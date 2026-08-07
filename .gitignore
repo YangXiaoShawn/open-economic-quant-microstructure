@@ -18,6 +18,7 @@ data/derived/**
 data/models/**
 data/quality/**
 data/_ingestion_manifests/**
+data/m8/**
 !data/raw/.gitkeep
 !data/normalized/.gitkeep
 !data/derived/.gitkeep
