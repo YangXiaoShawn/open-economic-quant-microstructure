@@ -23,7 +23,7 @@ timing, and execution accounting are tested.
 | M5 Execution research | Complete | M3-M4 | Market/limit fills, latency, partial fills, costs, inventory, liquidation, sensitivity | Deterministic accounting, OOS, volume-conservation, continuity, partial-fill, and liquidation tests pass |
 | M6 Reproducible vertical slice | Complete | M1-M5 | One CLI-driven sample run and machine-readable artifacts | Atomic producer and corruption/idempotence tests pass; canonical smoke requires no network |
 | M7 Research communication | Complete | M6 | Generated technical report/table, IC memo, limitations, dashboard, portfolio material | Render/dashboard tests read only verified artifacts and visibly label evidence tier |
-| M8 Broader empirical study | In progress | M6-M7 | Frozen single-date trade-only study, then multi-day BTCUSDT/ETHUSDT and local-L2 stability tests | Explicit input path+SHA, paired held-out comparison, clean canonical bundle, then untouched dates/regimes/failed hypotheses |
+| M8 Broader empirical study | In progress | M6-M7 | Frozen clean-commit single-date trade-only study complete; next add multi-day BTCUSDT/ETHUSDT and local-L2 stability tests | Explicit input path+SHA and paired held-out comparison are frozen; next require untouched dates/regimes/failed hypotheses |
 
 ## First vertical slice
 

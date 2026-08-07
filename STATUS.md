@@ -31,7 +31,7 @@ present.
 | M5 Execution research | Complete | OOS-only costs, two-stage latency, market/limit partial fills, queue proxy, inventory, liquidation and sensitivity |
 | M6 Reproducible vertical slice | Complete | Atomic CLI producer, immutable checksum bundle, deterministic run key, idempotent verification |
 | M7 Research communication | Complete | Code-generated report/memo/table, read-only six-tab dashboard, limitations and portfolio material |
-| M8 Broader empirical study | In progress | Single-date trade-only protocol/producer implemented; canonical clean run, multi-date evidence, and contiguous locally captured L2 epochs remain |
+| M8 Broader empirical study | In progress | Single-date trade-only protocol and clean canonical bundle complete; multi-date evidence and contiguous locally captured L2 epochs remain |
 
 ## Verification ledger
 
@@ -46,9 +46,10 @@ present.
 - 2026-08-07: `make download-sample` succeeded after network permission was
   granted; raw public responses and metadata were manifested and kept outside
   Git. `validate-public-data` passed 10,000 normalized rows with zero findings.
-- 2026-08-07: the canonical `make reproduce-sample`, `make verify-run`, generated
-  report, and dashboard bundle are part of final acceptance. Generated artifacts
-  remain ignored rather than committed.
+- 2026-08-07: clean-commit canonical synthetic and public bundles were produced,
+  checksum-verified, and independently re-rendered into technical report, IC
+  memo, and model table. Generated artifacts remain ignored rather than
+  committed.
 
 ## Empirical claim register
 
@@ -69,8 +70,7 @@ present.
 
 ## Immediate next milestone
 
-Finish the clean-commit canonical trade-only bundle and publish all paired
-outcomes without pooling instruments. Then freeze a multi-date extension before
-looking at new dates. Capture continuous public L2 epochs locally for
+Freeze a multi-date extension before looking at new dates, retaining the current
+single-date bundle unchanged. Capture continuous public L2 epochs locally for
 book-dependent claims, preserve adjacent untouched dates for testing, and
 publish both supported and failed hypotheses across instruments and regimes.
