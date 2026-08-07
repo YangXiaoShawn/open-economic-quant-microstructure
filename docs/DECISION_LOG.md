@@ -1,5 +1,20 @@
 # Decision log
 
+## 2026-08-07 — Freeze future live-L2 sessions before observation
+
+- **Decision:** Reserve 14:00–15:00 UTC on 2026-08-08 through 2026-08-11 for
+  concurrent BTCUSDT/ETHUSDT development, validation, primary-test, and
+  replication-test captures.
+- **Acceptance:** Both symbols need at least 3,300 seconds of overlapping
+  receipt-time coverage, a 1,800-second continuous valid epoch, zero sequence
+  gaps, zero DQ findings, exact row reconciliation, and complete immutable
+  capture evidence.
+- **Reason:** Fixed future sessions prevent outcome-based window choice and make
+  disconnects or missing data visible failures rather than hidden replacements.
+- **Claim boundary:** The first protocol is book-only. It permits future-mid
+  prediction and market-order scenarios, but not limit-fill, realized execution,
+  capacity, significance, or profitability claims.
+
 ## 2026-08-07 — Record the Jan 6 coverage-metadata race
 
 - **Discovery:** Before a stop message reached the parallel feasibility audit,

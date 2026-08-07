@@ -1,0 +1,82 @@
+[study]
+name = "binance-m8-live-l2-study"
+protocol_version = "1.0.0"
+evidence_tier = "FULL_DATA"
+seed = 20260807
+source = "binance_spot_live_diff_depth_100ms"
+symbols = ["BTCUSDT", "ETHUSDT"]
+stream_interval_ms = 100
+
+[[sessions]]
+date = "2026-08-08"
+start_utc = "14:00:00"
+end_utc = "15:00:00"
+role = "train"
+
+[[sessions]]
+date = "2026-08-09"
+start_utc = "14:00:00"
+end_utc = "15:00:00"
+role = "validation"
+
+[[sessions]]
+date = "2026-08-10"
+start_utc = "14:00:00"
+end_utc = "15:00:00"
+role = "primary_test"
+
+[[sessions]]
+date = "2026-08-11"
+start_utc = "14:00:00"
+end_utc = "15:00:00"
+role = "replication_test"
+
+[capture]
+duration_seconds = 3600
+max_messages_per_symbol = 60000
+max_raw_frame_bytes = 1048576
+max_arrow_batch_bytes = 16777216
+min_overlapping_coverage_seconds = 3300
+min_single_continuity_epoch_seconds = 1800
+require_complete_status = true
+require_live_reconstruction = true
+max_sequence_gaps = 0
+max_quality_errors = 0
+max_quality_warnings = 0
+
+[features]
+depth_levels = [1, 5, 10]
+event_horizons = [20, 100]
+clock_horizons_ms = [1000, 5000]
+include_spread = true
+include_depth = true
+include_ofi = true
+include_queue_imbalance = true
+include_microprice = true
+include_cancellation_intensity = true
+include_realized_volatility = true
+include_reference_fit_regimes = true
+
+[models]
+selection_metric = "log_loss"
+logistic_c_values = [0.1, 1.0, 10.0]
+tree_max_depth_values = [2, 4, 6]
+tree_min_samples_leaf = 40
+calibration_fraction = 0.20
+bootstrap_samples = 2000
+
+[execution]
+market_orders_only = true
+taker_fee_bps = 4.0
+decision_latency_events = [0, 1, 5]
+order_latency_events = [0, 1, 5]
+liquidate_at_end = true
+allow_limit_fill_claim = false
+allow_capacity_claim = false
+
+[claims]
+allow_p_values = false
+allow_significance_claim = false
+allow_realized_execution_claim = false
+allow_profitability_claim = false
+
