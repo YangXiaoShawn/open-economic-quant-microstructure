@@ -23,7 +23,7 @@ timing, and execution accounting are tested.
 | M5 Execution research | Complete | M3-M4 | Market/limit fills, latency, partial fills, costs, inventory, liquidation, sensitivity | Deterministic accounting, OOS, volume-conservation, continuity, partial-fill, and liquidation tests pass |
 | M6 Reproducible vertical slice | Complete | M1-M5 | One CLI-driven sample run and machine-readable artifacts | Atomic producer and corruption/idempotence tests pass; canonical smoke requires no network |
 | M7 Research communication | Complete | M6 | Generated technical report/table, IC memo, limitations, dashboard, portfolio material | Render/dashboard tests read only verified artifacts and visibly label evidence tier |
-| M8 Broader empirical study | In progress | M6-M7 | Frozen clean-commit single-date trade-only study complete; next add multi-day BTCUSDT/ETHUSDT and local-L2 stability tests | Explicit input path+SHA and paired held-out comparison are frozen; next require untouched dates/regimes/failed hypotheses |
+| M8 Broader empirical study | In progress | M6-M7 | Prospective four-date BTCUSDT/ETHUSDT trade protocol frozen before acquisition; local-L2 study remains separate | Complete all declared daily archives, lock selection before two untouched dates, publish stability/failed hypotheses, then add continuous local-L2 evidence |
 
 ## First vertical slice
 
@@ -106,5 +106,9 @@ The objective's ten acceptance criteria have reproducible evidence for M0-M7:
     hypotheses are documented.
 
 Passing M0-M7 completes the portfolio-quality system and first vertical slice.
-M8 remains the next empirical milestone: the downloaded public trade sample
-validates ingestion only and is intentionally insufficient for economic claims.
+M8 remains the next empirical milestone. The prospective calendar, hypotheses,
+selection rule, untouched tests, uncertainty, and failure policy are frozen in
+`docs/M8_MULTIDATE_TRADE_PROTOCOL.md`; its declared full daily archives have not
+yet been acquired or evaluated. The existing downloaded public trade sample
+validates the bounded exploratory path only and remains intentionally
+insufficient for economic claims.

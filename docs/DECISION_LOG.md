@@ -1,5 +1,25 @@
 # Decision log
 
+## 2026-08-07 — Freeze the M8 multi-date trade calendar before acquisition
+
+- **Decision:** Reserve the complete 2024-01-03 and 2024-01-04 UTC Binance Spot
+  daily aggregate-trade archives for training and validation, and reserve the
+  adjacent 2024-01-05 and 2024-01-06 archives as primary and replication tests.
+  Both BTCUSDT and ETHUSDT are mandatory. The inspected 2024-01-02 sample is
+  excluded from all study estimates.
+- **Reason:** Adjacent dates chosen mechanically before acquisition provide an
+  auditable barrier against outcome-based date selection. Full daily archives
+  remove the current row-cap truncation while remaining feasible on local disk
+  with streaming normalization.
+- **Evaluation:** Model selection uses validation log loss only. A locked model
+  is then evaluated without refit on both untouched dates, using paired
+  40-trade-block loss differences and explicit direction-replication status.
+- **Claim boundary:** This is a complete-data trade-only study. Execution, book,
+  fill, P&L, capacity, significance, and cross-instrument pooling remain
+  unauthorized. M8 still requires separately frozen continuous real L2 evidence.
+- **Failure policy:** Missing, oversized, corrupt, noncontiguous, or otherwise
+  invalid declared data produces `INSUFFICIENT_DATA`; dates are never replaced.
+
 Material choices are appended; prior entries are not rewritten to hide reversals.
 
 ## 2026-08-07 — Initialize the empty `Microstructure` directory

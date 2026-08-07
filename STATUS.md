@@ -31,7 +31,7 @@ present.
 | M5 Execution research | Complete | OOS-only costs, two-stage latency, market/limit partial fills, queue proxy, inventory, liquidation and sensitivity |
 | M6 Reproducible vertical slice | Complete | Atomic CLI producer, immutable checksum bundle, deterministic run key, idempotent verification |
 | M7 Research communication | Complete | Code-generated report/memo/table, read-only six-tab dashboard, limitations and portfolio material |
-| M8 Broader empirical study | In progress | Single-date trade-only protocol and clean canonical bundle complete; multi-date evidence and contiguous locally captured L2 epochs remain |
+| M8 Broader empirical study | In progress | Prospective four-date trade protocol is frozen before acquisition; complete archives, untouched-date results, and contiguous locally captured L2 epochs remain |
 
 ## Verification ledger
 
@@ -70,7 +70,8 @@ present.
 
 ## Immediate next milestone
 
-Freeze a multi-date extension before looking at new dates, retaining the current
-single-date bundle unchanged. Capture continuous public L2 epochs locally for
-book-dependent claims, preserve adjacent untouched dates for testing, and
-publish both supported and failed hypotheses across instruments and regimes.
+Implement and run the frozen
+[`M8_MULTIDATE_TRADE_PROTOCOL.md`](docs/M8_MULTIDATE_TRADE_PROTOCOL.md) without
+changing its 2024-01-03 through 2024-01-06 date roles after acquisition. Retain
+the current single-date bundle unchanged. In parallel, freeze and collect the
+separate continuous public L2 evidence required for book-dependent claims.
