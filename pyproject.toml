@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "event-driven-microstructure"
+version = "0.1.0"
+description = "Research-only event-driven order-flow and price-impact platform"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Microstructure Research Project" }]
+dependencies = [
+  "duckdb>=1.1,<2",
+  "numpy>=2,<3",
+  "polars>=1.20,<2",
+  "pyarrow>=18,<24",
+  "requests>=2.32,<3",
+  "scikit-learn>=1.5,<2",
+  "streamlit>=1.40,<2",
+  "websockets>=14,<17",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.13,<2",
+  "pytest>=8.3,<10",
+  "pytest-cov>=6,<8",
+  "ruff>=0.8,<1",
+  "types-requests>=2.32,<3",
+]
+
+[project.scripts]
+microstructure = "microstructure.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/microstructure"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests"]
+markers = [
+  "integration: exercises more than one package boundary",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests", "dashboard"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["microstructure"]
+warn_unreachable = true

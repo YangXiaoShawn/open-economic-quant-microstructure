@@ -1,0 +1,33 @@
+.DS_Store
+.idea/
+.vscode/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# External and generated research data must stay local.
+data/raw/**
+data/normalized/**
+data/derived/**
+data/models/**
+data/quality/**
+data/_ingestion_manifests/**
+!data/raw/.gitkeep
+!data/normalized/.gitkeep
+!data/derived/.gitkeep
+!data/models/.gitkeep
+!data/quality/.gitkeep
+!data/_ingestion_manifests/.gitkeep
+
+# Generated run artifacts are reproducible and may contain large files.
+artifacts/runs/**
+!artifacts/runs/.gitkeep
+
+# Generated dashboard/runtime files.
+.streamlit/secrets.toml

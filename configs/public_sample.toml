@@ -1,0 +1,63 @@
+[run]
+name = "binance-public-sample"
+evidence_tier = "PUBLIC_SAMPLE_PARTIAL"
+seed = 20260807
+
+[data]
+mode = "binance_rest"
+source = "binance_spot_rest"
+symbols = ["BTCUSDT", "ETHUSDT"]
+start = "2024-01-02T00:00:00Z"
+end = "2024-01-02T00:10:00Z"
+max_events_per_symbol = 5000
+raw_root = "data/raw"
+partition_root = "data/normalized"
+schema_version = "1.0.0"
+base_url = "https://data-api.binance.vision"
+request_limit = 1000
+timeout_seconds = 30.0
+max_retries = 5
+
+[quality]
+max_spread_bps = 100.0
+max_silence_ms = 5000
+fail_on_error = true
+
+[features]
+trade_windows = [5, 20, 100]
+volatility_window = 100
+intensity_window = 50
+label_horizon_events = 20
+large_trade_quantile = 0.95
+
+[evaluation]
+min_train_events = 1200
+validation_events = 400
+test_events = 400
+step_events = 400
+embargo_events = 20
+bootstrap_samples = 500
+calibration_bins = 10
+
+[models]
+selection_metric = "log_loss"
+logistic_c_values = [0.1, 1.0, 10.0]
+tree_max_depth_values = [2, 4, 6]
+tree_min_samples_leaf = 40
+
+[execution]
+decision_latency_events = 1
+order_latency_events = 1
+maker_fee_bps = 1.0
+taker_fee_bps = 4.0
+half_spread_bps = 1.0
+slippage_bps_per_unit = 0.20
+signal_threshold = 0.56
+max_position_units = 3.0
+order_size_units = 1.0
+limit_fill_base_probability = 0.55
+queue_ahead_units = 2.0
+limit_max_age_events = 20
+cancel_latency_events = 1
+liquidate_at_end = true
+capacity_multipliers = [0.5, 1.0, 2.0, 4.0]
