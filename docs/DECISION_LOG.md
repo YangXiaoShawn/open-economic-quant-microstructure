@@ -1,5 +1,18 @@
 # Decision log
 
+## 2026-08-07 — Record the Jan 6 coverage-metadata race
+
+- **Discovery:** Before a stop message reached the parallel feasibility audit,
+  it completed the same official archive availability, checksum, byte/row
+  count, aggregate-trade-ID boundary, and timestamp-boundary checks for Jan 6.
+  It did not inspect or retain price, quantity, maker direction, class balance,
+  features, labels, or model results.
+- **Correction:** Protocol 1.0.2 records coverage-only inspection for all four
+  dates. The calendar, roles, hypotheses, model grid, and interpretation rules
+  were already frozen and remain unchanged.
+- **Boundary:** This metadata helps verify feasibility and completeness only. It
+  is not economic evidence and cannot justify changing or dropping a date.
+
 ## 2026-08-07 — Correct the M8 freeze claim to outcome-blind
 
 - **Discovery:** A parallel feasibility audit read official Jan 3–5 archive

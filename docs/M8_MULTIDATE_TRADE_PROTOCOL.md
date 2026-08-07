@@ -6,10 +6,12 @@ This protocol is outcome-blind: it is frozen before inspecting any declared
 date's price, quantity, aggressor side, class balance, feature, label, model, or
 economic result. During a parallel feasibility audit before the first protocol
 commit, the official Jan 3–5 archive availability, checksums, byte/row counts,
-aggregate-trade-ID boundaries, and timestamp boundaries were inspected; Jan 6
-was not inspected. Those coverage-only facts were not supplied when the dates
-were chosen, and the mechanically selected calendar below was not changed after
-they became known. The previously inspected 2024-01-02 sample is
+aggregate-trade-ID boundaries, and timestamp boundaries were inspected. A
+stop-message race then allowed the same coverage-only checks for Jan 6 after the
+outcome-blind freeze; no economic field or result was read. These coverage-only
+facts were not supplied when the dates were chosen, and the mechanically
+selected calendar below was not changed after they became known. The previously
+inspected 2024-01-02 sample is
 protocol-development evidence only and is excluded from every fit, threshold,
 validation score, and test result below.
 
