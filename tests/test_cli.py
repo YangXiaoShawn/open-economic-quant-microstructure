@@ -188,6 +188,11 @@ def test_live_depth_capture_resnapshots_and_preserves_every_reconnect_epoch(
     summary = read_json(result.summary_path)
     assert summary["capture_status"] == "COMPLETE"
     assert summary["continuity_epochs"] == 2
+    assert [item["continuity_id"] for item in summary["continuity_epoch_coverage"]] == [
+        "epoch-1",
+        "epoch-2",
+    ]
+    assert sum(item["messages"] for item in summary["continuity_epoch_coverage"]) == 2
     assert summary["normalized_messages"] == 2
     assert summary["excluded_messages"] == 0
     assert all(
@@ -222,6 +227,133 @@ def test_live_depth_capture_resnapshots_and_preserves_every_reconnect_epoch(
     assert second_result.summary_path != result.summary_path
     assert latest_pointer["capture_status"] == "LATEST_POINTER"
     assert latest_pointer["authoritative_summary_path"] == str(second_result.summary_path)
+
+
+def test_live_depth_duration_completes_gracefully_before_message_ceiling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = _captured_depth(
+        sequence=1,
+        continuity_id="epoch-duration",
+        event_ts_ns=2_000_000_000,
+    )
+
+    class FakeClient:
+        def fetch_exchange_info(self, *, symbol: str, raw_root: Path) -> SimpleNamespace:
+            return SimpleNamespace(tick_size=Decimal("0.01"), lot_size=Decimal("0.001"))
+
+        def fetch_depth_snapshot(self, **kwargs: object) -> BookSnapshot:
+            return _preserved_snapshot(
+                output_root=tmp_path,
+                continuity_id=str(kwargs["continuity_id"]),
+                last_update_id=0,
+                received_ts_ns=1_900_000_000,
+            )
+
+    class FakeCollector:
+        url = "wss://example.invalid/stream"
+
+        def __init__(self, **kwargs: object) -> None:
+            self.callback = kwargs["on_raw_frame"]
+
+        async def stream(self, *, max_messages: int | None = None) -> AsyncIterator[CapturedDepth]:
+            assert max_messages == 10
+            received_ts_ns = item.delta.received_ts_ns
+            assert received_ts_ns is not None
+            self.callback(
+                RawDepthFrame(
+                    payload=item.raw_payload.encode(),
+                    was_text=True,
+                    received_ts_ns=received_ts_ns,
+                    capture_seq=1,
+                    continuity_id="epoch-duration",
+                )
+            )
+            yield item
+            await asyncio.sleep(60)
+
+    monkeypatch.setattr(cli_module, "BinancePublicClient", FakeClient)
+    monkeypatch.setattr(cli_module, "BinanceLiveDepthCollector", FakeCollector)
+
+    result = asyncio.run(
+        cli_module._capture_depth(
+            symbol="BTCUSDT",
+            max_messages=10,
+            duration_seconds=0.01,
+            output_root=tmp_path,
+        )
+    )
+
+    assert result.messages == 1
+    assert result.completion_reason == "duration_elapsed"
+    assert result.requested_duration_seconds == 0.01
+    assert result.elapsed_monotonic_seconds >= 0.009
+    summary = read_json(result.summary_path)
+    assert summary["completion_reason"] == "duration_elapsed"
+    assert summary["message_safety_ceiling"] == 10
+    assert summary["requested_duration_seconds"] == 0.01
+    assert summary["max_continuity_epoch_seconds"] == 0.0
+
+
+def test_live_depth_duration_fails_if_message_safety_ceiling_arrives_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeClient:
+        def fetch_exchange_info(self, *, symbol: str, raw_root: Path) -> SimpleNamespace:
+            return SimpleNamespace(tick_size=Decimal("0.01"), lot_size=Decimal("0.001"))
+
+        def fetch_depth_snapshot(self, **kwargs: object) -> BookSnapshot:
+            return _preserved_snapshot(
+                output_root=tmp_path,
+                continuity_id=str(kwargs["continuity_id"]),
+                last_update_id=0,
+                received_ts_ns=1_900_000_000,
+            )
+
+    class FakeCollector:
+        url = "wss://example.invalid/stream"
+
+        def __init__(self, **kwargs: object) -> None:
+            self.callback = kwargs["on_raw_frame"]
+
+        async def stream(self, *, max_messages: int | None = None) -> AsyncIterator[CapturedDepth]:
+            assert max_messages == 2
+            for sequence in (1, 2):
+                item = _captured_depth(
+                    sequence=sequence,
+                    continuity_id="epoch-cap",
+                    event_ts_ns=2_000_000_000 + sequence,
+                )
+                received_ts_ns = item.delta.received_ts_ns
+                assert received_ts_ns is not None
+                self.callback(
+                    RawDepthFrame(
+                        payload=item.raw_payload.encode(),
+                        was_text=True,
+                        received_ts_ns=received_ts_ns,
+                        capture_seq=sequence,
+                        continuity_id="epoch-cap",
+                    )
+                )
+                yield item
+
+    monkeypatch.setattr(cli_module, "BinancePublicClient", FakeClient)
+    monkeypatch.setattr(cli_module, "BinanceLiveDepthCollector", FakeCollector)
+
+    with pytest.raises(RuntimeError, match="message safety ceiling"):
+        asyncio.run(
+            cli_module._capture_depth(
+                symbol="BTCUSDT",
+                max_messages=2,
+                duration_seconds=60.0,
+                output_root=tmp_path,
+            )
+        )
+
+    assert not list((tmp_path / "quality").glob("live_depth_capture.*.summary.json"))
+    assert list((tmp_path / "quality").glob("live_depth_capture.*.failed.json"))
 
 
 def test_live_depth_capture_is_one_pass_and_history_independent_in_memory(

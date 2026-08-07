@@ -11,7 +11,7 @@ import os
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from decimal import Decimal
@@ -214,6 +214,96 @@ class DepthCaptureResult:
     raw_manifest_path: Path
     raw_manifest_sha256: str
     summary_path: Path
+    completion_reason: str
+    requested_duration_seconds: float | None
+    elapsed_monotonic_seconds: float
+    receipt_coverage_seconds: float
+    max_continuity_epoch_seconds: float
+
+
+@dataclass(slots=True)
+class _DepthCaptureStop:
+    reason: str = "not_started"
+    elapsed_monotonic_seconds: float = 0.0
+
+
+@dataclass(slots=True)
+class _DepthEpochCoverage:
+    continuity_id: str
+    snapshot_id: str
+    first_received_ns: int
+    last_received_ns: int
+    messages: int = 0
+    book_observations: int = 0
+    excluded_messages: int = 0
+    sequence_gaps: int = 0
+    reconstruction_status: Literal["LIVE", "GAPPED", "INVALID"] = "LIVE"
+    final_update_id: int = 0
+
+    @property
+    def duration_seconds(self) -> float:
+        return max(0.0, (self.last_received_ns - self.first_received_ns) / 1_000_000_000.0)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "continuity_id": self.continuity_id,
+            "snapshot_id": self.snapshot_id,
+            "first_received_ns": self.first_received_ns,
+            "last_received_ns": self.last_received_ns,
+            "duration_seconds": self.duration_seconds,
+            "messages": self.messages,
+            "book_observations": self.book_observations,
+            "excluded_messages": self.excluded_messages,
+            "sequence_gaps": self.sequence_gaps,
+            "reconstruction_status": self.reconstruction_status,
+            "final_update_id": self.final_update_id,
+        }
+
+
+async def _bounded_depth_items(
+    collector: BinanceLiveDepthCollector,
+    *,
+    max_messages: int,
+    duration_seconds: float | None,
+    stop: _DepthCaptureStop,
+) -> AsyncIterator[CapturedDepth]:
+    """Yield a live stream until its safety cap or a graceful duration deadline."""
+
+    started = time.monotonic()
+    yielded = 0
+    iterator = collector.stream(max_messages=max_messages).__aiter__()
+    try:
+        if duration_seconds is None:
+            async for item in iterator:
+                yielded += 1
+                yield item
+            stop.reason = "message_limit" if yielded == max_messages else "stream_ended_early"
+            return
+
+        deadline = started + duration_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stop.reason = "duration_elapsed"
+                return
+            try:
+                item = await asyncio.wait_for(anext(iterator), timeout=remaining)
+            except TimeoutError:
+                stop.reason = "duration_elapsed"
+                return
+            except StopAsyncIteration:
+                stop.reason = (
+                    "message_safety_ceiling" if yielded == max_messages else "stream_ended_early"
+                )
+                return
+            yielded += 1
+            yield item
+    finally:
+        stop.elapsed_monotonic_seconds = max(0.0, time.monotonic() - started)
+        with suppress(BaseException):
+            closer = getattr(iterator, "aclose", None)
+            if callable(closer):
+                await closer()
 
 
 @dataclass(frozen=True, slots=True)
@@ -553,9 +643,12 @@ async def _capture_depth(
     symbol: str,
     max_messages: int,
     output_root: Path,
+    duration_seconds: float | None = None,
 ) -> DepthCaptureResult:
     if max_messages < 1:
         raise ValueError("max_messages must be positive")
+    if duration_seconds is not None and duration_seconds <= 0:
+        raise ValueError("duration_seconds must be positive when supplied")
     output_root.mkdir(parents=True, exist_ok=True)
     capture_id = f"{symbol.lower()}-{time.time_ns()}"
     client = BinancePublicClient()
@@ -625,8 +718,16 @@ async def _capture_depth(
         stale_events = 0
         excluded_messages = 0
         final_update_id = 0
+        capture_stop = _DepthCaptureStop()
+        epoch_coverage: list[_DepthEpochCoverage] = []
+        current_epoch_coverage: _DepthEpochCoverage | None = None
         try:
-            async for item in collector.stream(max_messages=max_messages):
+            async for item in _bounded_depth_items(
+                collector,
+                max_messages=max_messages,
+                duration_seconds=duration_seconds,
+                stop=capture_stop,
+            ):
                 raw_message_bytes = raw_spool.append_captured(item)
                 if item.delta.continuity_id != current_continuity_id:
                     snapshot = client.fetch_depth_snapshot(
@@ -648,8 +749,20 @@ async def _capture_depth(
                     reconstructor = IncrementalBookReconstructor(snapshot)
                     current_continuity_id = item.delta.continuity_id
                     continuity_epochs += 1
+                    received_ts_ns = item.delta.received_ts_ns
+                    if received_ts_ns is None:  # pragma: no cover - append_captured validates
+                        raise RuntimeError("live depth delta has no receipt timestamp")
+                    current_epoch_coverage = _DepthEpochCoverage(
+                        continuity_id=item.delta.continuity_id,
+                        snapshot_id=snapshot.snapshot_id,
+                        first_received_ns=received_ts_ns,
+                        last_received_ns=received_ts_ns,
+                    )
+                    epoch_coverage.append(current_epoch_coverage)
                 if reconstructor is None:  # pragma: no cover - guarded by epoch creation
                     raise RuntimeError("live depth epoch has no reconstructor")
+                if current_epoch_coverage is None:  # pragma: no cover - guarded by epoch creation
+                    raise RuntimeError("live depth epoch has no coverage tracker")
                 spools["depth_deltas"].append(
                     item.delta.to_record(),
                     estimated_bytes=max(
@@ -674,12 +787,36 @@ async def _capture_depth(
                     stale_events += 1
                 status = _status_max(status, reconstructor.status)
                 final_update_id = reconstructor.final_update_id
+                received_ts_ns = item.delta.received_ts_ns
+                if received_ts_ns is None:  # pragma: no cover - append_captured validates
+                    raise RuntimeError("live depth delta has no receipt timestamp")
+                current_epoch_coverage.last_received_ns = received_ts_ns
+                current_epoch_coverage.messages += 1
+                current_epoch_coverage.book_observations += int(step.observation is not None)
+                current_epoch_coverage.excluded_messages += int(step.observation is None)
+                current_epoch_coverage.sequence_gaps += int(step.gap is not None)
+                current_epoch_coverage.reconstruction_status = reconstructor.status
+                current_epoch_coverage.final_update_id = reconstructor.final_update_id
 
-            if raw_spool.messages != max_messages:
-                raise RuntimeError(
-                    f"live depth stream ended after {raw_spool.messages} of "
-                    f"{max_messages} requested messages"
-                )
+            if duration_seconds is None:
+                if raw_spool.messages != max_messages or capture_stop.reason != "message_limit":
+                    raise RuntimeError(
+                        f"live depth stream ended after {raw_spool.messages} of "
+                        f"{max_messages} requested messages"
+                    )
+            else:
+                if capture_stop.reason == "message_safety_ceiling":
+                    raise RuntimeError(
+                        "live depth message safety ceiling was reached before the requested "
+                        "capture duration elapsed"
+                    )
+                if capture_stop.reason != "duration_elapsed":
+                    raise RuntimeError(
+                        "live depth stream ended before the requested capture duration "
+                        f"({capture_stop.reason})"
+                    )
+                if raw_spool.messages == 0:
+                    raise RuntimeError("duration-bounded live depth capture received no messages")
             if raw_spool.snapshot_anchors != continuity_epochs:
                 raise RuntimeError("not every continuity epoch has a raw snapshot anchor")
             for spool in spools.values():
@@ -748,6 +885,16 @@ async def _capture_depth(
                 report.write_json(report_path)
                 quality_report_paths[report.dataset] = str(report_path)
             summary_path = quality_root / f"live_depth_capture.{capture_id}.summary.json"
+            receipt_coverage_seconds = (
+                (raw_spool.last_received_ns - raw_spool.first_received_ns) / 1_000_000_000.0
+                if raw_spool.first_received_ns is not None
+                and raw_spool.last_received_ns is not None
+                else 0.0
+            )
+            max_continuity_epoch_seconds = max(
+                (epoch.duration_seconds for epoch in epoch_coverage),
+                default=0.0,
+            )
             summary_payload = {
                 "generated_at_utc": utc_now_iso(),
                 "capture_id": capture_id,
@@ -762,6 +909,13 @@ async def _capture_depth(
                 "reconstruction_status": status,
                 "quality_errors": quality_errors,
                 "quality_warnings": quality_warnings,
+                "completion_reason": capture_stop.reason,
+                "requested_duration_seconds": duration_seconds,
+                "message_safety_ceiling": max_messages,
+                "elapsed_monotonic_seconds": capture_stop.elapsed_monotonic_seconds,
+                "receipt_coverage_seconds": receipt_coverage_seconds,
+                "continuity_epoch_coverage": [epoch.to_dict() for epoch in epoch_coverage],
+                "max_continuity_epoch_seconds": max_continuity_epoch_seconds,
                 "quality_reports": quality_report_paths,
                 "raw_path": str(raw_evidence.path),
                 "raw_manifest": str(raw_evidence.manifest_path),
@@ -807,6 +961,11 @@ async def _capture_depth(
                 raw_manifest_path=raw_evidence.manifest_path,
                 raw_manifest_sha256=raw_evidence.manifest_sha256,
                 summary_path=summary_path,
+                completion_reason=capture_stop.reason,
+                requested_duration_seconds=duration_seconds,
+                elapsed_monotonic_seconds=capture_stop.elapsed_monotonic_seconds,
+                receipt_coverage_seconds=receipt_coverage_seconds,
+                max_continuity_epoch_seconds=max_continuity_epoch_seconds,
             )
         except BaseException as error:
             if raw_evidence is None:
@@ -849,6 +1008,9 @@ def _cmd_collect_l2(args: argparse.Namespace) -> int:
             symbol=str(args.symbol).upper(),
             max_messages=int(args.max_messages),
             output_root=output_root,
+            duration_seconds=(
+                float(args.duration_seconds) if args.duration_seconds is not None else None
+            ),
         )
     )
     _print_json(
@@ -866,6 +1028,11 @@ def _cmd_collect_l2(args: argparse.Namespace) -> int:
             "raw_manifest": result.raw_manifest_path,
             "raw_manifest_sha256": result.raw_manifest_sha256,
             "capture_summary": result.summary_path,
+            "completion_reason": result.completion_reason,
+            "requested_duration_seconds": result.requested_duration_seconds,
+            "elapsed_monotonic_seconds": result.elapsed_monotonic_seconds,
+            "receipt_coverage_seconds": result.receipt_coverage_seconds,
+            "max_continuity_epoch_seconds": result.max_continuity_epoch_seconds,
             "output_root": output_root,
             "live_trading": False,
         }
@@ -920,6 +1087,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     collect.add_argument("--symbol", choices=("BTCUSDT", "ETHUSDT"), required=True)
     collect.add_argument("--max-messages", type=int, default=1_000)
+    collect.add_argument(
+        "--duration-seconds",
+        type=float,
+        help=(
+            "gracefully complete after this wall duration; max-messages remains a safety "
+            "ceiling and fails the capture if reached first"
+        ),
+    )
     collect.add_argument("--output-root", type=Path, default=Path("data"))
     collect.set_defaults(handler=_cmd_collect_l2)
     return parser
@@ -930,6 +1105,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if getattr(args, "max_messages", 1) < 1:
         parser.error("--max-messages must be positive")
+    duration_seconds = getattr(args, "duration_seconds", None)
+    if duration_seconds is not None and duration_seconds <= 0:
+        parser.error("--duration-seconds must be positive")
     handler = args.handler
     try:
         return int(handler(args))
