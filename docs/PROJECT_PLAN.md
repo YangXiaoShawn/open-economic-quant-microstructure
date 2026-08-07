@@ -23,7 +23,7 @@ timing, and execution accounting are tested.
 | M5 Execution research | Complete | M3-M4 | Market/limit fills, latency, partial fills, costs, inventory, liquidation, sensitivity | Deterministic accounting, OOS, volume-conservation, continuity, partial-fill, and liquidation tests pass |
 | M6 Reproducible vertical slice | Complete | M1-M5 | One CLI-driven sample run and machine-readable artifacts | Atomic producer and corruption/idempotence tests pass; canonical smoke requires no network |
 | M7 Research communication | Complete | M6 | Generated technical report/table, IC memo, limitations, dashboard, portfolio material | Render/dashboard tests read only verified artifacts and visibly label evidence tier |
-| M8 Broader empirical study | Deferred | M6-M7 | Multi-day BTCUSDT/ETHUSDT analysis and stability tests | Public-data manifests, held-out periods, uncertainty, regimes, failed hypotheses documented |
+| M8 Broader empirical study | In progress | M6-M7 | Frozen single-date trade-only study, then multi-day BTCUSDT/ETHUSDT and local-L2 stability tests | Explicit input path+SHA, paired held-out comparison, clean canonical bundle, then untouched dates/regimes/failed hypotheses |
 
 ## First vertical slice
 
@@ -63,7 +63,7 @@ small public-data path without making the test suite depend on network access.
 | Class imbalance/calibration drift | Misleading probabilities | Persist class rates, Brier/log loss, calibration diagnostics by fold/regime |
 | Fee/latency/fill assumptions dominate P&L | Fragile strategy result | Publish assumption grid and sensitivity; never collapse it into model quality |
 | Public endpoint/schema changes | Broken ingestion | Version adapter/schema, capture response metadata/checksum, contract tests |
-| Memory/disk pressure | Local run failure | Stream downloads, lazy scans, date/symbol partitions, configurable row caps |
+| Memory/disk pressure | Local run failure | Byte-bounded response streams, disk-backed incremental DQ, batch Parquet, verified spill-capable scans, explicit eager guards; disclose metadata growth by page/part |
 | Multiple testing | False discoveries | Predeclare core hypotheses, report all tested variants, use adjusted interpretation |
 
 ## Acceptance test matrix
@@ -100,7 +100,7 @@ The objective's ten acceptance criteria have reproducible evidence for M0-M7:
    adverse selection, inventory, liquidation, turnover, and size sensitivity.
 7. Reports are rendered from serialized, checksum-verified outputs.
 8. Run provenance records actual UTC coverage, config/input hashes, seed, runtime,
-   Git revision and dirty state.
+   Git revision, dirty state, and exact tracked/non-ignored source-tree digest.
 9. Synthetic watermarks and claim checks prevent an unverified profitability claim.
 10. Limitations, evidence promotion rules, and the absence of evaluable failed
     hypotheses are documented.

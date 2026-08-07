@@ -6,6 +6,7 @@ from microstructure.data.book import (
     BookInvariantError,
     BookSnapshot,
     DepthDelta,
+    IncrementalBookReconstructor,
     reconstruct_snapshot_and_deltas,
 )
 
@@ -147,3 +148,18 @@ def test_delta_scale_mismatch_fails_closed_before_reinterpretation() -> None:
             _snapshot(),
             [_delta(100, 101, tick_size=0.1)],
         )
+
+
+def test_malformed_stale_looking_range_is_invalid_and_later_delta_is_audited() -> None:
+    reconstructor = IncrementalBookReconstructor(_snapshot())
+
+    malformed = reconstructor.update(_delta(101, 99))
+    excluded = reconstructor.update(_delta(101, 101))
+
+    assert malformed.outcome == "INVALID"
+    assert malformed.gap is not None
+    assert malformed.gap.reason == "invalid_sequence_range"
+    assert reconstructor.stale_events == 0
+    assert excluded.outcome == "EXCLUDED_AFTER_TERMINAL"
+    assert excluded.gap is not None
+    assert excluded.gap.reason == "epoch_already_invalid"

@@ -28,7 +28,13 @@ from microstructure.data.quality import ValidationReport, validate_table
 from microstructure.data.storage import DatasetWriteResult, write_partitioned_parquet
 from microstructure.data.synthetic import generate_synthetic_market, iter_table_batches
 from microstructure.execution import run_execution_sensitivity, simulate_predictions
-from microstructure.provenance import provenance_header, write_json
+from microstructure.provenance import (
+    git_source_tree_sha256,
+    git_state,
+    provenance_header,
+    sha256_file,
+    write_json,
+)
 from microstructure.reporting import (
     load_run_bundle,
     render_executive_memo,
@@ -220,6 +226,7 @@ def _run_identity(
         "git": {
             "commit": str(git.get("commit", "UNKNOWN")),
             "dirty": bool(git.get("dirty", False)),
+            "source_tree_sha256": str(git.get("source_tree_sha256", "UNKNOWN")),
         },
         "seed": seed,
     }
@@ -740,11 +747,9 @@ def _execution_metric_row(
     }
 
 
-def _produce(config: ProjectConfig, stage: Path) -> None:
+def _produce_synthetic(config: ProjectConfig, stage: Path) -> None:
     if config.data.mode != "synthetic":
-        raise PipelineError(
-            "this vertical-slice producer supports synthetic mode only; public ingestion remains separate"
-        )
+        raise PipelineError("synthetic producer requires data.mode='synthetic'")
     if config.data.events_per_symbol is None:
         raise PipelineError("synthetic configuration requires events_per_symbol")
 
@@ -1104,17 +1109,104 @@ def _produce(config: ProjectConfig, stage: Path) -> None:
     load_run_bundle(stage)
 
 
-def reproduce(config: ProjectConfig, run_dir: Path) -> Path:
-    """Produce or verify one immutable synthetic run bundle.
+def _produce(
+    config: ProjectConfig,
+    stage: Path,
+    *,
+    ingestion_manifest_path: str | Path | None,
+    ingestion_manifest_sha256: str | None,
+) -> None:
+    if config.data.mode == "synthetic":
+        _produce_synthetic(config, stage)
+        return
+    if config.data.mode != "binance_rest":
+        raise PipelineError(
+            f"no research-run producer is registered for data mode {config.data.mode!r}"
+        )
+    if ingestion_manifest_path is None or ingestion_manifest_sha256 is None:
+        raise PipelineError(
+            "public reproduction requires an explicit ingestion manifest path and SHA-256"
+        )
+    from microstructure.public_pipeline import produce_public_trade_run
+
+    produce_public_trade_run(
+        config,
+        stage,
+        ingestion_manifest_path=ingestion_manifest_path,
+        ingestion_manifest_sha256=ingestion_manifest_sha256,
+    )
+
+
+def reproduce(
+    config: ProjectConfig,
+    run_dir: Path,
+    *,
+    ingestion_manifest_path: str | Path | None = None,
+    ingestion_manifest_sha256: str | None = None,
+) -> Path:
+    """Produce or verify one immutable research run bundle.
 
     A verified completed target is reused without changing a byte. An existing
     incomplete target is never repaired or overwritten. New output is built in a
     sibling staging directory, verified, and atomically renamed into place.
+    Public-data runs require an explicit content-hashed ingestion-manifest anchor;
+    synthetic runs reject one so their input contract cannot be confused.
     """
+    anchored = ingestion_manifest_path is not None or ingestion_manifest_sha256 is not None
+    normalized_ingestion_sha256 = (
+        ingestion_manifest_sha256.lower() if ingestion_manifest_sha256 is not None else None
+    )
+    if (ingestion_manifest_path is None) != (ingestion_manifest_sha256 is None):
+        raise PipelineError("ingestion manifest path and SHA-256 must be supplied together")
+    if config.data.mode == "synthetic" and anchored:
+        raise PipelineError("synthetic reproduction does not accept a public input manifest")
+    if config.data.mode == "binance_rest" and not anchored:
+        raise PipelineError(
+            "public reproduction requires an explicit ingestion manifest path and SHA-256"
+        )
+    if config.data.mode == "binance_rest":
+        if ingestion_manifest_path is None or ingestion_manifest_sha256 is None:
+            raise PipelineError("public ingestion anchor is incomplete")
+        public_manifest_path = Path(ingestion_manifest_path).resolve()
+        if not public_manifest_path.is_file():
+            raise PipelineError(f"public ingestion manifest does not exist: {public_manifest_path}")
+        observed_manifest_sha = sha256_file(public_manifest_path)
+        if observed_manifest_sha != normalized_ingestion_sha256:
+            raise PipelineError("public ingestion manifest bytes do not match the supplied SHA-256")
+
     target = run_dir.resolve()
     if target.exists():
         if target.is_dir() and (target / "_SUCCESS").is_file():
-            load_run_bundle(target)
+            bundle = load_run_bundle(target)
+            if bundle.provenance.get("config_sha256") != config.hash:
+                raise PipelineError(
+                    "completed run target was produced from a different configuration"
+                )
+            if bundle.run_id != config.run.name:
+                raise PipelineError(
+                    "completed run target has a different run ID than the configuration"
+                )
+            current_state = git_state(config.project_root)
+            current_git = {
+                "commit": current_state.commit,
+                "dirty": current_state.dirty,
+                "source_tree_sha256": git_source_tree_sha256(config.project_root),
+            }
+            bundled_git = bundle.provenance.get("git")
+            if not isinstance(bundled_git, Mapping) or any(
+                bundled_git.get(key) != value for key, value in current_git.items()
+            ):
+                raise PipelineError(
+                    "completed run target was produced from a different Git/source-tree state"
+                )
+            if (
+                config.data.mode == "binance_rest"
+                and bundle.provenance.get("ingestion_manifest_sha256")
+                != normalized_ingestion_sha256
+            ):
+                raise PipelineError(
+                    "completed run target was produced from a different ingestion manifest"
+                )
             return target
         raise PipelineError(
             f"run target already exists but is not a verified completed bundle: {target}"
@@ -1123,7 +1215,12 @@ def reproduce(config: ProjectConfig, run_dir: Path) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent)).resolve()
     try:
-        _produce(config, stage)
+        _produce(
+            config,
+            stage,
+            ingestion_manifest_path=ingestion_manifest_path,
+            ingestion_manifest_sha256=normalized_ingestion_sha256,
+        )
         if target.exists():
             raise PipelineError(f"run target appeared during production: {target}")
         stage.rename(target)

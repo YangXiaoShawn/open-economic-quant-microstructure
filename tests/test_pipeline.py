@@ -264,3 +264,66 @@ def test_existing_incomplete_target_is_not_repaired_or_overwritten(
     with pytest.raises(PipelineError, match="not a verified completed bundle"):
         reproduce(config, target)
     assert marker.read_text(encoding="utf-8") == "preserve me\n"
+
+
+def test_completed_target_from_different_config_is_not_reused(
+    completed_bundle: tuple[ProjectConfig, Path], tmp_path: Path
+) -> None:
+    config, target = completed_bundle
+    alternate_path = tmp_path / "alternate.toml"
+    alternate_path.write_text(
+        config.path.read_text(encoding="utf-8").replace("seed = 20260807", "seed = 20260808"),
+        encoding="utf-8",
+    )
+    alternate = load_config(alternate_path)
+
+    with pytest.raises(PipelineError, match="different configuration"):
+        reproduce(alternate, target)
+
+
+def test_completed_target_from_different_source_tree_is_not_reused(
+    completed_bundle: tuple[ProjectConfig, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, target = completed_bundle
+    monkeypatch.setattr(
+        "microstructure.pipeline.git_source_tree_sha256",
+        lambda project_root: "f" * 64,
+    )
+
+    with pytest.raises(PipelineError, match="different Git/source-tree state"):
+        reproduce(config, target)
+
+
+def test_synthetic_reproduction_rejects_public_manifest_anchor(
+    completed_bundle: tuple[ProjectConfig, Path], tmp_path: Path
+) -> None:
+    config, _ = completed_bundle
+
+    with pytest.raises(PipelineError, match="does not accept a public input manifest"):
+        reproduce(
+            config,
+            tmp_path / "wrongly-anchored",
+            ingestion_manifest_path=tmp_path / "ingestion.json",
+            ingestion_manifest_sha256="a" * 64,
+        )
+
+
+def test_public_reproduction_requires_and_hashes_explicit_manifest_anchor(
+    tmp_path: Path,
+) -> None:
+    config = load_config(Path(__file__).parents[1] / "configs" / "public_sample.toml")
+    target = tmp_path / "public-run"
+
+    with pytest.raises(PipelineError, match="requires an explicit ingestion manifest"):
+        reproduce(config, target)
+
+    manifest = tmp_path / "ingestion.json"
+    manifest.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(PipelineError, match="bytes do not match"):
+        reproduce(
+            config,
+            target,
+            ingestion_manifest_path=manifest,
+            ingestion_manifest_sha256="a" * 64,
+        )

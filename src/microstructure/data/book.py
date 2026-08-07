@@ -8,6 +8,7 @@ book continuity.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -16,10 +17,15 @@ import pyarrow as pa  # type: ignore[import-untyped]
 from microstructure.data.schemas import SCHEMA_VERSION, table_from_records
 
 BookLevel = tuple[int, int]
+_MAX_BOOK_LEVELS_PER_SIDE = 10_000
 
 
 class BookInvariantError(ValueError):
     """Raised when a snapshot or delta contains an impossible book level."""
+
+
+class _BookCapacityError(BookInvariantError):
+    """Raised before retained book state can exceed its hard memory bound."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,7 +154,29 @@ class ReconstructionResult:
     final_update_id: int
 
 
+ReconstructionOutcome = Literal[
+    "OBSERVED",
+    "STALE",
+    "GAP",
+    "INVALID",
+    "EXCLUDED_AFTER_TERMINAL",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ReconstructionStep:
+    """Bounded result of applying one delta to one continuity epoch."""
+
+    outcome: ReconstructionOutcome
+    observation: Mapping[str, object] | None
+    gap: SequenceGap | None
+
+
 def _levels_to_book(levels: tuple[BookLevel, ...], side: str) -> dict[int, int]:
+    if len(levels) > _MAX_BOOK_LEVELS_PER_SIDE:
+        raise _BookCapacityError(
+            f"{side} snapshot exceeds {_MAX_BOOK_LEVELS_PER_SIDE} retained levels"
+        )
     result: dict[int, int] = {}
     for price, quantity in levels:
         if price <= 0:
@@ -173,6 +201,8 @@ def _apply_side(book: dict[int, int], changes: tuple[BookLevel, ...], side: str)
             book.pop(price, None)
         else:
             book[price] = quantity
+    if len(book) > _MAX_BOOK_LEVELS_PER_SIDE:
+        raise _BookCapacityError(f"{side} book exceeds {_MAX_BOOK_LEVELS_PER_SIDE} retained levels")
 
 
 def _depth(book: dict[int, int], *, bids: bool, levels: int, lot_size: float) -> float:
@@ -267,6 +297,153 @@ def _gap(snapshot: BookSnapshot, delta: DepthDelta, expected: int, reason: str) 
     )
 
 
+class IncrementalBookReconstructor:
+    """Stateful O(book-depth) snapshot-plus-delta reconstruction.
+
+    The class retains only the current epoch's book.  Every input delta returns
+    an explicit outcome; after a gap or invalidation, later deltas receive an
+    ``EXCLUDED_AFTER_TERMINAL`` gap record rather than disappearing silently.
+    """
+
+    def __init__(self, snapshot: BookSnapshot) -> None:
+        if snapshot.available_ts_ns < snapshot.received_ts_ns:
+            raise BookInvariantError("snapshot cannot be available before it was received")
+        if (
+            not math.isfinite(snapshot.tick_size)
+            or not math.isfinite(snapshot.lot_size)
+            or snapshot.tick_size <= 0
+            or snapshot.lot_size <= 0
+        ):
+            raise BookInvariantError("snapshot tick and lot sizes must be finite and positive")
+        if snapshot.depth_limit < 1 or snapshot.depth_limit > _MAX_BOOK_LEVELS_PER_SIDE:
+            raise BookInvariantError(
+                f"snapshot depth_limit must be within 1..{_MAX_BOOK_LEVELS_PER_SIDE}"
+            )
+        bids = _levels_to_book(snapshot.bids, "bid")
+        asks = _levels_to_book(snapshot.asks, "ask")
+        if max(bids) >= min(asks):
+            raise BookInvariantError("snapshot is crossed or locked")
+        self.snapshot = snapshot
+        self._bids = bids
+        self._asks = asks
+        self._last_update_id = snapshot.last_update_id
+        self._stale_events = 0
+        self._status: Literal["LIVE", "GAPPED", "INVALID"] = "LIVE"
+
+    @property
+    def status(self) -> Literal["LIVE", "GAPPED", "INVALID"]:
+        return self._status
+
+    @property
+    def stale_events(self) -> int:
+        return self._stale_events
+
+    @property
+    def final_update_id(self) -> int:
+        return self._last_update_id
+
+    def _validate_identity(self, delta: DepthDelta) -> None:
+        if delta.venue != self.snapshot.venue or delta.symbol != self.snapshot.symbol:
+            raise BookInvariantError("delta venue/symbol does not match snapshot")
+        if delta.tick_size != self.snapshot.tick_size or delta.lot_size != self.snapshot.lot_size:
+            raise BookInvariantError("delta tick/lot scales do not match snapshot metadata")
+
+    def update(self, delta: DepthDelta) -> ReconstructionStep:
+        """Apply exactly one delta and return its explicit reconstruction disposition."""
+        self._validate_identity(delta)
+        expected = self._last_update_id + 1
+        if self._status != "LIVE":
+            return ReconstructionStep(
+                outcome="EXCLUDED_AFTER_TERMINAL",
+                observation=None,
+                gap=_gap(
+                    self.snapshot,
+                    delta,
+                    expected,
+                    f"epoch_already_{self._status.lower()}",
+                ),
+            )
+        if delta.continuity_id != self.snapshot.continuity_id:
+            self._status = "GAPPED"
+            return ReconstructionStep(
+                outcome="GAP",
+                observation=None,
+                gap=_gap(self.snapshot, delta, expected, "continuity_id_mismatch"),
+            )
+        if delta.last_update_id < delta.first_update_id:
+            self._status = "INVALID"
+            return ReconstructionStep(
+                outcome="INVALID",
+                observation=None,
+                gap=_gap(self.snapshot, delta, expected, "invalid_sequence_range"),
+            )
+        if delta.last_update_id <= self._last_update_id:
+            self._stale_events += 1
+            return ReconstructionStep(outcome="STALE", observation=None, gap=None)
+        if (
+            delta.previous_update_id is not None
+            and delta.previous_update_id != self._last_update_id
+        ):
+            self._status = "GAPPED"
+            return ReconstructionStep(
+                outcome="GAP",
+                observation=None,
+                gap=_gap(self.snapshot, delta, expected, "previous_update_id_mismatch"),
+            )
+        if delta.first_update_id > expected:
+            self._status = "GAPPED"
+            return ReconstructionStep(
+                outcome="GAP",
+                observation=None,
+                gap=_gap(self.snapshot, delta, expected, "forward_sequence_gap"),
+            )
+        if delta.last_update_id < expected:
+            self._stale_events += 1
+            return ReconstructionStep(outcome="STALE", observation=None, gap=None)
+
+        candidate_bids = self._bids.copy()
+        candidate_asks = self._asks.copy()
+        try:
+            _apply_side(candidate_bids, delta.bids, "bid")
+            _apply_side(candidate_asks, delta.asks, "ask")
+            if not candidate_bids or not candidate_asks:
+                raise BookInvariantError("delta emptied one side of the order book")
+            crossed = max(candidate_bids) >= min(candidate_asks)
+            observation = _observation(
+                snapshot=self.snapshot,
+                delta=delta,
+                bids=candidate_bids,
+                asks=candidate_asks,
+                valid=not crossed,
+            )
+        except _BookCapacityError:
+            self._status = "INVALID"
+            return ReconstructionStep(
+                outcome="INVALID",
+                observation=None,
+                gap=_gap(self.snapshot, delta, expected, "book_level_limit_exceeded"),
+            )
+        except BookInvariantError:
+            self._status = "INVALID"
+            return ReconstructionStep(
+                outcome="INVALID",
+                observation=None,
+                gap=_gap(self.snapshot, delta, expected, "invalid_book_level"),
+            )
+
+        self._bids = candidate_bids
+        self._asks = candidate_asks
+        self._last_update_id = delta.last_update_id
+        if crossed:
+            self._status = "INVALID"
+            return ReconstructionStep(
+                outcome="INVALID",
+                observation=observation,
+                gap=_gap(self.snapshot, delta, expected, "crossed_or_locked_book"),
+            )
+        return ReconstructionStep(outcome="OBSERVED", observation=observation, gap=None)
+
+
 def reconstruct_snapshot_and_deltas(
     snapshot: BookSnapshot, deltas: tuple[DepthDelta, ...] | list[DepthDelta]
 ) -> ReconstructionResult:
@@ -276,91 +453,25 @@ def reconstruct_snapshot_and_deltas(
     event must cover the next expected update ID, allowing safe overlap.  A
     forward gap invalidates the continuity epoch; later events are not emitted.
     """
-    if snapshot.available_ts_ns < snapshot.received_ts_ns:
-        raise BookInvariantError("snapshot cannot be available before it was received")
-    if (
-        not math.isfinite(snapshot.tick_size)
-        or not math.isfinite(snapshot.lot_size)
-        or snapshot.tick_size <= 0
-        or snapshot.lot_size <= 0
-    ):
-        raise BookInvariantError("snapshot tick and lot sizes must be finite and positive")
-    bids = _levels_to_book(snapshot.bids, "bid")
-    asks = _levels_to_book(snapshot.asks, "ask")
-    if max(bids) >= min(asks):
-        raise BookInvariantError("snapshot is crossed or locked")
-
-    last_update_id = snapshot.last_update_id
-    stale_events = 0
+    reconstructor = IncrementalBookReconstructor(snapshot)
     observation_records: list[dict[str, object]] = []
     gaps: list[SequenceGap] = []
-    status: Literal["LIVE", "GAPPED", "INVALID"] = "LIVE"
 
     for delta in deltas:
-        if delta.venue != snapshot.venue or delta.symbol != snapshot.symbol:
-            raise BookInvariantError("delta venue/symbol does not match snapshot")
-        if delta.tick_size != snapshot.tick_size or delta.lot_size != snapshot.lot_size:
-            raise BookInvariantError("delta tick/lot scales do not match snapshot metadata")
-        expected = last_update_id + 1
-        if delta.last_update_id <= last_update_id:
-            stale_events += 1
-            continue
-        if delta.continuity_id != snapshot.continuity_id:
-            gaps.append(_gap(snapshot, delta, expected, "continuity_id_mismatch"))
-            status = "GAPPED"
-            break
-        if delta.last_update_id < delta.first_update_id:
-            gaps.append(_gap(snapshot, delta, expected, "invalid_sequence_range"))
-            status = "INVALID"
-            break
-        if delta.previous_update_id is not None and delta.previous_update_id != last_update_id:
-            gaps.append(_gap(snapshot, delta, expected, "previous_update_id_mismatch"))
-            status = "GAPPED"
-            break
-        if delta.first_update_id > expected:
-            gaps.append(_gap(snapshot, delta, expected, "forward_sequence_gap"))
-            status = "GAPPED"
-            break
-        if delta.last_update_id < expected:
-            stale_events += 1
-            continue
-
-        candidate_bids = bids.copy()
-        candidate_asks = asks.copy()
-        try:
-            _apply_side(candidate_bids, delta.bids, "bid")
-            _apply_side(candidate_asks, delta.asks, "ask")
-            if not candidate_bids or not candidate_asks:
-                raise BookInvariantError("delta emptied one side of the order book")
-            crossed = max(candidate_bids) >= min(candidate_asks)
-            observation_records.append(
-                _observation(
-                    snapshot=snapshot,
-                    delta=delta,
-                    bids=candidate_bids,
-                    asks=candidate_asks,
-                    valid=not crossed,
-                )
-            )
-        except BookInvariantError:
-            gaps.append(_gap(snapshot, delta, expected, "invalid_book_level"))
-            status = "INVALID"
-            break
-
-        bids = candidate_bids
-        asks = candidate_asks
-        last_update_id = delta.last_update_id
-        if crossed:
-            gaps.append(_gap(snapshot, delta, expected, "crossed_or_locked_book"))
-            status = "INVALID"
+        step = reconstructor.update(delta)
+        if step.observation is not None:
+            observation_records.append(dict(step.observation))
+        if step.gap is not None:
+            gaps.append(step.gap)
+        if step.outcome in {"GAP", "INVALID"}:
             break
 
     return ReconstructionResult(
-        status=status,
+        status=reconstructor.status,
         observations=table_from_records("book_observations", observation_records),
         gaps=table_from_records("sequence_gaps", [item.to_record() for item in gaps]),
-        stale_events=stale_events,
-        final_update_id=last_update_id,
+        stale_events=reconstructor.stale_events,
+        final_update_id=reconstructor.final_update_id,
     )
 
 

@@ -3,9 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import pyarrow.parquet as pq
+import pytest
 
 from microstructure.data.schemas import get_schema
-from microstructure.data.storage import write_partitioned_parquet, write_source_manifest
+from microstructure.data.storage import (
+    StorageError,
+    write_partitioned_parquet,
+    write_source_manifest,
+)
 from microstructure.data.synthetic import generate_synthetic_market
 from microstructure.provenance import read_json, sha256_file
 
@@ -49,6 +54,16 @@ def test_partitioned_parquet_is_streamed_content_addressed_and_manifested(
         assert manifest["schema_version"] == "1.0.0"
         assert manifest["checksum"]["value"] == artifact.data_sha256
         assert manifest["requested_range_ns"]["start"] == start_ns
+        assert manifest["write_ordinal"] == artifact.write_ordinal
+        assert manifest["observed_range_ns"] == {
+            "start": artifact.observed_start_ns,
+            "end_inclusive": artifact.observed_end_inclusive_ns,
+        }
+
+    dataset_manifest = read_json(result.manifest_path)
+    assert [item["write_ordinal"] for item in dataset_manifest["artifacts"]] == list(
+        range(len(result.artifacts))
+    )
 
 
 def test_same_normalized_content_reuses_immutable_parquet(tmp_path: Path) -> None:
@@ -96,3 +111,27 @@ def test_raw_source_manifest_contains_required_lineage_and_checksum(tmp_path: Pa
     assert manifest["checksum"]["value"] == sha256_file(raw)
     assert manifest["requested_range_ns"] == {"start": 100, "end_exclusive": 200}
     assert manifest["response_headers"]["ETag"] == "abc"
+
+
+def test_partition_writer_rejects_oversized_input_before_materializing_it(
+    tmp_path: Path,
+) -> None:
+    data = generate_synthetic_market(
+        symbols=("BTCUSDT",),
+        events_per_symbol=3,
+        start_ts_ns=1_704_153_600_000_000_000,
+        seed=101,
+    )
+
+    with pytest.raises(StorageError, match="above the bounded-memory limit 2"):
+        write_partitioned_parquet(
+            iter((data.trades,)),
+            root=tmp_path,
+            dataset="trades",
+            schema_name="trades",
+            source="synthetic_v1",
+            max_input_batch_rows=2,
+        )
+
+    assert not list(tmp_path.rglob("*.parquet"))
+    assert not list(tmp_path.rglob("*.manifest-*.json"))

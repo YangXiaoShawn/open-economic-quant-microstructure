@@ -61,18 +61,40 @@ TRADE_REQUIRED_COLUMNS = frozenset(
 _STATIC_MODEL_FEATURES = (
     "spread_bps",
     "depth_total_l1",
+    "depth_total_l5",
+    "depth_total_l10",
     "queue_imbalance_l1",
+    "queue_imbalance_l5",
+    "queue_imbalance_l10",
     "microprice_deviation_bps",
     "ofi_l1",
     "log_mid_return_1",
+    "realized_price_impact_bps_1",
+    "spread_recovery_bps_1",
+    "depth_recovery_l1_1",
 )
 _MODEL_FEATURE_PREFIXES = (
+    "cancellation_intensity_w",
     "ofi_w",
     "signed_trade_volume_w",
     "trade_volume_w",
     "trade_count_w",
     "trade_intensity_w",
     "realized_volatility_w",
+)
+
+DEPTH_DELTA_REQUIRED_COLUMNS = frozenset(
+    {
+        "venue",
+        "symbol",
+        "event_ts_ns",
+        "available_ts_ns",
+        "continuity_id",
+        "first_update_id",
+        "last_update_id",
+        "bids",
+        "asks",
+    }
 )
 
 
@@ -160,6 +182,108 @@ def _prepare_trades(trades: pl.DataFrame | None) -> pl.DataFrame | None:
     )
 
 
+def build_cancellation_intensity_features(
+    depth_deltas: pl.DataFrame,
+    *,
+    windows: tuple[int, ...] = (20, 100),
+) -> pl.DataFrame:
+    """Build causal cancellation-intensity proxies from observable L2 deletes.
+
+    Binance diff-depth encodes a zero quantity as removal of that price level.
+    Those deletes are directly observable; an update to a smaller nonzero
+    quantity is not classified here because its cancellation/execution split is
+    not identifiable from the delta alone. Windows are event-count windows,
+    include the current available delta, and reset at every continuity epoch.
+    """
+
+    _require_columns(depth_deltas, DEPTH_DELTA_REQUIRED_COLUMNS, "depth deltas")
+    if depth_deltas.is_empty():
+        raise ResearchDataError("depth deltas must not be empty")
+    normalized_windows = tuple(sorted(set(windows)))
+    if not normalized_windows or any(isinstance(window, bool) or window < 1 for window in windows):
+        raise ResearchDataError("cancellation windows must be positive integers")
+
+    group = ["venue", "symbol", "continuity_id"]
+    ordered = depth_deltas.sort([*group, "last_update_id", "first_update_id"])
+    invalid = ordered.filter(
+        pl.col("continuity_id").is_null()
+        | (pl.col("available_ts_ns") < pl.col("event_ts_ns"))
+        | (pl.col("first_update_id") > pl.col("last_update_id"))
+    )
+    if not invalid.is_empty():
+        raise ResearchDataError(
+            "depth deltas require a continuity ID, observable availability, and valid ranges"
+        )
+    duplicates = (
+        ordered.group_by([*group, "first_update_id", "last_update_id"])
+        .len()
+        .filter(pl.col("len") > 1)
+    )
+    if not duplicates.is_empty():
+        raise ResearchDataError("depth-delta sequence ranges must be unique within an epoch")
+
+    prior_end = pl.col("last_update_id").shift(1).over(group)
+    prior_available = pl.col("available_ts_ns").shift(1).over(group)
+    broken = ordered.filter(
+        prior_end.is_not_null()
+        & (
+            (pl.col("last_update_id") <= prior_end)
+            | (pl.col("first_update_id") > prior_end + 1)
+            | (pl.col("available_ts_ns") < prior_available)
+        )
+    )
+    if not broken.is_empty():
+        raise ResearchDataError(
+            "depth deltas contain a stale/gapped sequence or reversing availability clock"
+        )
+
+    per_event = ordered.with_columns(
+        (
+            pl.col("bids").list.eval(pl.element().struct.field("quantity_lots") == 0).list.sum()
+            + pl.col("asks").list.eval(pl.element().struct.field("quantity_lots") == 0).list.sum()
+        )
+        .fill_null(0)
+        .cast(pl.Int64)
+        .alias("cancellation_deletes_current"),
+        (pl.col("bids").list.len() + pl.col("asks").list.len())
+        .cast(pl.Int64)
+        .alias("depth_updates_current"),
+        pl.col("available_ts_ns").alias("decision_ts_ns"),
+        pl.col("available_ts_ns").alias("feature_cutoff_ts_ns"),
+        pl.col("available_ts_ns").alias("max_feature_source_ts_ns"),
+        pl.col("last_update_id").alias("decision_sequence"),
+        pl.col("last_update_id").alias("max_feature_source_sequence"),
+        pl.lit("zero_quantity_level_deletes_only").alias("cancellation_observation_policy"),
+        pl.lit(False).alias("nonzero_reduction_classified_as_cancellation"),
+    )
+    expressions: list[pl.Expr] = []
+    for window in normalized_windows:
+        deletes = (
+            pl.col("cancellation_deletes_current")
+            .rolling_sum(window_size=window, min_samples=1)
+            .over(group)
+        )
+        updates = (
+            pl.col("depth_updates_current")
+            .rolling_sum(window_size=window, min_samples=1)
+            .over(group)
+        )
+        expressions.extend(
+            [
+                deletes.alias(f"cancellation_deletes_w{window}"),
+                updates.alias(f"depth_updates_w{window}"),
+                pl.when(updates > 0)
+                .then(deletes / updates)
+                .otherwise(0.0)
+                .cast(pl.Float64)
+                .alias(f"cancellation_intensity_w{window}"),
+            ]
+        )
+    return per_event.with_columns(expressions).sort(
+        ["decision_ts_ns", "venue", "symbol", "continuity_id", "decision_sequence"]
+    )
+
+
 def _join_trade_history(books: pl.DataFrame, trades: pl.DataFrame | None) -> pl.DataFrame:
     if trades is None:
         return books.with_columns(
@@ -187,6 +311,58 @@ def _join_trade_history(books: pl.DataFrame, trades: pl.DataFrame | None) -> pl.
         pl.col("_cum_volume").fill_null(0.0),
         pl.col("_cum_count").fill_null(0),
     )
+
+
+def _join_cancellation_history(
+    features: pl.DataFrame,
+    depth_deltas: pl.DataFrame | None,
+    config: FeatureConfig,
+) -> pl.DataFrame:
+    if depth_deltas is None:
+        return features
+    if "venue" not in features.columns:
+        raise ResearchDataError(
+            "book observations require venue when cancellation features are requested"
+        )
+    cancellation = build_cancellation_intensity_features(
+        depth_deltas,
+        windows=config.trade_windows,
+    )
+    feature_columns = [
+        name
+        for name in cancellation.columns
+        if name.startswith("cancellation_deletes_w")
+        or name.startswith("depth_updates_w")
+        or name.startswith("cancellation_intensity_w")
+    ]
+    keyed = cancellation.select(
+        "venue",
+        "symbol",
+        "continuity_id",
+        pl.col("decision_sequence").alias("sequence_end"),
+        pl.col("max_feature_source_ts_ns").alias("cancellation_feature_max_source_ts_ns"),
+        pl.col("max_feature_source_sequence").alias("cancellation_feature_max_source_sequence"),
+        "cancellation_observation_policy",
+        "nonzero_reduction_classified_as_cancellation",
+        *feature_columns,
+    )
+    keys = ["venue", "symbol", "continuity_id", "sequence_end"]
+    joined = features.join(keyed, on=keys, how="left", validate="1:1")
+    missing = joined.filter(pl.col("cancellation_feature_max_source_ts_ns").is_null())
+    if not missing.is_empty():
+        raise ResearchDataError(
+            "supplied depth deltas do not cover every research-eligible book observation"
+        )
+    future = joined.filter(
+        (pl.col("cancellation_feature_max_source_ts_ns") > pl.col("feature_cutoff_ts_ns"))
+        | (
+            (pl.col("cancellation_feature_max_source_ts_ns") == pl.col("feature_cutoff_ts_ns"))
+            & (pl.col("cancellation_feature_max_source_sequence") > pl.col("decision_sequence"))
+        )
+    )
+    if not future.is_empty():
+        raise TemporalLeakageError("cancellation feature lineage extends beyond its decision")
+    return joined
 
 
 def build_l1_trade_features(
@@ -217,6 +393,29 @@ def build_l1_trade_features(
             )
     prepared_trades = _prepare_trades(trades)
     group = ["symbol", "continuity_id"]
+    depth_expressions: list[pl.Expr] = []
+    for level in (5, 10):
+        bid_column = f"depth_bid_{level}"
+        ask_column = f"depth_ask_{level}"
+        presence = (
+            bid_column in book_observations.columns,
+            ask_column in book_observations.columns,
+        )
+        if presence[0] != presence[1]:
+            raise ResearchDataError(
+                f"book observations must supply both {bid_column} and {ask_column}"
+            )
+        if all(presence):
+            total = pl.col(bid_column) + pl.col(ask_column)
+            depth_expressions.extend(
+                [
+                    total.alias(f"depth_total_l{level}"),
+                    pl.when(total > 0)
+                    .then((pl.col(bid_column) - pl.col(ask_column)) / total)
+                    .otherwise(None)
+                    .alias(f"queue_imbalance_l{level}"),
+                ]
+            )
 
     books = (
         book_observations.filter(pl.col("is_valid"))
@@ -229,6 +428,7 @@ def build_l1_trade_features(
             ((pl.col("best_bid") + pl.col("best_ask")) / 2.0).alias("mid_price"),
             (pl.col("best_ask") - pl.col("best_bid")).alias("spread"),
             (pl.col("bid_quantity") + pl.col("ask_quantity")).alias("depth_total_l1"),
+            *depth_expressions,
         )
         .with_columns(
             pl.col("best_bid").shift(1).over(group).alias("_previous_bid"),
@@ -236,6 +436,8 @@ def build_l1_trade_features(
             pl.col("bid_quantity").shift(1).over(group).alias("_previous_bid_quantity"),
             pl.col("ask_quantity").shift(1).over(group).alias("_previous_ask_quantity"),
             pl.col("mid_price").shift(1).over(group).alias("_previous_mid"),
+            pl.col("spread").shift(1).over(group).alias("_previous_spread"),
+            pl.col("depth_total_l1").shift(1).over(group).alias("_previous_depth_l1"),
             pl.col("sequence_end").cum_count().over(group).alias("history_events"),
         )
         .with_columns(
@@ -258,6 +460,18 @@ def build_l1_trade_features(
             .then((pl.col("mid_price") / pl.col("_previous_mid")).log())
             .otherwise(0.0)
             .alias("log_mid_return_1"),
+            pl.when(pl.col("_previous_mid").is_not_null())
+            .then(10_000.0 * (pl.col("mid_price") / pl.col("_previous_mid") - 1.0))
+            .otherwise(0.0)
+            .alias("realized_price_impact_bps_1"),
+            pl.when(pl.col("_previous_spread").is_not_null())
+            .then(10_000.0 * (pl.col("_previous_spread") - pl.col("spread")) / pl.col("mid_price"))
+            .otherwise(0.0)
+            .alias("spread_recovery_bps_1"),
+            pl.when(pl.col("_previous_depth_l1").is_not_null())
+            .then(pl.col("depth_total_l1") - pl.col("_previous_depth_l1"))
+            .otherwise(0.0)
+            .alias("depth_recovery_l1_1"),
             pl.when(pl.col("_previous_bid").is_null())
             .then(0.0)
             .otherwise(
@@ -351,6 +565,8 @@ def build_l1_trade_features(
             "_previous_bid_quantity",
             "_previous_ask_quantity",
             "_previous_mid",
+            "_previous_spread",
+            "_previous_depth_l1",
             "_segment_start_ts_ns",
             "_cum_signed",
             "_cum_volume",
@@ -456,10 +672,13 @@ def build_research_frame(
     book_observations: pl.DataFrame,
     trades: pl.DataFrame | None,
     config: FeatureConfig,
+    *,
+    depth_deltas: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Build the complete causal feature/strictly-future-label event frame."""
 
     features = build_l1_trade_features(book_observations, trades, config)
+    features = _join_cancellation_history(features, depth_deltas, config)
     return add_future_event_labels(features, config.label_horizon_events)
 
 
@@ -500,6 +719,22 @@ def validate_temporal_contract(frame: pl.DataFrame) -> TemporalAudit:
     )
     if not future_feature.is_empty():
         raise TemporalLeakageError("feature lineage extends beyond its decision cutoff")
+
+    if {
+        "cancellation_feature_max_source_ts_ns",
+        "cancellation_feature_max_source_sequence",
+    }.issubset(frame.columns):
+        future_cancellation = frame.filter(
+            (pl.col("cancellation_feature_max_source_ts_ns") > pl.col("feature_cutoff_ts_ns"))
+            | (
+                (pl.col("cancellation_feature_max_source_ts_ns") == pl.col("feature_cutoff_ts_ns"))
+                & (pl.col("cancellation_feature_max_source_sequence") > pl.col("decision_sequence"))
+            )
+        )
+        if not future_cancellation.is_empty():
+            raise TemporalLeakageError(
+                "cancellation feature lineage extends beyond its decision cutoff"
+            )
 
     uncensored = ~pl.col("right_censored")
     invalid_label = frame.filter(
@@ -558,6 +793,7 @@ __all__ = [
     "TemporalAudit",
     "TemporalLeakageError",
     "add_future_event_labels",
+    "build_cancellation_intensity_features",
     "build_l1_trade_features",
     "build_research_frame",
     "model_feature_columns",

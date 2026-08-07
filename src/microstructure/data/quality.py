@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+import os
+import sqlite3
+import tempfile
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol, TextIO
 
 import pyarrow as pa  # type: ignore[import-untyped]
 
-from microstructure.data.schemas import ensure_schema
+from microstructure.data.schemas import ensure_schema, get_schema
 from microstructure.provenance import utc_now_iso, write_json
 
 Severity = Literal["ERROR", "WARNING"]
@@ -32,21 +36,45 @@ class ValidationReport:
     dataset: str
     rows_checked: int
     findings: tuple[QualityFinding, ...]
+    total_errors: int | None = None
+    total_warnings: int | None = None
+    findings_jsonl_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.rows_checked < 0:
+            raise ValueError("rows_checked must be non-negative")
+        if (self.total_errors is None) != (self.total_warnings is None):
+            raise ValueError("total_errors and total_warnings must be supplied together")
+        retained_errors = sum(item.severity == "ERROR" for item in self.findings)
+        retained_warnings = sum(item.severity == "WARNING" for item in self.findings)
+        if self.total_errors is not None and self.total_errors < retained_errors:
+            raise ValueError("total_errors cannot be smaller than retained error findings")
+        if self.total_warnings is not None and self.total_warnings < retained_warnings:
+            raise ValueError("total_warnings cannot be smaller than retained warning findings")
 
     @property
     def has_errors(self) -> bool:
-        return any(item.severity == "ERROR" for item in self.findings)
+        return self.error_count > 0
 
     @property
     def error_count(self) -> int:
+        if self.total_errors is not None:
+            return self.total_errors
         return sum(item.severity == "ERROR" for item in self.findings)
 
     @property
     def warning_count(self) -> int:
+        if self.total_warnings is not None:
+            return self.total_warnings
         return sum(item.severity == "WARNING" for item in self.findings)
 
+    @property
+    def findings_truncated(self) -> bool:
+        """Whether ``findings`` is only an in-memory preview of the full result."""
+        return len(self.findings) < self.error_count + self.warning_count
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "generated_at_utc": utc_now_iso(),
             "dataset": self.dataset,
             "rows_checked": self.rows_checked,
@@ -54,13 +82,318 @@ class ValidationReport:
             "findings": [asdict(item) for item in self.findings],
             "mutation_policy": "observations were not changed or repaired",
         }
+        if self.findings_truncated:
+            payload["findings_preview"] = {
+                "retained": len(self.findings),
+                "total": self.error_count + self.warning_count,
+                "truncated": True,
+            }
+        if self.findings_jsonl_path is not None:
+            payload["findings_jsonl_path"] = self.findings_jsonl_path
+        return payload
 
     def write_json(self, path: str | Path) -> None:
         write_json(path, self.to_dict())
 
 
+class _FindingTarget(Protocol):
+    def append(self, finding: QualityFinding) -> None: ...
+
+
+class _FindingAccumulator:
+    """Count every finding while retaining only a bounded in-memory preview."""
+
+    def __init__(
+        self,
+        *,
+        max_findings: int | None,
+        findings_jsonl_path: str | Path | None,
+    ) -> None:
+        if max_findings is not None and max_findings < 0:
+            raise ValueError("max_findings must be non-negative or None")
+        self._max_findings = max_findings
+        self._findings: list[QualityFinding] = []
+        self.error_count = 0
+        self.warning_count = 0
+        self.path = Path(findings_jsonl_path) if findings_jsonl_path is not None else None
+        self._temporary_path: Path | None = None
+        self._sink: TextIO | None = None
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
+                text=True,
+            )
+            self._temporary_path = Path(temporary_name)
+            self._sink = os.fdopen(descriptor, "w", encoding="utf-8")
+
+    @property
+    def findings(self) -> tuple[QualityFinding, ...]:
+        return tuple(self._findings)
+
+    def append(self, finding: QualityFinding) -> None:
+        if finding.severity == "ERROR":
+            self.error_count += 1
+        else:
+            self.warning_count += 1
+        if self._max_findings is None or len(self._findings) < self._max_findings:
+            self._findings.append(finding)
+        if self._sink is not None:
+            self._sink.write(
+                json.dumps(
+                    asdict(finding),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+            self._sink.write("\n")
+
+    def flush(self) -> None:
+        if self._sink is not None:
+            self._sink.flush()
+
+    def publish(self) -> None:
+        if self._sink is not None:
+            self._sink.flush()
+            os.fsync(self._sink.fileno())
+            self._sink.close()
+            self._sink = None
+        if self.path is not None and self._temporary_path is not None:
+            os.replace(self._temporary_path, self.path)
+            self._temporary_path = None
+
+    def close(self) -> None:
+        if self._sink is not None:
+            self._sink.close()
+            self._sink = None
+        if self._temporary_path is not None:
+            self._temporary_path.unlink(missing_ok=True)
+            self._temporary_path = None
+
+
+def _continuity_key(continuity_id: object) -> tuple[int, str]:
+    if continuity_id is None:
+        return (1, "")
+    return (0, str(continuity_id))
+
+
+class _SpillState:
+    """Disk-backed exact state whose RAM use does not grow with row history."""
+
+    def __init__(self) -> None:
+        # An empty SQLite filename creates a private temporary on-disk database
+        # which is deleted when the connection closes.
+        self._connection = sqlite3.connect("")
+        self._connection.execute("PRAGMA cache_size = -2048")
+        self._connection.execute("PRAGMA temp_store = FILE")
+        self._connection.execute("PRAGMA journal_mode = OFF")
+        self._connection.execute("PRAGMA synchronous = OFF")
+        self._connection.executescript(
+            """
+            CREATE TABLE event_state (
+                venue TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                continuity_is_null INTEGER NOT NULL,
+                continuity_id TEXT NOT NULL,
+                event_ts_ns INTEGER NOT NULL,
+                received_ts_ns INTEGER,
+                row_index INTEGER NOT NULL,
+                PRIMARY KEY (venue, symbol, continuity_is_null, continuity_id)
+            ) WITHOUT ROWID;
+            CREATE TABLE sequence_state (
+                sequence_kind TEXT NOT NULL,
+                venue TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                continuity_is_null INTEGER NOT NULL,
+                continuity_id TEXT NOT NULL,
+                sequence_end INTEGER NOT NULL,
+                PRIMARY KEY (
+                    sequence_kind,
+                    venue,
+                    symbol,
+                    continuity_is_null,
+                    continuity_id
+                )
+            ) WITHOUT ROWID;
+            CREATE TABLE trade_identity (
+                venue TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                trade_id INTEGER NOT NULL,
+                first_row INTEGER NOT NULL,
+                PRIMARY KEY (venue, symbol, trade_id)
+            ) WITHOUT ROWID;
+            """
+        )
+
+    def get_event(self, key: tuple[str, str, str | None]) -> tuple[int, int | None, int] | None:
+        continuity_is_null, continuity_id = _continuity_key(key[2])
+        result = self._connection.execute(
+            """
+            SELECT event_ts_ns, received_ts_ns, row_index
+            FROM event_state
+            WHERE venue = ? AND symbol = ?
+              AND continuity_is_null = ? AND continuity_id = ?
+            """,
+            (key[0], key[1], continuity_is_null, continuity_id),
+        ).fetchone()
+        if result is None:
+            return None
+        event_ts_ns, received_ts_ns, row_index = result
+        return (
+            int(event_ts_ns),
+            int(received_ts_ns) if received_ts_ns is not None else None,
+            int(row_index),
+        )
+
+    def set_event(
+        self,
+        key: tuple[str, str, str | None],
+        value: tuple[int, int | None, int],
+    ) -> None:
+        continuity_is_null, continuity_id = _continuity_key(key[2])
+        self._connection.execute(
+            """
+            INSERT INTO event_state (
+                venue, symbol, continuity_is_null, continuity_id,
+                event_ts_ns, received_ts_ns, row_index
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (venue, symbol, continuity_is_null, continuity_id)
+            DO UPDATE SET
+                event_ts_ns = excluded.event_ts_ns,
+                received_ts_ns = excluded.received_ts_ns,
+                row_index = excluded.row_index
+            """,
+            (*key[:2], continuity_is_null, continuity_id, *value),
+        )
+
+    def get_sequence(self, kind: str, key: tuple[str, str, str | None]) -> int | None:
+        continuity_is_null, continuity_id = _continuity_key(key[2])
+        result = self._connection.execute(
+            """
+            SELECT sequence_end
+            FROM sequence_state
+            WHERE sequence_kind = ? AND venue = ? AND symbol = ?
+              AND continuity_is_null = ? AND continuity_id = ?
+            """,
+            (kind, key[0], key[1], continuity_is_null, continuity_id),
+        ).fetchone()
+        return int(result[0]) if result is not None else None
+
+    def set_sequence(
+        self,
+        kind: str,
+        key: tuple[str, str, str | None],
+        sequence_end: int,
+    ) -> None:
+        continuity_is_null, continuity_id = _continuity_key(key[2])
+        self._connection.execute(
+            """
+            INSERT INTO sequence_state (
+                sequence_kind, venue, symbol, continuity_is_null,
+                continuity_id, sequence_end
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (
+                sequence_kind, venue, symbol, continuity_is_null, continuity_id
+            ) DO UPDATE SET sequence_end = excluded.sequence_end
+            """,
+            (kind, key[0], key[1], continuity_is_null, continuity_id, sequence_end),
+        )
+
+    def first_trade_row_or_insert(
+        self, identity: tuple[str, str, int], row_index: int
+    ) -> int | None:
+        try:
+            self._connection.execute(
+                """
+                INSERT INTO trade_identity (venue, symbol, trade_id, first_row)
+                VALUES (?, ?, ?, ?)
+                """,
+                (*identity, row_index),
+            )
+        except sqlite3.IntegrityError:
+            result = self._connection.execute(
+                """
+                SELECT first_row FROM trade_identity
+                WHERE venue = ? AND symbol = ? AND trade_id = ?
+                """,
+                identity,
+            ).fetchone()
+            if result is None:  # pragma: no cover - guarded by the primary key
+                raise RuntimeError("duplicate identity disappeared from quality state") from None
+            return int(result[0])
+        return None
+
+    def commit(self) -> None:
+        self._connection.commit()
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+class _ValidationState(Protocol):
+    def get_event(self, key: tuple[str, str, str | None]) -> tuple[int, int | None, int] | None: ...
+
+    def set_event(
+        self,
+        key: tuple[str, str, str | None],
+        value: tuple[int, int | None, int],
+    ) -> None: ...
+
+    def get_sequence(self, kind: str, key: tuple[str, str, str | None]) -> int | None: ...
+
+    def set_sequence(
+        self,
+        kind: str,
+        key: tuple[str, str, str | None],
+        sequence_end: int,
+    ) -> None: ...
+
+    def first_trade_row_or_insert(
+        self, identity: tuple[str, str, int], row_index: int
+    ) -> int | None: ...
+
+
+class _MemoryState:
+    def __init__(self) -> None:
+        self._events: dict[tuple[str, str, str | None], tuple[int, int | None, int]] = {}
+        self._sequences: dict[tuple[str, str, str, str | None], int] = {}
+        self._trade_identities: dict[tuple[str, str, int], int] = {}
+
+    def get_event(self, key: tuple[str, str, str | None]) -> tuple[int, int | None, int] | None:
+        return self._events.get(key)
+
+    def set_event(
+        self,
+        key: tuple[str, str, str | None],
+        value: tuple[int, int | None, int],
+    ) -> None:
+        self._events[key] = value
+
+    def get_sequence(self, kind: str, key: tuple[str, str, str | None]) -> int | None:
+        return self._sequences.get((kind, *key))
+
+    def set_sequence(
+        self,
+        kind: str,
+        key: tuple[str, str, str | None],
+        sequence_end: int,
+    ) -> None:
+        self._sequences[(kind, *key)] = sequence_end
+
+    def first_trade_row_or_insert(
+        self, identity: tuple[str, str, int], row_index: int
+    ) -> int | None:
+        first_row = self._trade_identities.get(identity)
+        if first_row is None:
+            self._trade_identities[identity] = row_index
+        return first_row
+
+
 def _finding(
-    findings: list[QualityFinding],
+    findings: _FindingTarget,
     *,
     rule_id: str,
     severity: Severity,
@@ -92,11 +425,14 @@ def _validate_event_clocks(
     rows: list[dict[str, Any]],
     *,
     dataset: str,
-    findings: list[QualityFinding],
+    findings: _FindingTarget,
     max_silence_ns: int,
+    row_offset: int = 0,
+    state: _ValidationState | None = None,
 ) -> None:
-    previous: dict[tuple[str, str, str | None], tuple[int, int | None, int]] = {}
-    for index, row in enumerate(rows):
+    validation_state = state if state is not None else _MemoryState()
+    for local_index, row in enumerate(rows):
+        index = row_offset + local_index
         event_ts = int(row["event_ts_ns"])
         available_ts = int(row["available_ts_ns"])
         received = row.get("received_ts_ns")
@@ -125,7 +461,7 @@ def _validate_event_clocks(
             )
 
         key = (str(row["venue"]), str(row["symbol"]), row.get("continuity_id"))
-        prior = previous.get(key)
+        prior = validation_state.get_event(key)
         if prior is not None:
             previous_event, previous_received, previous_index = prior
             if event_ts < previous_event:
@@ -171,16 +507,23 @@ def _validate_event_clocks(
                         "previous_received_ts_ns": previous_received,
                     },
                 )
-        previous[key] = (event_ts, received_ts, index)
+        validation_state.set_event(key, (event_ts, received_ts, index))
 
 
 def _validate_trades(
-    rows: list[dict[str, Any]], dataset: str, findings: list[QualityFinding]
+    rows: list[dict[str, Any]],
+    dataset: str,
+    findings: _FindingTarget,
+    *,
+    row_offset: int = 0,
+    state: _ValidationState | None = None,
 ) -> None:
-    identities: dict[tuple[str, str, int], int] = {}
-    for index, row in enumerate(rows):
+    validation_state = state if state is not None else _MemoryState()
+    for local_index, row in enumerate(rows):
+        index = row_offset + local_index
         identity = (str(row["venue"]), str(row["symbol"]), int(row["trade_id"]))
-        if identity in identities:
+        first_row = validation_state.first_trade_row_or_insert(identity, index)
+        if first_row is not None:
             _finding(
                 findings,
                 rule_id="trade.duplicate",
@@ -189,10 +532,8 @@ def _validate_trades(
                 row_index=index,
                 row=row,
                 message="duplicate trade identity was preserved",
-                details={"first_row": identities[identity], "trade_id": identity[2]},
+                details={"first_row": first_row, "trade_id": identity[2]},
             )
-        else:
-            identities[identity] = index
         if int(row["price_ticks"]) <= 0 or float(row["price"]) <= 0.0:
             _finding(
                 findings,
@@ -250,10 +591,16 @@ def _validate_trades(
 
 
 def _validate_book_sequences(
-    rows: list[dict[str, Any]], dataset: str, findings: list[QualityFinding]
+    rows: list[dict[str, Any]],
+    dataset: str,
+    findings: _FindingTarget,
+    *,
+    row_offset: int = 0,
+    state: _ValidationState | None = None,
 ) -> None:
-    previous_end: dict[tuple[str, str, str | None], int] = {}
-    for index, row in enumerate(rows):
+    validation_state = state if state is not None else _MemoryState()
+    for local_index, row in enumerate(rows):
+        index = row_offset + local_index
         start = int(row["sequence_start"])
         end = int(row["sequence_end"])
         if end < start:
@@ -268,7 +615,7 @@ def _validate_book_sequences(
             )
             continue
         key = (str(row["venue"]), str(row["symbol"]), row.get("continuity_id"))
-        prior = previous_end.get(key)
+        prior = validation_state.get_sequence("book_observations", key)
         if prior is not None:
             expected = prior + 1
             if start > expected:
@@ -298,17 +645,31 @@ def _validate_book_sequences(
                     message="sequence event is fully stale or duplicated",
                     details={"previous_end": prior},
                 )
-        previous_end[key] = max(prior if prior is not None else end, end)
+        validation_state.set_sequence(
+            "book_observations",
+            key,
+            max(prior if prior is not None else end, end),
+        )
 
 
 def _validate_books(
     rows: list[dict[str, Any]],
     dataset: str,
-    findings: list[QualityFinding],
+    findings: _FindingTarget,
     max_spread_bps: float,
+    *,
+    row_offset: int = 0,
+    state: _ValidationState | None = None,
 ) -> None:
-    _validate_book_sequences(rows, dataset, findings)
-    for index, row in enumerate(rows):
+    _validate_book_sequences(
+        rows,
+        dataset,
+        findings,
+        row_offset=row_offset,
+        state=state,
+    )
+    for local_index, row in enumerate(rows):
+        index = row_offset + local_index
         bid = float(row["best_bid"])
         ask = float(row["best_ask"])
         bid_quantity = float(row["bid_quantity"])
@@ -431,10 +792,16 @@ def _validate_books(
 
 
 def _validate_depth_deltas(
-    rows: list[dict[str, Any]], dataset: str, findings: list[QualityFinding]
+    rows: list[dict[str, Any]],
+    dataset: str,
+    findings: _FindingTarget,
+    *,
+    row_offset: int = 0,
+    state: _ValidationState | None = None,
 ) -> None:
-    previous_end: dict[tuple[str, str, str | None], int] = {}
-    for index, row in enumerate(rows):
+    validation_state = state if state is not None else _MemoryState()
+    for local_index, row in enumerate(rows):
+        index = row_offset + local_index
         start = int(row["first_update_id"])
         end = int(row["last_update_id"])
         if end < start:
@@ -449,7 +816,7 @@ def _validate_depth_deltas(
             )
         else:
             key = (str(row["venue"]), str(row["symbol"]), row.get("continuity_id"))
-            prior = previous_end.get(key)
+            prior = validation_state.get_sequence("depth_deltas", key)
             if prior is not None:
                 expected = prior + 1
                 previous_hint = row.get("previous_update_id")
@@ -491,7 +858,11 @@ def _validate_depth_deltas(
                         message="depth delta is fully stale or duplicated",
                         details={"previous_end": prior},
                     )
-            previous_end[key] = max(prior if prior is not None else end, end)
+            validation_state.set_sequence(
+                "depth_deltas",
+                key,
+                max(prior if prior is not None else end, end),
+            )
         for side in ("bids", "asks"):
             seen_prices: set[int] = set()
             for level in row[side]:
@@ -530,6 +901,175 @@ def _validate_depth_deltas(
                         details={"side": side, "price_ticks": price_ticks},
                     )
                 seen_prices.add(price_ticks)
+
+
+class IncrementalQualityValidator:
+    """Validate normalized Arrow batches without retaining the row history.
+
+    Clock, sequence, and exact trade-identity state spill to a private temporary
+    SQLite database. ``findings`` in the final report is a bounded preview, while
+    total severity counts remain exact. Supplying ``findings_jsonl_path`` streams
+    every finding to JSONL in detection order.
+    """
+
+    def __init__(
+        self,
+        schema_name: str,
+        *,
+        max_spread_bps: float = 100.0,
+        max_silence_ns: int = 5_000_000_000,
+        max_findings: int | None = 1_000,
+        findings_jsonl_path: str | Path | None = None,
+        row_chunk_size: int = 16_384,
+    ) -> None:
+        get_schema(schema_name)
+        if row_chunk_size <= 0:
+            raise ValueError("row_chunk_size must be positive")
+        self.schema_name = schema_name
+        self.max_spread_bps = max_spread_bps
+        self.max_silence_ns = max_silence_ns
+        self.row_chunk_size = row_chunk_size
+        self._state = _SpillState()
+        try:
+            self._findings = _FindingAccumulator(
+                max_findings=max_findings,
+                findings_jsonl_path=findings_jsonl_path,
+            )
+        except BaseException:
+            self._state.close()
+            raise
+        self._rows_checked = 0
+        self._closed = False
+        self._report: ValidationReport | None = None
+
+    def __enter__(self) -> IncrementalQualityValidator:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: object,
+    ) -> None:
+        self.close()
+
+    @property
+    def rows_checked(self) -> int:
+        return self._rows_checked
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("incremental quality validator is already closed")
+
+    def _validate_rows(self, rows: list[dict[str, Any]]) -> None:
+        row_offset = self._rows_checked
+        if self.schema_name in {"trades", "book_observations", "depth_deltas"}:
+            _validate_event_clocks(
+                rows,
+                dataset=self.schema_name,
+                findings=self._findings,
+                max_silence_ns=self.max_silence_ns,
+                row_offset=row_offset,
+                state=self._state,
+            )
+        if self.schema_name == "trades":
+            _validate_trades(
+                rows,
+                self.schema_name,
+                self._findings,
+                row_offset=row_offset,
+                state=self._state,
+            )
+        elif self.schema_name == "book_observations":
+            _validate_books(
+                rows,
+                self.schema_name,
+                self._findings,
+                self.max_spread_bps,
+                row_offset=row_offset,
+                state=self._state,
+            )
+        elif self.schema_name == "depth_deltas":
+            _validate_depth_deltas(
+                rows,
+                self.schema_name,
+                self._findings,
+                row_offset=row_offset,
+                state=self._state,
+            )
+        self._rows_checked += len(rows)
+
+    def update(self, batch: pa.Table | pa.RecordBatch) -> None:
+        """Consume one table or record batch without changing its observations."""
+        self._require_open()
+        if not isinstance(batch, (pa.Table, pa.RecordBatch)):
+            raise TypeError("batch must be a pyarrow Table or RecordBatch")
+        if batch.num_rows == 0:
+            ensure_schema(batch, self.schema_name)
+            return
+        for start in range(0, batch.num_rows, self.row_chunk_size):
+            chunk = batch.slice(start, self.row_chunk_size)
+            ensure_schema(chunk, self.schema_name)
+            self._validate_rows(chunk.to_pylist())
+            self._state.commit()
+            self._findings.flush()
+
+    def finish(self) -> ValidationReport:
+        """Close spill resources and return the exact-count validation report."""
+        if self._report is not None:
+            return self._report
+        self._require_open()
+        self._state.commit()
+        self._findings.flush()
+        self._findings.publish()
+        self._state.close()
+        self._closed = True
+        jsonl_path = self._findings.path
+        self._report = ValidationReport(
+            dataset=self.schema_name,
+            rows_checked=self._rows_checked,
+            findings=self._findings.findings,
+            total_errors=self._findings.error_count,
+            total_warnings=self._findings.warning_count,
+            findings_jsonl_path=str(jsonl_path.resolve()) if jsonl_path is not None else None,
+        )
+        return self._report
+
+    def close(self) -> None:
+        """Release resources without fabricating a report for unfinished input."""
+        if self._closed:
+            return
+        self._findings.close()
+        self._state.close()
+        self._closed = True
+
+
+def validate_batches(
+    batches: Iterable[pa.Table | pa.RecordBatch],
+    schema_name: str,
+    *,
+    max_spread_bps: float = 100.0,
+    max_silence_ns: int = 5_000_000_000,
+    max_findings: int | None = 1_000,
+    findings_jsonl_path: str | Path | None = None,
+    row_chunk_size: int = 16_384,
+) -> ValidationReport:
+    """Consume an iterable once and validate it with bounded retained state."""
+    validator = IncrementalQualityValidator(
+        schema_name,
+        max_spread_bps=max_spread_bps,
+        max_silence_ns=max_silence_ns,
+        max_findings=max_findings,
+        findings_jsonl_path=findings_jsonl_path,
+        row_chunk_size=row_chunk_size,
+    )
+    try:
+        for batch in batches:
+            validator.update(batch)
+        return validator.finish()
+    except BaseException:
+        validator.close()
+        raise
 
 
 def validate_table(

@@ -76,6 +76,7 @@ class RunBundle:
     manifest: Mapping[str, Any]
     provenance: Mapping[str, Any]
     quality: Mapping[str, Any]
+    hypothesis_evaluation: Mapping[str, Any]
     predictive_metrics: tuple[Mapping[str, Any], ...]
     execution_metrics: tuple[Mapping[str, Any], ...]
     execution_sensitivity: tuple[Mapping[str, Any], ...]
@@ -197,8 +198,20 @@ def _validate_manifest(manifest: Mapping[str, Any], provenance: Mapping[str, Any
     input_hashes = provenance.get("input_manifest_sha256")
     if not isinstance(input_hashes, list):
         raise RunBundleValidationError("provenance.input_manifest_sha256 must be a list")
+    if tier != "SYNTHETIC_SMOKE" and not input_hashes:
+        raise RunBundleValidationError(
+            "public-sample and full-data runs require at least one input manifest SHA-256"
+        )
     for index, digest in enumerate(input_hashes):
         _require_sha256(digest, f"provenance.input_manifest_sha256[{index}]")
+
+    manifest_run_key = manifest.get("run_key")
+    provenance_run_key = provenance.get("run_key")
+    if manifest_run_key is not None or provenance_run_key is not None:
+        manifest_digest = _require_sha256(manifest_run_key, "run_manifest.run_key")
+        provenance_digest = _require_sha256(provenance_run_key, "provenance.run_key")
+        if not hmac.compare_digest(manifest_digest, provenance_digest):
+            raise RunBundleValidationError("run manifest and provenance run keys do not match")
 
     git = provenance.get("git")
     if not isinstance(git, Mapping):
@@ -456,11 +469,18 @@ def load_run_bundle(
         "quality_summary",
         ("quality/summary.json",),
     )
+    hypothesis_path = _artifact_path(
+        root,
+        manifest,
+        "hypothesis_evaluation",
+        (),
+    )
     return RunBundle(
         root=root,
         manifest=manifest,
         provenance=provenance,
         quality=_read_quality(quality_path),
+        hypothesis_evaluation=_read_quality(hypothesis_path),
         predictive_metrics=_read_records(predictive),
         execution_metrics=_read_records(execution),
         execution_sensitivity=_read_records(execution_sensitivity),

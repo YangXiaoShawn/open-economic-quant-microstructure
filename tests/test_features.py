@@ -10,6 +10,7 @@ from microstructure.research.features import (
     ResearchDataError,
     TemporalLeakageError,
     build_research_frame,
+    model_feature_columns,
     validate_temporal_contract,
 )
 
@@ -81,6 +82,51 @@ def test_hand_checked_causal_features_and_strict_trade_tie() -> None:
     assert at_one["signed_trade_volume_w2"] == pytest.approx(2.0)
     assert at_one["trade_feature_max_source_ts_ns"] == SECOND // 2
     assert at_one["trade_feature_max_source_ts_ns"] < at_one["decision_ts_ns"]
+    assert at_one["realized_price_impact_bps_1"] == pytest.approx(0.0)
+    assert at_one["spread_recovery_bps_1"] == pytest.approx(0.0)
+    assert at_one["depth_recovery_l1_1"] == pytest.approx(0.0)
+
+
+def test_optional_multilevel_depth_and_cancellation_enter_canonical_frame() -> None:
+    books = _books().with_columns(
+        pl.lit("binance_spot").alias("venue"),
+        (pl.col("bid_quantity") + 4.0).alias("depth_bid_5"),
+        (pl.col("ask_quantity") + 6.0).alias("depth_ask_5"),
+        (pl.col("bid_quantity") + 14.0).alias("depth_bid_10"),
+        (pl.col("ask_quantity") + 16.0).alias("depth_ask_10"),
+    )
+    depth_deltas = pl.DataFrame(
+        {
+            "venue": ["binance_spot"] * books.height,
+            "symbol": ["BTCUSDT"] * books.height,
+            "event_ts_ns": books.get_column("event_ts_ns"),
+            "available_ts_ns": books.get_column("available_ts_ns"),
+            "continuity_id": books.get_column("continuity_id"),
+            "first_update_id": books.get_column("sequence_end"),
+            "last_update_id": books.get_column("sequence_end"),
+            "bids": [
+                [{"price_ticks": 10_000, "quantity_lots": 0 if index == 1 else 10}]
+                for index in range(books.height)
+            ],
+            "asks": [[{"price_ticks": 10_200, "quantity_lots": 10}] for _ in range(books.height)],
+        }
+    )
+
+    frame = build_research_frame(
+        books,
+        _trades(),
+        _feature_config(),
+        depth_deltas=depth_deltas,
+    )
+    at_one = frame.filter(pl.col("decision_ts_ns") == SECOND).row(0, named=True)
+
+    assert at_one["depth_total_l5"] == pytest.approx(30.0)
+    assert at_one["queue_imbalance_l5"] == pytest.approx(2.0 / 30.0)
+    assert at_one["cancellation_deletes_w2"] == 1
+    assert at_one["cancellation_intensity_w2"] == pytest.approx(0.25)
+    assert at_one["cancellation_feature_max_source_ts_ns"] == SECOND
+    assert "cancellation_intensity_w2" in model_feature_columns(frame)
+    validate_temporal_contract(frame)
 
 
 def test_future_event_label_is_exact_right_censored_and_gap_local() -> None:

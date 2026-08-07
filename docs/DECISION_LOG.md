@@ -123,3 +123,88 @@ Material choices are appended; prior entries are not rewritten to hide reversals
 - **Consequence:** The cap was reached for both symbols. All 10,000 normalized
   rows passed the current validators, but both requested ranges are recorded as
   incomplete and no economic hypothesis is promoted from this sample.
+
+## 2026-08-07 — Freeze the trade-only public study before model comparison
+
+- **Context:** The already acquired public sample contains aggregate trades but
+  no contemporaneous order-book state. Reusing book features or the execution
+  simulator would turn missing observations into assumptions and overstate the
+  evidence.
+- **Decision:** Freeze a retrospective, explicitly exploratory trade-only
+  protocol with per-symbol causal features, strictly later trade labels,
+  purged walk-forward folds, validation-only model selection, and a paired
+  fixed-block comparison against the historical prior. Require the caller to
+  select the ingestion manifest by both path and SHA-256; never scan for a
+  "latest" input. Serialize execution artifacts as `NOT_RUN` with a reason.
+- **Consequence:** BTCUSDT and ETHUSDT are reported separately, including failed
+  or contradictory outcomes. The run cannot be interpreted as a book, fill,
+  P&L, statistical-significance, or persistent-alpha study.
+
+## 2026-08-07 — Make page/batch streaming the default public ingestion path
+
+- **Context:** A configurable row cap made the first 10,000-row sample safe, but
+  the original downloader, validator, and ingestion composition retained the
+  entire acquisition in memory. A cap on observations is not a RAM contract and
+  does not satisfy the larger-history requirement.
+- **Decision:** Expose a lazy, page-bounded Binance iterator; feed each page once
+  through an incremental validator with disk-backed exact identity state and
+  then into a batch-bounded Parquet writer. Keep eager materialization only as an
+  explicit compatibility operation with its own finite row guard.
+- **Consequence:** Public acquisition memory is bounded by response/batch and
+  validator preview limits rather than total history length. Manifest and part
+  metadata may still grow with page count; downstream full-history readers must
+  likewise use verified batch scans instead of eager Arrow/Polars copies.
+
+## 2026-08-07 — Verify public history before exposing a bounded canonical stream
+
+- **Context:** Hashing only an ingestion manifest does not prove that normalized
+  rows still match the declared raw pages, source symbol, exchange metadata, or
+  physical arrival order. Sorting first can also conceal source-order defects.
+- **Decision:** Bind the explicit ingestion path+SHA to configuration, raw URI
+  semantics and exact aggregate-trade fields; require inverse raw-to-normalized
+  coverage; run physical-order incremental DQ; and feed that single verified
+  Arrow stream into a memory-limited DuckDB external sort. Keep eager loading as
+  a separately guarded compatibility API.
+- **Consequence:** The current 10,000-row input can be materialized for the
+  predeclared small study, while larger consumers can iterate bounded canonical
+  batches without trusting a global in-memory sort.
+
+## 2026-08-07 — Make quality evidence atomic and ingestion-manifested
+
+- **Context:** Reusing a fixed findings filename could truncate a previous
+  complete JSONL before a rerun succeeded, leaving an older summary pointing at
+  partial/new evidence.
+- **Decision:** Stream findings into a same-directory temporary file, fsync and
+  atomically publish only on validator completion, use a distinct per-ingestion
+  quality filename, and bind report/findings paths, byte counts and SHA-256 into
+  the immutable ingestion manifest.
+- **Consequence:** A failed rerun cannot damage previously published findings;
+  complete quality evidence is independently integrity-checkable.
+
+## 2026-08-07 — Treat the exact source tree as part of run identity
+
+- **Context:** A Git commit plus `dirty=true` cannot distinguish different local
+  patches. It also allowed an old clean bundle to satisfy `make smoke` after the
+  implementation changed.
+- **Decision:** Hash the bytes, paths and modes of every tracked and non-ignored
+  untracked source file. Include that digest with commit/dirty state in
+  provenance and both synthetic/public run keys; refuse completed-target reuse
+  when any component differs. Run the `make check` smoke leg in a fresh temporary
+  target.
+- **Consequence:** Ignored raw/run artifacts do not perturb identity, but changed
+  code, configuration, tests or documentation requires a new immutable bundle.
+
+## 2026-08-07 — Journal live depth before parsing and reconstruct incrementally
+
+- **Context:** Retaining every WebSocket payload, delta and reconstructed book
+  row in Python made `collect-l2 --max-messages` an in-memory history limit. A
+  malformed frame could also fail before its original bytes were preserved.
+- **Decision:** Emit exact raw frames to a typed capture journal before decoding,
+  record each reconnect snapshot anchor, enforce per-frame/batch byte ceilings,
+  run a bounded-state incremental book reconstructor and incremental DQ, and
+  stream capture-scoped Parquet output. Publish one immutable capture-ID summary
+  last; keep the fixed summary filename only as a latest-pointer.
+- **Consequence:** Capture memory is bounded by book depth and batch limits rather
+  than message count; every epoch is resnapshotted, every message is reconciled
+  to an observation/exclusion, and parse/sequence failure leaves explicit raw
+  evidence without fabricating a completed capture.

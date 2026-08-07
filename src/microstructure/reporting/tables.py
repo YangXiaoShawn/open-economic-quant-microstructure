@@ -26,7 +26,10 @@ def _canonical_row(row: Mapping[str, Any]) -> dict[str, Any]:
     result["horizon_events"] = _first(
         row, ("horizon_events", "label_horizon_events", "horizon"), "N/A"
     )
-    result["split"] = str(_first(row, ("split", "evaluation_split"), "test"))
+    # Missing split provenance is not evidence that a row is held out.  Keep the
+    # presentation layer fail-closed so an unsplit metric cannot be promoted to
+    # final-test evidence merely by being serialized.
+    result["split"] = str(_first(row, ("split", "evaluation_split"), "unknown"))
     result["n_obs"] = _first(row, ("n_obs", "observations", "sample_size"))
     result["period_start_utc"] = _first(row, ("period_start_utc", "test_start_utc", "start_utc"))
     result["period_end_utc"] = _first(row, ("period_end_utc", "test_end_utc", "end_utc"))

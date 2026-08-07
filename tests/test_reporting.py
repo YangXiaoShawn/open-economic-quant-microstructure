@@ -12,6 +12,7 @@ from microstructure.reporting import (
     RunBundleValidationError,
     comparison_rows,
     load_run_bundle,
+    render_executive_memo,
     render_model_comparison,
     render_technical_report,
     write_checksum_manifest,
@@ -91,6 +92,11 @@ def _build_bundle(
             "roc_auc": 0.99,
             "split": "validation",
         },
+        {
+            "instrument": "BTCUSDT",
+            "model": "unsplit-model",
+            "roc_auc": 0.999,
+        },
     ]
     execution = [
         {
@@ -157,6 +163,7 @@ def test_rendering_is_deterministic_held_out_only_and_watermarked(tmp_path: Path
     assert "size_multiplier" in first
     assert len(bundle.execution_sensitivity) == 1
     assert "validation-only-model" not in table
+    assert "unsplit-model" not in table
     assert len(comparison_rows(bundle)) == 1
 
 
@@ -213,6 +220,175 @@ def test_full_data_requires_manifested_complete_coverage(tmp_path: Path) -> None
     )
 
     with pytest.raises(RunBundleValidationError, match="complete coverage"):
+        load_run_bundle(run_dir)
+
+
+def test_public_bundle_requires_manifested_input_identity(tmp_path: Path) -> None:
+    run_dir = _build_bundle(
+        tmp_path / "missing-input",
+        evidence_tier="PUBLIC_SAMPLE_PARTIAL",
+        data_mode="binance_rest",
+        data_source="binance_spot_public_rest",
+        finalize=False,
+    )
+    provenance_path = run_dir / "provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["input_manifest_sha256"] = []
+    _write_json(provenance_path, provenance)
+    write_checksum_manifest(run_dir)
+    (run_dir / "_SUCCESS").write_text("complete\n", encoding="utf-8")
+
+    with pytest.raises(RunBundleValidationError, match="at least one input manifest"):
+        load_run_bundle(run_dir)
+
+
+def test_public_trade_only_report_uses_manifest_scope_and_excludes_execution(
+    tmp_path: Path,
+) -> None:
+    run_dir = _build_bundle(
+        tmp_path / "public-trade-only",
+        evidence_tier="PUBLIC_SAMPLE_PARTIAL",
+        data_mode="binance_rest_trade_only",
+        data_source="binance_spot_public_rest",
+        finalize=False,
+    )
+    manifest_path = run_dir / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    question = "Do signed aggregate trades predict future trade-price direction?"
+    exclusion_reason = "Trade-only data contain no quotes, depth, or queue state."
+    manifest["research"] = {"question": question}
+    manifest["data"]["symbol_coverage"] = [
+        {
+            "symbol": "BTCUSDT",
+            "rows": 5_000,
+            "observed_start_utc": "2024-01-02T00:00:00Z",
+            "observed_end_inclusive_utc": "2024-01-02T00:01:53.619000Z",
+            "complete_range": False,
+        },
+        {
+            "symbol": "ETHUSDT",
+            "rows": 5_000,
+            "observed_start_utc": "2024-01-02T00:00:00Z",
+            "observed_end_inclusive_utc": "2024-01-02T00:06:49.796000Z",
+            "complete_range": False,
+        },
+    ]
+    manifest["execution_assumptions"] = {
+        "status": "NOT_RUN",
+        "reason": exclusion_reason,
+        "pnl_calculated": False,
+        "fills_calculated": False,
+    }
+    manifest["artifacts"]["hypothesis_evaluation"] = "metrics/hypothesis_evaluation.json"
+    _write_json(manifest_path, manifest)
+    _write_json(
+        run_dir / "metrics" / "hypothesis_evaluation.json",
+        {
+            "selection_metric": "log_loss",
+            "caveat": ("Exploratory paired interval only; no significance claim is authorized."),
+            "cross_instrument_conclusion": {
+                "status": "not_inferred",
+                "text": "BTCUSDT and ETHUSDT are not pooled.",
+            },
+            "per_symbol": [
+                {
+                    "symbol": "BTCUSDT",
+                    "selected_model": "logistic_l2_c1",
+                    "baseline": "historical_prior",
+                    "metric": "log_loss",
+                    "point_delta": -0.012345,
+                    "ci_low": -0.02,
+                    "ci_high": 0.003,
+                    "n_obs": 400,
+                    "n_blocks": 10,
+                    "samples": 500,
+                    "seed": 20280807,
+                    "status": "ok",
+                    "favorable_direction": "negative_selected_minus_prior_is_favorable",
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "selected_model": "shallow_tree_d2_leaf25",
+                    "baseline": "historical_prior",
+                    "metric": "log_loss",
+                    "point_delta": 0.006789,
+                    "ci_low": -0.004,
+                    "ci_high": 0.018,
+                    "n_obs": 400,
+                    "n_blocks": 10,
+                    "samples": 500,
+                    "seed": 20380807,
+                    "status": "ok",
+                    "favorable_direction": "negative_selected_minus_prior_is_favorable",
+                },
+            ],
+        },
+    )
+    _write_json(run_dir / "metrics" / "execution_metrics.json", [])
+    _write_json(run_dir / "metrics" / "execution_sensitivity.json", [])
+    write_checksum_manifest(run_dir)
+    (run_dir / "_SUCCESS").write_text("complete\n", encoding="utf-8")
+
+    bundle = load_run_bundle(run_dir)
+    technical = render_technical_report(bundle)
+    memo = render_executive_memo(bundle)
+    published = write_report_set(bundle, tmp_path / "published-public-trade-only")
+
+    assert bundle.execution_metrics == ()
+    assert bundle.execution_sensitivity == ()
+    assert len(bundle.hypothesis_evaluation["per_symbol"]) == 2
+    assert question in technical
+    assert "### Per-symbol observed coverage" in technical
+    assert "| BTCUSDT | 5000 |" in technical
+    assert "2024-01-02T00:01:53.619000Z" in technical
+    assert "| ETHUSDT | 5000 |" in technical
+    assert "2024-01-02T00:06:49.796000Z" in technical
+    assert (
+        "| BTCUSDT | 5000 | 2024-01-02T00:00:00Z | 2024-01-02T00:01:53.619000Z | false |"
+    ) in technical
+    assert (
+        "| ETHUSDT | 5000 | 2024-01-02T00:00:00Z | 2024-01-02T00:06:49.796000Z | false |"
+    ) in technical
+    assert "Execution simulation and P&L were not run" in technical
+    assert "Execution sensitivity was not run" in technical
+    assert exclusion_reason in technical
+    assert "conditional on these assumptions" not in technical
+    assert "This scenario grid changes" not in technical
+    assert "Execution simulation, fills, execution sensitivity, and P&L were not run" in memo
+    assert exclusion_reason in memo
+    assert "simulated strategy outcomes" not in memo
+    assert "Simulated fills do not prove" not in memo
+    for rendered in (
+        technical,
+        memo,
+        published.technical_report.read_text(encoding="utf-8"),
+        published.executive_memo.read_text(encoding="utf-8"),
+        published.model_comparison.read_text(encoding="utf-8"),
+    ):
+        assert "Paired H0/H1 diagnostic" in rendered
+        assert "negative value favors the selected model" in rendered
+        assert "BTCUSDT" in rendered
+        assert "-0.012345" in rendered
+        assert "ETHUSDT" in rendered
+        assert "0.006789" in rendered
+        assert "not p-values or confirmatory significance intervals" in rendered
+        assert "cannot support persistent alpha" in rendered
+
+
+def test_manifest_and_provenance_run_keys_must_match(tmp_path: Path) -> None:
+    run_dir = _build_bundle(tmp_path / "mismatched-run-key", finalize=False)
+    manifest_path = run_dir / "run_manifest.json"
+    provenance_path = run_dir / "provenance.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    manifest["run_key"] = "c" * 64
+    provenance["run_key"] = "d" * 64
+    _write_json(manifest_path, manifest)
+    _write_json(provenance_path, provenance)
+    write_checksum_manifest(run_dir)
+    (run_dir / "_SUCCESS").write_text("complete\n", encoding="utf-8")
+
+    with pytest.raises(RunBundleValidationError, match="run keys do not match"):
         load_run_bundle(run_dir)
 
 

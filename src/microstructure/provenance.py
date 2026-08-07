@@ -56,6 +56,58 @@ def git_state(project_root: str | Path) -> GitState:
     return GitState(commit=commit, dirty=bool(status.stdout.strip()))
 
 
+def git_source_tree_sha256(project_root: str | Path) -> str:
+    """Hash exact tracked and non-ignored untracked working-tree bytes.
+
+    The Git revision plus a dirty boolean cannot distinguish two different
+    patches on the same commit.  This digest is path-stable, excludes ignored
+    raw/run artifacts, and streams file content so provenance remains exact
+    without loading the source tree into memory.
+    """
+    requested_root = Path(project_root).resolve()
+    repository = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=requested_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if repository.returncode != 0:
+        return hashlib.sha256(b"NOT_A_GIT_WORKTREE").hexdigest()
+    repository_root = Path(repository.stdout.strip()).resolve()
+    listing = subprocess.run(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+    )
+    if listing.returncode != 0:
+        raise RuntimeError("unable to enumerate Git source-tree files")
+
+    digest = hashlib.sha256()
+    relative_paths = sorted(item for item in listing.stdout.split(b"\0") if item)
+    for encoded_relative in relative_paths:
+        relative = Path(os.fsdecode(encoded_relative))
+        path = repository_root / relative
+        digest.update(len(encoded_relative).to_bytes(8, "big"))
+        digest.update(encoded_relative)
+        if path.exists() or path.is_symlink():
+            digest.update((path.lstat().st_mode & 0o7777).to_bytes(4, "big"))
+        if path.is_symlink():
+            target = os.readlink(path).encode("utf-8", errors="surrogateescape")
+            digest.update(b"SYMLINK\0")
+            digest.update(len(target).to_bytes(8, "big"))
+            digest.update(target)
+        elif path.is_file():
+            digest.update(b"FILE\0")
+            digest.update(sha256_file(path).encode())
+        elif path.exists():
+            digest.update(b"OTHER\0")
+        else:
+            digest.update(b"MISSING\0")
+    return digest.hexdigest()
+
+
 def runtime_metadata() -> dict[str, str]:
     return {
         "python": sys.version.split()[0],
@@ -97,11 +149,13 @@ def provenance_header(
     input_manifests: list[str],
 ) -> dict[str, Any]:
     state = git_state(project_root)
+    git = asdict(state)
+    git["source_tree_sha256"] = git_source_tree_sha256(project_root)
     return {
         "generated_at_utc": utc_now_iso(),
         "evidence_tier": evidence_tier,
         "config_sha256": config_hash,
         "input_manifest_sha256": sorted(input_manifests),
-        "git": asdict(state),
+        "git": git,
         "runtime": runtime_metadata(),
     }

@@ -13,6 +13,12 @@ from typing import Any
 from microstructure.reporting.bundle import RunBundle
 from microstructure.reporting.tables import comparison_rows, render_model_comparison
 
+_DEFAULT_RESEARCH_QUESTION = (
+    "When do order-flow imbalance, liquidity, and observable market state predict\n"
+    "short-horizon price movement, and how much apparent value survives the separately\n"
+    "specified execution model?"
+)
+
 
 def _display(value: Any) -> str:
     if value is None or value == "":
@@ -76,6 +82,168 @@ def _sensitivity_table(bundle: RunBundle) -> str:
     return "\n".join(lines)
 
 
+def _research_question(bundle: RunBundle) -> str:
+    research = bundle.manifest.get("research")
+    if isinstance(research, Mapping):
+        question = research.get("question")
+        if isinstance(question, str) and question.strip():
+            return question.strip()
+    return _DEFAULT_RESEARCH_QUESTION
+
+
+def _hypothesis_number(value: object) -> str:
+    if value is None or isinstance(value, bool):
+        return "N/A"
+    if isinstance(value, (int, float)):
+        return f"{float(value):.6f}"
+    return _display(value)
+
+
+def _paired_hypothesis_section(bundle: RunBundle) -> str:
+    payload = bundle.hypothesis_evaluation
+    if not payload:
+        return ""
+    values = payload.get("per_symbol")
+    if not isinstance(values, list) or not values:
+        return (
+            "## Paired H0/H1 diagnostic\n\n"
+            "The declared hypothesis artifact contains no per-symbol rows."
+        )
+
+    rows = [value for value in values if isinstance(value, Mapping)]
+    metric = payload.get("selection_metric")
+    if metric == "log_loss":
+        direction_text = (
+            "For Δ log-loss (selected minus historical prior), a negative value favors the "
+            "selected model."
+        )
+    else:
+        directions = sorted(
+            {
+                str(row.get("favorable_direction"))
+                for row in rows
+                if row.get("favorable_direction") is not None
+            }
+        )
+        direction_text = (
+            "The serialized favorable direction is "
+            + (", ".join(f"`{value}`" for value in directions) if directions else "N/A")
+            + "."
+        )
+
+    lines = [
+        "## Paired H0/H1 diagnostic",
+        "",
+        (
+            "The frozen comparison is validation-selected test predictions versus the "
+            "historical-prior baseline on identical `row_id` and fixed 2x-horizon blocks. "
+            + direction_text
+        ),
+        "",
+        (
+            "| Symbol | Selected model | Baseline | Metric | Point Δ | Paired 95% interval | "
+            "Observations | Blocks | Samples | Seed | Status |"
+        ),
+        "| --- | --- | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for row in rows:
+        interval = (
+            f"[{_hypothesis_number(row.get('ci_low'))}, {_hypothesis_number(row.get('ci_high'))}]"
+        )
+        cells = (
+            row.get("symbol"),
+            row.get("selected_model"),
+            row.get("baseline"),
+            row.get("metric"),
+            _hypothesis_number(row.get("point_delta")),
+            interval,
+            row.get("n_obs"),
+            row.get("n_blocks"),
+            row.get("samples"),
+            row.get("seed"),
+            row.get("status"),
+        )
+        lines.append("| " + " | ".join(_display(cell) for cell in cells) + " |")
+
+    caveat = payload.get("caveat")
+    cross = payload.get("cross_instrument_conclusion")
+    cross_text: object = None
+    if isinstance(cross, Mapping):
+        cross_text = cross.get("text")
+    if not isinstance(cross_text, str) or not cross_text.strip():
+        cross_text = (
+            "No cross-instrument estimate was pooled. Mixed directions cannot support "
+            "persistent alpha; even matching directions remain sample-specific."
+        )
+    lines.extend(
+        [
+            "",
+            (
+                "These paired percentile intervals are dependence diagnostics, not p-values "
+                "or confirmatory significance intervals; H0 is not rejected by this "
+                "exploratory design."
+            ),
+            _display(caveat) if isinstance(caveat, str) and caveat.strip() else "",
+            "",
+            (
+                "No cross-instrument estimate was pooled. Mixed directions, if present, "
+                "cannot support persistent alpha; even matching directions would remain "
+                "bounded, sample-specific diagnostics."
+            ),
+            _display(cross_text),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _symbol_coverage_table(bundle: RunBundle) -> str:
+    coverage = bundle.data.get("symbol_coverage")
+    if not isinstance(coverage, list):
+        return ""
+
+    columns = (
+        "Symbol",
+        "Rows",
+        "Observed start (UTC)",
+        "Observed end (UTC, inclusive)",
+        "Requested range complete",
+    )
+    lines = [
+        "### Per-symbol observed coverage",
+        "",
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    for item in coverage:
+        if isinstance(item, Mapping):
+            observed_end = item.get("observed_end_inclusive_utc", item.get("observed_end_utc"))
+            complete = item.get("complete_range", item.get("complete"))
+            values = (
+                item.get("symbol"),
+                item.get("rows"),
+                item.get("observed_start_utc"),
+                observed_end,
+                complete,
+            )
+        else:
+            values = (item, None, None, None, None)
+        lines.append("| " + " | ".join(_display(value) for value in values) + " |")
+    if not coverage:
+        lines.append("| N/A | N/A | N/A | N/A | N/A |")
+    return "\n".join(lines)
+
+
+def _execution_not_run(assumptions: Mapping[str, Any]) -> bool:
+    return assumptions.get("status") == "NOT_RUN"
+
+
+def _execution_not_run_reason(assumptions: Mapping[str, Any]) -> str:
+    reason = assumptions.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        return reason.strip()
+    return "No reason was serialized."
+
+
 def _executive_summary(bundle: RunBundle) -> str:
     row_count = len(comparison_rows(bundle))
     if bundle.evidence_tier == "SYNTHETIC_SMOKE":
@@ -101,11 +269,67 @@ def _executive_summary(bundle: RunBundle) -> str:
 def render_technical_report(bundle: RunBundle) -> str:
     """Render a deterministic technical report without calculating new statistics."""
     model_table = render_model_comparison(bundle).rstrip()
+    hypothesis_section = _paired_hypothesis_section(bundle)
+    hypothesis_text = f"\n\n{hypothesis_section}" if hypothesis_section else ""
     quality = _mapping_table(bundle.quality)
+    coverage_table = _symbol_coverage_table(bundle)
+    coverage_text = f"\n\n{coverage_table}\n\n" if coverage_table else " "
     execution_assumptions = bundle.manifest.get("execution_assumptions", {})
     if not isinstance(execution_assumptions, Mapping):
         execution_assumptions = {"serialized_value": execution_assumptions}
     execution_text = _mapping_table(execution_assumptions)
+    if _execution_not_run(execution_assumptions):
+        exclusion_reason = _display(_execution_not_run_reason(execution_assumptions))
+        model_execution_text = (
+            "Only predictive diagnostics are serialized for this run. Execution simulation, "
+            "fills, and P&L are absent by design, so predictive metrics cannot be interpreted "
+            "as executable or profitable performance."
+        )
+        execution_scope_text = (
+            "**Execution simulation and P&L were not run for this bundle.** "
+            f"Reason: {exclusion_reason}\n\n"
+            "No fill, fee, slippage, latency, queue, inventory, liquidation, capacity, "
+            "turnover, or profitability result is available from this run."
+        )
+        sensitivity_text = (
+            "Execution sensitivity was not run, and no scenario rows are available. "
+            f"Reason: {exclusion_reason}"
+        )
+        economic_text = (
+            "No capital recommendation is made by this renderer. This run contains no "
+            "execution simulation or P&L, so its predictive diagnostics provide no evidence "
+            "of fillability, net returns, deployable capacity, or profitability. Predictive "
+            "outputs remain bounded by the declared evidence tier and observed interval."
+        )
+        execution_limitation = (
+            "- Execution simulation and P&L were not run; no execution-performance or "
+            "profitability inference is available."
+        )
+    else:
+        model_execution_text = (
+            "Predictive metrics and execution results remain distinct serialized inputs. A\n"
+            "model metric does not establish that a fill was possible or that its signal\n"
+            "survives fees and latency."
+        )
+        execution_scope_text = (
+            "Any fill probability, queue position, partial-fill behavior, fee, slippage,\n"
+            "latency, inventory, liquidation, or capacity result is conditional on these\n"
+            "assumptions and on the observability of the source data."
+        )
+        sensitivity_text = (
+            f"{_sensitivity_table(bundle)}\n\n"
+            "This scenario grid changes declared execution size assumptions only. It is not\n"
+            "an estimate of endogenous market impact or deployable capacity."
+        )
+        economic_text = (
+            "No capital recommendation is made by this renderer. Synthetic outputs have no\n"
+            "empirical interpretation. Public-sample outputs are interval-specific. Full-data\n"
+            "outputs still require robustness across instruments, regimes, costs, latency,\n"
+            "fill specifications, and alternative periods before an investment conclusion."
+        )
+        execution_limitation = (
+            "- Approximate fills and simulated P&L are not realized execution performance."
+        )
     return f"""# Technical report — {bundle.run_id}
 
 > **{bundle.watermark}**
@@ -123,16 +347,14 @@ does not retrain a model, recompute a statistic, or infer a missing value.
 
 ## Research question
 
-When do order-flow imbalance, liquidity, and observable market state predict
-short-horizon price movement, and how much apparent value survives the separately
-specified execution model?
+{_research_question(bundle)}
 
 ## Data lineage and quality
 
 The report covers only `{bundle.observed_start_utc}` through
 `{bundle.observed_end_utc}` in UTC for {", ".join(bundle.symbols)}. Data source and
 mode are `{_display(bundle.data.get("source"))}` and
-`{_display(bundle.data.get("mode"))}`. The frozen quality summary is:
+`{_display(bundle.data.get("mode"))}`.{coverage_text}The frozen quality summary is:
 
 {quality}
 
@@ -149,40 +371,30 @@ table only when its serialized split is `test`, `final_test`, `holdout`, or
 
 ## Model comparison
 
-{model_table}
+{model_table}{hypothesis_text}
 
-Predictive metrics and execution results remain distinct serialized inputs. A
-model metric does not establish that a fill was possible or that its signal
-survives fees and latency.
+{model_execution_text}
 
 ## Execution assumptions
 
 {execution_text}
 
-Any fill probability, queue position, partial-fill behavior, fee, slippage,
-latency, inventory, liquidation, or capacity result is conditional on these
-assumptions and on the observability of the source data.
+{execution_scope_text}
 
 ## Execution sensitivity
 
-{_sensitivity_table(bundle)}
-
-This scenario grid changes declared execution size assumptions only. It is not
-an estimate of endogenous market impact or deployable capacity.
+{sensitivity_text}
 
 ## Economic interpretation
 
-No capital recommendation is made by this renderer. Synthetic outputs have no
-empirical interpretation. Public-sample outputs are interval-specific. Full-data
-outputs still require robustness across instruments, regimes, costs, latency,
-fill specifications, and alternative periods before an investment conclusion.
+{economic_text}
 
 ## Limitations
 
 - Exchange behavior and public data coverage may not generalize to other venues.
 - Exchange event time does not prove local receipt or decision-time availability.
 - Trade-only data cannot identify true queue position or cancellation dynamics.
-- Approximate fills and simulated P&L are not realized execution performance.
+{execution_limitation}
 - Small or selected periods can exaggerate stability; multiple comparisons raise
   false-discovery risk.
 - Checksums establish artifact integrity, not economic validity.
@@ -205,6 +417,81 @@ def render_executive_memo(bundle: RunBundle) -> str:
     if not isinstance(git, Mapping):
         git = {}
     input_hashes = bundle.provenance.get("input_manifest_sha256", [])
+    hypothesis_section = _paired_hypothesis_section(bundle)
+    hypothesis_text = f"\n\n{hypothesis_section}" if hypothesis_section else ""
+    execution_assumptions = bundle.manifest.get("execution_assumptions", {})
+    if not isinstance(execution_assumptions, Mapping):
+        execution_assumptions = {"serialized_value": execution_assumptions}
+    if _execution_not_run(execution_assumptions):
+        exclusion_reason = _display(_execution_not_run_reason(execution_assumptions))
+        artifact_inventory = (
+            f"It contains {comparison_count} held-out comparison row(s). Execution "
+            "simulation, fills, execution sensitivity, and P&L were not run. "
+            f"Reason: {exclusion_reason} No absent execution metric should be interpreted "
+            "as zero."
+        )
+        decision_framing = (
+            "**Decision framing.** This bundle can assess only the serialized predictive "
+            "diagnostics. It cannot assess fillability, fees, spread, latency, adverse "
+            "selection, inventory, capacity, net returns, or profitability because no "
+            "execution model or P&L calculation was run."
+        )
+        material_risks = (
+            "**Material risks.** Public exchange data may omit receipt-time information and "
+            "matching-engine state. Trade-only observations cannot reveal spread, depth, "
+            "cancellations, queue priority, or fillability. Clock gaps, sequence gaps, "
+            "regime concentration, and repeated model searches can create optimistic "
+            "predictive diagnostics."
+        )
+        kill_criteria = (
+            "**Kill criteria.** Stop escalation if the apparent effect disappears on the "
+            "untouched test period; changes sign across instruments or regimes without an "
+            "economic explanation; fails checksum, timing, or leakage controls; or depends "
+            "on repeated sample or model selection. Predictive diagnostics alone cannot "
+            "clear an execution or capital gate."
+        )
+        next_evidence = (
+            "**Next evidence requested.** Reproduce the same frozen configuration, then test "
+            "a predeclared adjacent period and both default instruments. Publish data-quality "
+            "exceptions, fold boundaries, calibration, and dependence-aware intervals. "
+            "Acquire appropriate quote or order-book data before any separate execution, "
+            "fill, cost, capacity, or P&L study. Record failed hypotheses as carefully as "
+            "favorable ones."
+        )
+    else:
+        artifact_inventory = (
+            f"It contains\n{comparison_count} held-out comparison row(s) and "
+            f"{sensitivity_count} execution-\nsensitivity scenario row(s). Those rows are "
+            "diagnostics, not a\nclaim that a signal is stable, executable, or profitable."
+        )
+        decision_framing = (
+            "**Decision framing.** Predictive quality, execution assumptions, and simulated\n"
+            "strategy outcomes must be assessed separately. A higher classification score is\n"
+            "not sufficient: the apparent edge must remain after fees, spread, latency,\n"
+            "partial fills, adverse selection, liquidation, and inventory constraints. Any\n"
+            "missing metric is reported as unavailable rather than zero."
+        )
+        material_risks = (
+            "**Material risks.** Public exchange data may omit receipt-time information and\n"
+            "matching-engine state. Trade-only observations cannot reveal true queue priority.\n"
+            "Clock gaps, sequence gaps, regime concentration, cost assumptions, and repeated\n"
+            "model searches can all create optimistic results. Simulated fills do not prove\n"
+            "capacity or operational executability."
+        )
+        kill_criteria = (
+            "**Kill criteria.** Stop escalation if the apparent effect disappears on the\n"
+            "untouched test period; changes sign across instruments or regimes without an\n"
+            "economic explanation; fails checksum, timing, or leakage controls; depends on an\n"
+            "implausibly favorable fee, latency, or fill assumption; or cannot beat the\n"
+            "declared baseline after costs with uncertainty reported."
+        )
+        next_evidence = (
+            "**Next evidence requested.** Reproduce the same frozen configuration, then test a\n"
+            "predeclared adjacent period and both default instruments. Publish data-quality\n"
+            "exceptions, fold boundaries, calibration, bootstrap intervals, gross-to-net\n"
+            "attribution, fill/latency sensitivity, turnover, inventory, and liquidation\n"
+            "effects. Record failed hypotheses as carefully as favorable ones."
+        )
     return f"""# Research review memo — {bundle.run_id}
 
 > **{bundle.watermark}**
@@ -220,16 +507,9 @@ The observed interval is `{bundle.observed_start_utc}` through
 `{bundle.observed_end_utc}` for {", ".join(bundle.symbols)}. The run records
 configuration `{bundle.provenance.get("config_sha256")}`, input-manifest hashes
 `{_display(input_hashes)}`, and Git commit `{_display(git.get("commit"))}` with
-dirty flag `{_display(git.get("dirty"))}`. It contains
-{comparison_count} held-out comparison row(s) and {sensitivity_count} execution-
-sensitivity scenario row(s). Those rows are diagnostics, not a
-claim that a signal is stable, executable, or profitable.
+dirty flag `{_display(git.get("dirty"))}`. {artifact_inventory}
 
-**Decision framing.** Predictive quality, execution assumptions, and simulated
-strategy outcomes must be assessed separately. A higher classification score is
-not sufficient: the apparent edge must remain after fees, spread, latency,
-partial fills, adverse selection, liquidation, and inventory constraints. Any
-missing metric is reported as unavailable rather than zero.
+{decision_framing}{hypothesis_text}
 
 **Current conclusion.** The defensible decision is to preserve the run as
 reproducible evidence and use it to choose the next falsification test. It is not
@@ -240,23 +520,11 @@ tier.
 
 ## Page 2 — Risks, kill criteria, and next work
 
-**Material risks.** Public exchange data may omit receipt-time information and
-matching-engine state. Trade-only observations cannot reveal true queue priority.
-Clock gaps, sequence gaps, regime concentration, cost assumptions, and repeated
-model searches can all create optimistic results. Simulated fills do not prove
-capacity or operational executability.
+{material_risks}
 
-**Kill criteria.** Stop escalation if the apparent effect disappears on the
-untouched test period; changes sign across instruments or regimes without an
-economic explanation; fails checksum, timing, or leakage controls; depends on an
-implausibly favorable fee, latency, or fill assumption; or cannot beat the
-declared baseline after costs with uncertainty reported.
+{kill_criteria}
 
-**Next evidence requested.** Reproduce the same frozen configuration, then test a
-predeclared adjacent period and both default instruments. Publish data-quality
-exceptions, fold boundaries, calibration, bootstrap intervals, gross-to-net
-attribution, fill/latency sensitivity, turnover, inventory, and liquidation
-effects. Record failed hypotheses as carefully as favorable ones.
+{next_evidence}
 
 **Governance.** Any later memo must retain the evidence banner, actual UTC data
 period, configuration and input hashes, and Git state. A changed assumption is a
@@ -298,7 +566,11 @@ def write_report_set(bundle: RunBundle, output_dir: str | Path) -> ReportPaths:
     comparison = output / "model_comparison.md"
     _atomic_write(technical, render_technical_report(bundle))
     _atomic_write(memo, render_executive_memo(bundle))
-    _atomic_write(comparison, render_model_comparison(bundle))
+    comparison_content = render_model_comparison(bundle).rstrip()
+    hypothesis_section = _paired_hypothesis_section(bundle)
+    if hypothesis_section:
+        comparison_content += "\n\n" + hypothesis_section
+    _atomic_write(comparison, comparison_content)
     return ReportPaths(
         technical_report=technical,
         executive_memo=memo,

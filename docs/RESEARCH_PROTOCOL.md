@@ -94,6 +94,14 @@ Models are selected on aggregate validation log loss (classification) or MAE
 indistinguishable under the predeclared rule. The final test cannot change the
 model, signal threshold, calibration, size, latency, or fee assumption.
 
+The frozen trade-only public protocol is narrower and is specified separately
+in `docs/PUBLIC_TRADE_PROTOCOL.md`. It evaluates each symbol independently and
+uses the same held-out rows and identical contiguous bootstrap draws for the
+validation-selected model-minus-historical-prior log-loss difference. Marginal
+model intervals are not substituted for that paired estimand. Because the input
+has no contemporaneous book, execution, fill, P&L, and capacity artifacts are
+serialized as `NOT_RUN`, not zero.
+
 ## Execution scenarios
 
 Base market orders use the book observable at order-arrival time after separate

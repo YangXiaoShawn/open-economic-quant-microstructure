@@ -9,12 +9,14 @@ import re
 import tempfile
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pyarrow as pa  # type: ignore[import-untyped]
+import pyarrow.compute as pc  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
 from microstructure.data.schemas import SCHEMA_VERSION, ensure_schema, get_schema
@@ -36,6 +38,9 @@ class PartitionArtifact:
     symbol: str
     partition_date: str
     rows: int
+    write_ordinal: int
+    observed_start_ns: int
+    observed_end_inclusive_ns: int
     data_path: Path
     manifest_path: Path
     data_sha256: str
@@ -48,6 +53,19 @@ class DatasetWriteResult:
     schema_version: str
     rows: int
     artifacts: tuple[PartitionArtifact, ...]
+    manifest_path: Path
+    manifest_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureDatasetWriteResult:
+    """Constant-descriptor result for one bounded-memory live capture."""
+
+    dataset: str
+    schema_version: str
+    rows: int
+    data_path: Path | None
+    data_sha256: str | None
     manifest_path: Path
     manifest_sha256: str
 
@@ -130,6 +148,7 @@ def _write_parquet_part(
     requested_end_ns: int | None,
     time_column: str,
     compression: str,
+    write_ordinal: int,
 ) -> PartitionArtifact:
     partition = (
         root
@@ -164,7 +183,9 @@ def _write_parquet_part(
         temporary.unlink(missing_ok=True)
         raise
 
-    times = table.column(time_column).to_pylist()
+    time_bounds = pc.min_max(table.column(time_column)).as_py()
+    if time_bounds is None or time_bounds["min"] is None or time_bounds["max"] is None:
+        raise StorageError("cannot manifest a Parquet part without a timestamp range")
     manifest_payload: dict[str, Any] = {
         "manifest_version": MANIFEST_VERSION,
         "artifact_kind": "normalized_parquet",
@@ -174,11 +195,15 @@ def _write_parquet_part(
         "venue": venue,
         "symbol": symbol,
         "partition_date": date,
+        "write_ordinal": write_ordinal,
         "source": source,
         "source_uri": source_uri,
         "downloaded_at_utc": downloaded_at_utc,
         "requested_range_ns": {"start": requested_start_ns, "end_exclusive": requested_end_ns},
-        "observed_range_ns": {"start": min(times), "end_inclusive": max(times)},
+        "observed_range_ns": {
+            "start": int(time_bounds["min"]),
+            "end_inclusive": int(time_bounds["max"]),
+        },
         "source_checksum_sha256": source_checksum_sha256,
         "checksum": {"algorithm": "sha256", "value": checksum},
         "rows": table.num_rows,
@@ -199,6 +224,9 @@ def _write_parquet_part(
         symbol=symbol,
         partition_date=date,
         rows=table.num_rows,
+        write_ordinal=write_ordinal,
+        observed_start_ns=int(time_bounds["min"]),
+        observed_end_inclusive_ns=int(time_bounds["max"]),
         data_path=destination,
         manifest_path=manifest_path,
         data_sha256=checksum,
@@ -224,6 +252,7 @@ def write_partitioned_parquet(
     requested_end_ns: int | None = None,
     time_column: str = "event_ts_ns",
     max_rows_per_file: int = 250_000,
+    max_input_batch_rows: int = 250_000,
     compression: str = "zstd",
 ) -> DatasetWriteResult:
     """Stream batches into immutable Parquet parts partitioned by venue/symbol/day.
@@ -234,6 +263,8 @@ def write_partitioned_parquet(
     """
     if max_rows_per_file < 1:
         raise ValueError("max_rows_per_file must be positive")
+    if max_input_batch_rows < 1:
+        raise ValueError("max_input_batch_rows must be positive")
     destination_root = Path(root)
     destination_root.mkdir(parents=True, exist_ok=True)
     download_time = downloaded_at_utc or utc_now_iso()
@@ -241,6 +272,11 @@ def write_partitioned_parquet(
 
     for raw_batch in batches:
         table = _as_table(raw_batch)
+        if table.num_rows > max_input_batch_rows:
+            raise StorageError(
+                f"input batch has {table.num_rows} rows, above the bounded-memory limit "
+                f"{max_input_batch_rows}"
+            )
         ensure_schema(table, schema_name)
         if time_column not in table.column_names:
             raise StorageError(f"partition time column is missing: {time_column}")
@@ -274,6 +310,7 @@ def write_partitioned_parquet(
                         requested_end_ns=requested_end_ns,
                         time_column=time_column,
                         compression=compression,
+                        write_ordinal=len(artifacts),
                     )
                 )
 
@@ -284,8 +321,13 @@ def write_partitioned_parquet(
             "data_sha256": item.data_sha256,
             "manifest_sha256": item.manifest_sha256,
             "rows": item.rows,
+            "write_ordinal": item.write_ordinal,
+            "observed_range_ns": {
+                "start": item.observed_start_ns,
+                "end_inclusive": item.observed_end_inclusive_ns,
+            },
         }
-        for item in sorted(artifacts, key=lambda item: str(item.data_path))
+        for item in artifacts
     ]
     stable_identity: dict[str, Any] = {
         "manifest_version": MANIFEST_VERSION,
@@ -308,6 +350,207 @@ def write_partitioned_parquet(
         schema_version=SCHEMA_VERSION,
         rows=sum(item.rows for item in artifacts),
         artifacts=tuple(artifacts),
+        manifest_path=manifest_path,
+        manifest_sha256=manifest_sha,
+    )
+
+
+def write_capture_parquet(
+    batches: Iterable[pa.RecordBatch | pa.Table],
+    *,
+    root: str | Path,
+    dataset: str,
+    schema_name: str,
+    venue: str,
+    symbol: str,
+    capture_id: str,
+    source: str,
+    source_uri: str,
+    downloaded_at_utc: str | None = None,
+    source_checksum_sha256: str | None = None,
+    requested_start_ns: int | None = None,
+    requested_end_ns: int | None = None,
+    time_column: str = "event_ts_ns",
+    max_input_batch_rows: int = 16_384,
+    compression: str = "zstd",
+) -> CaptureDatasetWriteResult:
+    """Write one live-capture Parquet artifact from a bounded batch iterator.
+
+    The Parquet writer emits one bounded row group per input batch and retains
+    exactly one output descriptor, independent of capture length.  Live capture
+    data is partitioned by immutable ``capture_id`` rather than UTC day because
+    capture-order quality evidence must not be reordered to satisfy a partition.
+    """
+    if max_input_batch_rows < 1:
+        raise ValueError("max_input_batch_rows must be positive")
+    safe_dataset = _safe(dataset, "dataset")
+    safe_schema = _safe(SCHEMA_VERSION, "schema version")
+    safe_venue = _safe(venue, "venue")
+    safe_symbol = _safe(symbol, "symbol")
+    safe_capture_id = _safe(capture_id, "capture ID")
+    schema = get_schema(schema_name)
+    if time_column not in schema.names:
+        raise StorageError(f"partition time column is missing: {time_column}")
+
+    destination_root = Path(root)
+    partition = (
+        destination_root
+        / safe_dataset
+        / f"schema-{safe_schema}"
+        / f"venue-{safe_venue}"
+        / f"symbol-{safe_symbol}"
+        / f"capture-{safe_capture_id}"
+    )
+    partition.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=partition,
+        prefix=".capture-",
+        suffix=".parquet.tmp",
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    writer: pq.ParquetWriter | None = None
+    rows = 0
+    observed_start_ns: int | None = None
+    observed_end_ns: int | None = None
+    destination: Path | None = None
+    checksum: str | None = None
+    try:
+        writer = pq.ParquetWriter(
+            temporary,
+            schema,
+            compression=compression,
+            use_dictionary=True,
+            write_statistics=True,
+        )
+        for raw_batch in batches:
+            table = _as_table(raw_batch)
+            if table.num_rows > max_input_batch_rows:
+                raise StorageError(
+                    f"input batch has {table.num_rows} rows, above the bounded-memory "
+                    f"limit {max_input_batch_rows}"
+                )
+            ensure_schema(table, schema_name)
+            if table.num_rows == 0:
+                continue
+            if set(table.column("venue").to_pylist()) != {venue}:
+                raise StorageError("live capture batch contains an unexpected venue")
+            if set(table.column("symbol").to_pylist()) != {symbol}:
+                raise StorageError("live capture batch contains an unexpected symbol")
+            bounds = pc.min_max(table.column(time_column)).as_py()
+            if bounds is None or bounds["min"] is None or bounds["max"] is None:
+                raise StorageError("cannot write a live capture batch without timestamps")
+            batch_start = int(bounds["min"])
+            batch_end = int(bounds["max"])
+            observed_start_ns = (
+                batch_start if observed_start_ns is None else min(observed_start_ns, batch_start)
+            )
+            observed_end_ns = (
+                batch_end if observed_end_ns is None else max(observed_end_ns, batch_end)
+            )
+            writer.write_table(table, row_group_size=max_input_batch_rows)
+            rows += table.num_rows
+        writer.close()
+        writer = None
+        if rows == 0:
+            temporary.unlink()
+        else:
+            with temporary.open("rb") as handle:
+                os.fsync(handle.fileno())
+            checksum = sha256_file(temporary)
+            destination = partition / f"capture-{checksum[:20]}.parquet"
+            if destination.exists():
+                if sha256_file(destination) != checksum:
+                    raise StorageError(f"content-address collision at {destination}")
+                temporary.unlink()
+            else:
+                os.replace(temporary, destination)
+    except BaseException:
+        if writer is not None:
+            with suppress(BaseException):
+                writer.close()
+        temporary.unlink(missing_ok=True)
+        raise
+
+    download_time = downloaded_at_utc or utc_now_iso()
+    data_path = destination
+    data_sha256 = checksum
+    artifact_entry: dict[str, Any] | None = None
+    if data_path is not None and data_sha256 is not None:
+        artifact_payload: dict[str, Any] = {
+            "manifest_version": MANIFEST_VERSION,
+            "artifact_kind": "normalized_live_capture_parquet",
+            "dataset": dataset,
+            "schema_name": schema_name,
+            "schema_version": SCHEMA_VERSION,
+            "venue": venue,
+            "symbol": symbol,
+            "capture_id": capture_id,
+            "source": source,
+            "source_uri": source_uri,
+            "downloaded_at_utc": download_time,
+            "requested_range_ns": {
+                "start": requested_start_ns,
+                "end_exclusive": requested_end_ns,
+            },
+            "observed_range_ns": {
+                "start": observed_start_ns,
+                "end_inclusive": observed_end_ns,
+            },
+            "source_checksum_sha256": source_checksum_sha256,
+            "checksum": {"algorithm": "sha256", "value": data_sha256},
+            "rows": rows,
+            "bytes": data_path.stat().st_size,
+            "path": str(data_path.relative_to(destination_root)),
+            "transformations": [
+                "normalized field names and types",
+                "UTC epoch-nanosecond timestamp conversion",
+                "exact integer tick/lot conversion where scale supplied",
+            ],
+        }
+        artifact_manifest_path, artifact_manifest_sha = _immutable_json(
+            partition,
+            f"capture-{data_sha256[:20]}.manifest",
+            artifact_payload,
+        )
+        artifact_entry = {
+            "data_path": str(data_path.relative_to(destination_root)),
+            "manifest_path": str(artifact_manifest_path.relative_to(destination_root)),
+            "data_sha256": data_sha256,
+            "manifest_sha256": artifact_manifest_sha,
+            "rows": rows,
+            "write_ordinal": 0,
+            "observed_range_ns": artifact_payload["observed_range_ns"],
+        }
+
+    dataset_payload: dict[str, Any] = {
+        "manifest_version": MANIFEST_VERSION,
+        "dataset": dataset,
+        "schema_version": SCHEMA_VERSION,
+        "source": source,
+        "source_uri": source_uri,
+        "downloaded_at_utc": download_time,
+        "requested_range_ns": {
+            "start": requested_start_ns,
+            "end_exclusive": requested_end_ns,
+        },
+        "partitioning": {"kind": "capture_id", "value": capture_id},
+        "artifacts": [artifact_entry] if artifact_entry is not None else [],
+        "rows": rows,
+    }
+    manifest_directory = destination_root / "_manifests"
+    manifest_directory.mkdir(parents=True, exist_ok=True)
+    manifest_path, manifest_sha = _immutable_json(
+        manifest_directory,
+        f"{safe_dataset}.capture-{safe_capture_id}.manifest",
+        dataset_payload,
+    )
+    return CaptureDatasetWriteResult(
+        dataset=dataset,
+        schema_version=SCHEMA_VERSION,
+        rows=rows,
+        data_path=data_path,
+        data_sha256=data_sha256,
         manifest_path=manifest_path,
         manifest_sha256=manifest_sha,
     )

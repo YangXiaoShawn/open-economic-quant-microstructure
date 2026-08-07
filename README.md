@@ -73,8 +73,10 @@ make download-sample
 ```
 
 It uses Binance's public market-data-only REST base URL and requires no API key.
-The adapter honors retryable status codes and `Retry-After`, paginates by trade
-ID to avoid losing tied timestamps, and imposes a small per-symbol row cap. See
+The adapter honors retryable status codes, `Retry-After`, and interrupted body
+streams; paginates by trade ID to avoid losing tied timestamps; enforces a
+response-byte ceiling; and imposes a small per-symbol row cap. Pages flow once
+through disk-backed incremental validation into bounded Parquet batches. See
 the official [Spot REST documentation](https://developers.binance.com/en/docs/products/spot/rest-api)
 and [Spot WebSocket stream guide](https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/ws-streams/~).
 
@@ -83,6 +85,17 @@ purpose. Public historical Spot depth is not assumed to exist. A book-based
 empirical study begins only after a continuous local snapshot/delta epoch has
 been captured and passed sequence checks.
 
+Producing a public research bundle never scans for a "latest" input. Select the
+immutable ingestion manifest explicitly by both path and digest:
+
+```bash
+make reproduce-public-sample \
+  PUBLIC_INGESTION_MANIFEST=data/_ingestion_manifests/<manifest>.json \
+  PUBLIC_INGESTION_MANIFEST_SHA256=<64-character-sha256>
+make verify-public-run
+make report-public
+```
+
 ## Commands
 
 | Command | Purpose |
@@ -90,10 +103,13 @@ been captured and passed sequence checks.
 | `make setup` | Create/synchronize the locked Python 3.12 environment |
 | `make download-sample` | Download the bounded credential-free public trade sample |
 | `make validate-data` | Run offline, non-mutating validation on the synthetic fixture |
+| `make validate-public-data` | Validate configured public normalized partitions incrementally |
 | `make smoke` | Produce or verify the immutable synthetic vertical slice |
 | `make test` | Run all unit and integration tests without network access |
 | `make reproduce-sample` | Alias for the canonical smoke producer |
+| `make reproduce-public-sample` | Produce a trade-only run from an explicit manifest path + SHA |
 | `make verify-run` | Verify run structure and every protected checksum |
+| `make verify-public-run` | Verify the explicit public run bundle |
 | `make report` | Render a fresh report set from the frozen bundle |
 | `make dashboard` | Open the local read-only Streamlit research dashboard |
 | `make check` | Run Ruff, strict mypy, pytest, and the smoke producer |
@@ -106,7 +122,10 @@ The equivalent CLI is available as `microstructure` after setup. Run
 
 - Credential-free aggregate-trade ingestion with bounded retries, raw response
   preservation, symbol metadata, exact scaling, immutable manifests, and
-  streaming partitioned Parquet writes.
+  streaming partitioned Parquet writes. A verified public reader performs
+  physical-order incremental DQ and a single upstream Parquet pass into a
+  spill-capable DuckDB canonical sort; eager compatibility reads have a separate
+  hard row limit.
 - Optional public live diff-depth capture plus REST snapshot anchoring and pure
   `U/u` reconstruction with stale, overlap, gap, crossed-book, and invariant
   checks. Reconnection starts a new continuity epoch.
@@ -114,8 +133,9 @@ The equivalent CLI is available as `microstructure` after setup. Run
   scale mismatches, abnormal spread, silence, gaps, and crossed books. Validation
   never repairs observations.
 - Leakage-safe spread, L1/L5/L10 depth state, queue imbalance, microprice, OFI,
-  signed flow, intensity, volatility, impact, recovery, regime, and stability
-  research APIs, with event-time and clock-time labels and explicit censoring.
+  signed flow, intensity, volatility, observable zero-quantity cancellation,
+  causal lagged impact/recovery, regime, and stability features, with event-time
+  and clock-time labels and explicit censoring.
 - A common-fold model ladder: historical prior, unpenalized logistic regression,
   L2-regularized logistic grid, and shallow tree. Selection uses validation data;
   the final test is frozen. Calibration and fixed-block bootstrap diagnostics are
@@ -153,24 +173,30 @@ _SUCCESS
 ```
 
 The semantic run key is derived from the configuration, immutable input identity,
-Git state, and seed—not generation timestamps. Repeating a completed run does
-not mutate it.
+Git commit, the exact tracked/non-ignored source-tree digest, and seed—not
+generation timestamps. Reuse additionally requires the current source identity
+to match; an older clean bundle cannot masquerade as evidence for changed code.
 
 ## Main findings and current evidence
 
 As of 2026-08-07:
 
-- The integrated offline suite passes 91 tests, Ruff, and strict mypy across the
+- The integrated offline suite passes 208 tests, Ruff, and strict mypy across 28
+  source modules covering the
   data, reconstruction, timing, modeling, execution, reporting, dashboard, and
   pipeline boundaries.
 - A fixed public sample for 2024-01-02 downloaded and normalized 10,000 real
   aggregate trades: 5,000 each for BTCUSDT and ETHUSDT. The configured cap was
   reached for both instruments, so both ranges are explicitly marked incomplete.
   The current validators reported zero errors and zero warnings on those rows.
-- No empirical price-prediction, statistical-significance, profitability, or
-  capacity finding is supported. The public sample contains trades only and is
-  intentionally too narrow and capped for promotion under the research protocol.
-  Synthetic model and P&L values are never interpreted economically.
+- The generated trade-only report serializes per-symbol paired held-out
+  model-minus-prior diagnostics without pooling instruments. Exact metrics live
+  only in the checksum-verified run bundle; they are not manually copied into
+  this file.
+- The single-date, cap-truncated, validation-selected diagnostics do
+  not authorize a statistical-significance, persistent-alpha, profitability,
+  or capacity claim. The public bundle records execution and P&L as `NOT_RUN`;
+  synthetic model/P&L values are never interpreted economically.
 
 This distinction is the main research conclusion so far: a functioning simulator
 is not evidence that a market effect exists.

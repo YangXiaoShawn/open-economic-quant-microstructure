@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
@@ -20,7 +21,11 @@ class ConfigError(ValueError):
 
 
 EvidenceTier = Literal["SYNTHETIC_SMOKE", "PUBLIC_SAMPLE_PARTIAL", "FULL_DATA"]
-DataMode = Literal["synthetic", "binance_rest"]
+# Adapter modes are intentionally open-ended: ingestion owns the fail-closed
+# registry, while configuration validates a stable identifier that third-party
+# adapters can use.  Built-in modes retain their source-specific checks below.
+DataMode = str
+_DATA_MODE_PATTERN = re.compile(r"[a-z][a-z0-9_.-]{0,63}")
 
 
 def _utc_datetime(value: str) -> datetime:
@@ -173,8 +178,11 @@ def load_config(path: str | Path) -> ProjectConfig:
     if evidence_tier not in {"SYNTHETIC_SMOKE", "PUBLIC_SAMPLE_PARTIAL", "FULL_DATA"}:
         raise ConfigError(f"unsupported evidence tier: {evidence_tier}")
     mode = str(data_raw["mode"])
-    if mode not in {"synthetic", "binance_rest"}:
-        raise ConfigError(f"unsupported data mode: {mode}")
+    if _DATA_MODE_PATTERN.fullmatch(mode) is None:
+        raise ConfigError(
+            "data.mode must be a lowercase adapter identifier containing only "
+            "letters, digits, underscores, dots, or hyphens"
+        )
 
     start = _utc_datetime(str(data_raw["start"]))
     end_value = data_raw.get("end")
@@ -188,7 +196,7 @@ def load_config(path: str | Path) -> ProjectConfig:
         seed=int(run_raw["seed"]),
     )
     data = DataConfig(
-        mode=cast(DataMode, mode),
+        mode=mode,
         source=str(data_raw["source"]),
         symbols=tuple(str(symbol).upper() for symbol in data_raw["symbols"]),
         start=start,
@@ -264,6 +272,12 @@ def load_config(path: str | Path) -> ProjectConfig:
         raise ConfigError("synthetic inputs must use the SYNTHETIC_SMOKE evidence tier")
     if data.mode == "binance_rest" and run.evidence_tier == "SYNTHETIC_SMOKE":
         raise ConfigError("public inputs cannot use the SYNTHETIC_SMOKE evidence tier")
+    if data.mode == "binance_rest" and data.end is None:
+        raise ConfigError("binance_rest mode requires a bounded data.end")
+    if data.mode == "binance_rest" and (
+        data.max_events_per_symbol is None or data.max_events_per_symbol < 1
+    ):
+        raise ConfigError("binance_rest mode requires positive data.max_events_per_symbol")
     if data.schema_version != SCHEMA_VERSION:
         raise ConfigError(
             f"unsupported data.schema_version {data.schema_version!r}; expected {SCHEMA_VERSION!r}"

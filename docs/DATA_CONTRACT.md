@@ -83,9 +83,12 @@ the book is not live again until a new snapshot starts a new epoch.
 The configured historical adapter uses only credential-free public market-data
 REST endpoints. It starts aggregate-trade pagination with a fixed UTC interval,
 then advances by aggregate trade ID so trades sharing a timestamp are not lost.
-HTTP 408/418/429/5xx and connection failures use bounded exponential backoff;
-`Retry-After` is honored for rate-limit responses. Every exact response body is
-content-addressed and manifested before normalization.
+HTTP 408/418/429/5xx, connection failures, and recoverable interruptions while
+streaming an HTTP 200 body use bounded exponential backoff; `Retry-After` is
+honored for rate-limit responses. Response bodies have a byte ceiling. Every
+accepted exact body is content-addressed and manifested before normalization;
+an interrupted or oversized response preserves a bounded rejected prefix and an
+explicit rejection sidecar before retry/failure.
 
 The optional live collector uses the market-data-only WebSocket endpoint and
 diff-depth `U/u` updates. A correct local book buffers updates, fetches a public
@@ -96,13 +99,24 @@ starts a new continuity epoch. These rules follow Binance's official
 Public REST behavior and rate-limit headers are described in the official
 [Spot REST documentation](https://developers.binance.com/en/docs/products/spot/rest-api).
 
-Every historical download requires a finite per-symbol row cap. The low-level
-downloader cannot be invoked without one, and validation refuses to concatenate
-more rows than the configured bound. Large studies must be decomposed into
-bounded date/symbol partitions rather than increasing one in-memory request
-without limit. A `ConfiguredDataAdapter` protocol is the normalized extension
-boundary for later venues or institutional sources; its mode must match the
-resolved configuration before dispatch.
+Live capture persists each WebSocket frame before UTF-8/JSON parsing in a typed
+base64 journal containing exact bytes, local receipt time, capture sequence and
+continuity epoch. Each reconnect snapshot's raw body and sidecar are journaled as
+an anchor. A frame above 1 MiB fails only after its evidence is preserved;
+normalized Arrow spools flush before an estimated 16 MiB batch ceiling. A
+capture-ID-scoped normalized root produces one streaming Parquet descriptor per
+nonempty table, and a capture-ID completion summary is atomically published
+last. The fixed summary name is only a latest-pointer, never the sole completion
+record. Historical REST output retains the date-partition layout described
+below.
+
+Every historical download requires a finite per-symbol event cap, but that cap
+is not treated as a RAM budget. The default path lazily yields at most one REST
+page per Arrow batch, updates exact disk-backed quality state, and feeds the
+Parquet writer once. Eager compatibility materialization has a separate hard
+row guard. A `ConfiguredDataAdapter` protocol/registry is the normalized
+extension boundary for later venues or institutional sources; its mode must
+match the resolved configuration before dispatch.
 
 ## Storage and manifests
 
@@ -112,18 +126,29 @@ Normalized Parquet is content-addressed and partitioned beneath:
 <root>/<dataset>/schema-<version>/venue-<venue>/symbol-<symbol>/date-YYYY-MM-DD/
 ```
 
-Writers consume bounded Arrow record batches; they do not require all history in
-memory. Each part has an immutable sidecar with source URI, download/creation
+Writers reject oversized input batches before row conversion and consume
+bounded Arrow record batches; they do not require all event rows in memory.
+Each part has an immutable sidecar with source URI, download/creation
 time, requested and observed ranges, row/byte counts, schema version,
-transformations, input checksum, and Parquet checksum. A dataset manifest lists
-all parts and manifest hashes. Run bundles snapshot these manifest hashes and
-protect every included file with `checksums.sha256`.
+transformations, input checksum, write ordinal, and Parquet checksum. A dataset
+manifest lists all parts, sidecars, hashes, row counts, observed bounds and write
+order. Validation checks those bytes before scanning rows. Run bundles snapshot
+these manifest hashes and protect every included file with `checksums.sha256`.
 
 Each config-driven ingestion also writes a content-named immutable ingestion
 manifest linking only the exact raw responses used by that invocation to the
 normalized dataset manifests. It records the row cap and each symbol's
 `complete_range` state, so capped coverage cannot survive merely as terminal
-output or be mistaken for the entire requested interval.
+output or be mistaken for the entire requested interval. Quality reports and
+full findings JSONL are atomically published under per-run names and their
+SHA-256/byte counts are bound into the same ingestion manifest.
+
+The public research reader verifies metadata, URI/symbol semantics, exact raw
+record membership, inverse raw-to-normalized coverage, scales, parts and
+sidecars before exposing rows. Its batch API performs physical-order incremental
+quality checks while a single upstream Arrow stream is staged through a
+memory-limited, spill-capable DuckDB canonical sort. The legacy eager reader has
+an independent finite materialization guard checked before any Parquet row read.
 
 External raw and normalized data are ignored by Git. Small deterministic test
 fixtures may be committed only under tests and must state whether they are
@@ -138,3 +163,8 @@ books, invalid price/quantity, scale mismatches, abnormal spread, nonmonotone
 depth, long silence, and receipt-clock reversal. A downstream research view may
 exclude a row, but it must preserve the normalized source and report the
 exclusion count/reason.
+
+Incremental validators retain only a bounded in-memory finding preview; exact
+duplicate/clock/sequence state spills to SQLite and complete findings stream to
+JSONL. A failed validation closes and removes only its temporary sink, leaving
+any previously published evidence untouched.
