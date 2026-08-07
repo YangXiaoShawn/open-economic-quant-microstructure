@@ -2,10 +2,16 @@
 
 ## Freeze and scope
 
-This protocol is frozen before downloading, inspecting, or modeling any of its
-declared dates. The previously inspected 2024-01-02 sample is protocol-development
-evidence only and is excluded from every fit, threshold, validation score, and
-test result below.
+This protocol is outcome-blind: it is frozen before inspecting any declared
+date's price, quantity, aggressor side, class balance, feature, label, model, or
+economic result. During a parallel feasibility audit before the first protocol
+commit, the official Jan 3–5 archive availability, checksums, byte/row counts,
+aggregate-trade-ID boundaries, and timestamp boundaries were inspected; Jan 6
+was not inspected. Those coverage-only facts were not supplied when the dates
+were chosen, and the mechanically selected calendar below was not changed after
+they became known. The previously inspected 2024-01-02 sample is
+protocol-development evidence only and is excluded from every fit, threshold,
+validation score, and test result below.
 
 The study is a prospective stability test of the trade-only hypothesis. It is
 not an order-book, execution, profitability, or capacity study. Even a favorable
@@ -31,8 +37,10 @@ ETHUSDT on each UTC date:
 | 2024-01-06 | Replication test | Open with the same locked specification; no refit |
 
 The dates were chosen mechanically as the four adjacent dates immediately after
-the inspected 2024-01-02 development sample, not because of observed outcomes.
-Do not replace a quiet, volatile, missing, inconvenient, or unfavorable date.
+the inspected 2024-01-02 development sample, not because of observed economic
+outcomes. Pre-freeze coverage-only inspection does not authorize any calendar
+change. Do not replace a quiet, volatile, missing, inconvenient, or unfavorable
+date.
 
 All eight symbol/date archives must be present, checksum-verified, and complete
 for `[00:00:00Z, 24:00:00Z)`. A missing archive, truncated response, failed
@@ -151,4 +159,3 @@ artifact, feature stability, generated report/memo/table, resolved configuration
 Git/source-tree provenance, checksum manifest, and `_SUCCESS` written last.
 Corruption, input relocation without matching bytes, a dirty/different source
 identity, or any incomplete date must fail verification and reuse.
-

@@ -1,5 +1,20 @@
 # Decision log
 
+## 2026-08-07 — Correct the M8 freeze claim to outcome-blind
+
+- **Discovery:** A parallel feasibility audit read official Jan 3–5 archive
+  availability, checksum, byte/row count, aggregate-trade-ID boundary, and
+  timestamp-boundary metadata before commit `a34ba13`. It did not inspect or
+  retain economic fields, class balance, features, labels, or model results;
+  Jan 6 was not inspected.
+- **Correction:** Protocol 1.0.1 describes the study as outcome-blind rather
+  than claiming it was fully acquisition/inspection-blind. The calendar and all
+  roles remain unchanged because they were selected mechanically before those
+  metadata were reported.
+- **Constraint:** No economic field or model outcome from any declared date may
+  be inspected until the ingestion, analysis lock, and final-test gates are
+  implemented. Coverage-only facts cannot be used to replace a date.
+
 ## 2026-08-07 — Freeze the M8 multi-date trade calendar before acquisition
 
 - **Decision:** Reserve the complete 2024-01-03 and 2024-01-04 UTC Binance Spot

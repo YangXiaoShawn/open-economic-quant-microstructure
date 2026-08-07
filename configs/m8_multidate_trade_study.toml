@@ -1,6 +1,6 @@
 [study]
 name = "binance-m8-multidate-trades"
-protocol_version = "1.0.0"
+protocol_version = "1.0.1"
 evidence_tier = "FULL_DATA"
 seed = 20260807
 source = "binance_spot_daily_aggtrades_archive"
@@ -56,4 +56,3 @@ allow_significance_claim = false
 allow_cross_instrument_pooling = false
 allow_execution_claim = false
 allow_profitability_claim = false
-
