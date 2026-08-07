@@ -160,7 +160,7 @@ not mutate it.
 
 As of 2026-08-07:
 
-- The integrated offline suite passes 90 tests, Ruff, and strict mypy across the
+- The integrated offline suite passes 91 tests, Ruff, and strict mypy across the
   data, reconstruction, timing, modeling, execution, reporting, dashboard, and
   pipeline boundaries.
 - A fixed public sample for 2024-01-02 downloaded and normalized 10,000 real

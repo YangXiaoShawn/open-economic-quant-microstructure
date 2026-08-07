@@ -491,7 +491,7 @@ def liquidity_recovery_summary(
                 "descriptive_only": pl.Boolean,
             }
         )
-    return pl.DataFrame(episodes).sort("symbol", "shock_ts_ns")
+    return pl.DataFrame(episodes, infer_schema_length=None).sort("symbol", "shock_ts_ns")
 
 
 def assign_market_regimes(

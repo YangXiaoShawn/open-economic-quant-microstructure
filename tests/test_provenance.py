@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from microstructure.provenance import git_state, read_json, sha256_file, write_json
@@ -14,7 +15,38 @@ def test_sha256_and_atomic_json_round_trip(tmp_path: Path) -> None:
     assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_git_state_handles_unborn_repository() -> None:
-    state = git_state(Path(__file__).parents[1])
-    assert state.commit == "UNBORN" or len(state.commit) == 40
-    assert state.dirty is True
+def test_git_state_handles_unborn_clean_and_dirty_repositories(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True)
+    tracked = repository / "tracked.txt"
+    tracked.write_text("first\n", encoding="utf-8")
+
+    unborn = git_state(repository)
+    assert unborn.commit == "UNBORN"
+    assert unborn.dirty is True
+
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Provenance Test",
+            "-c",
+            "user.email=provenance@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    clean = git_state(repository)
+    assert len(clean.commit) == 40
+    assert clean.dirty is False
+
+    tracked.write_text("modified\n", encoding="utf-8")
+    dirty = git_state(repository)
+    assert dirty.commit == clean.commit
+    assert dirty.dirty is True

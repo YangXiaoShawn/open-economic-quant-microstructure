@@ -33,7 +33,7 @@ signal, statistical-significance, profitability, or capacity claim.
 
 - 2026-08-07: `make lint` passed across source, tests, and dashboard.
 - 2026-08-07: `make typecheck` passed in strict mode across 25 package modules.
-- 2026-08-07: `make test` passed all 90 offline tests on Python 3.12.13.
+- 2026-08-07: `make test` passed all 91 offline tests on Python 3.12.13.
 - 2026-08-07: pipeline tests independently reproduced two semantically identical
   run bundles, verified their checksums, rejected corruption, and preserved an
   incomplete target without repair.

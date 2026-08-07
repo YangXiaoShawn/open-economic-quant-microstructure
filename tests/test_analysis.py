@@ -129,6 +129,36 @@ def test_liquidity_recovery_tracks_one_episode_and_censors_segment_tail() -> Non
     assert tail["recovery_information_end_ts_ns"] is None
 
 
+def test_liquidity_recovery_infers_late_censor_status_without_row_limit() -> None:
+    row_count = 201
+    frame = pl.DataFrame(
+        {
+            "symbol": ["BTCUSDT"] * row_count,
+            "continuity_id": ["a"] * row_count,
+            "decision_ts_ns": list(range(row_count)),
+            "decision_sequence": list(range(row_count)),
+            "spread_bps": [10.0 if index % 2 == 0 else 2.0 for index in range(row_count)],
+            "depth_total_l1": [40.0 if index % 2 == 0 else 100.0 for index in range(row_count)],
+        }
+    )
+
+    summary = liquidity_recovery_summary(
+        frame,
+        train_thresholds={
+            "BTCUSDT": LiquidityShockThresholds(
+                spread_shock_bps=8.0,
+                depth_shock_max=50.0,
+                spread_recovery_bps=4.0,
+                depth_recovery_min=80.0,
+                max_recovery_events=1,
+            )
+        },
+    )
+
+    assert summary.height == 101
+    assert summary.get_column("recovery_censor_reason")[-1] == ("segment_ends_before_max_horizon")
+
+
 def test_regimes_are_assigned_from_supplied_train_boundaries() -> None:
     frame = pl.DataFrame(
         {
