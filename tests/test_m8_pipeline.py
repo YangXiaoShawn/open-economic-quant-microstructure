@@ -156,6 +156,7 @@ def _archive(
     period_index: int,
     symbol_index: int,
     gap_at: int | None,
+    silence_at: int | None,
 ) -> M8RawArchiveEntry:
     archive_name = f"{symbol}-aggTrades-{study_date.isoformat()}.zip"
     member_name = archive_name.removesuffix(".zip") + ".csv"
@@ -178,9 +179,12 @@ def _archive(
         aggregate_id = first_id + index + (1 if gap_at is not None and index >= gap_at else 0)
         price = 100.0 + math.sin(index / 6.0 + period_index * 0.4 + symbol_index * 0.7)
         price += 0.12 * math.sin(index / 17.0 + period_index * 0.4)
+        event_offset_ms = index // 3 + (
+            6_000 if silence_at is not None and index >= silence_at else 0
+        )
         lines.append(
             f"{aggregate_id},{price:.2f},{0.5 + (index % 11) * 0.03:.4f},"
-            f"{aggregate_id},{aggregate_id},{start_ms + index // 3},"
+            f"{aggregate_id},{aggregate_id},{start_ms + event_offset_ms},"
             f"{'true' if index % 3 else 'false'},true\n"
         )
     archive_path.parent.mkdir(parents=True, exist_ok=True)
@@ -311,6 +315,7 @@ def _authority(
     config: M8StudyConfig,
     *,
     gaps: set[tuple[str, str]] | None = None,
+    silences: set[tuple[str, str]] | None = None,
 ) -> M8AcquisitionManifest:
     root = (tmp_path / "authority").resolve()
     root.mkdir(parents=True)
@@ -325,6 +330,7 @@ def _authority(
             period_index=period_index,
             symbol_index=symbol_index,
             gap_at=(17 if gaps and (symbol, period.date.isoformat()) in gaps else None),
+            silence_at=(90 if silences and (symbol, period.date.isoformat()) in silences else None),
         )
         for period_index, period in enumerate(config.periods)
         for symbol_index, symbol in enumerate(config.study.symbols)
@@ -418,6 +424,17 @@ def _install_boundaries(
             raise AssertionError(f"unexpected acquisition manifest path: {resolved}")
         assert observed.sha256 == expected_sha256
         assert observed.config_sha256 == config.hash
+        if observed.copied_from_manifest_sha256 is not None:
+            expected_files = {item.path for item in observed.retained_artifacts} | {
+                observed.path.relative_to(observed.root).as_posix()
+            }
+            actual_files = {
+                item.relative_to(observed.root).as_posix()
+                for item in observed.root.rglob("*")
+                if item.is_file()
+            }
+            if actual_files != expected_files:
+                raise M8AcquisitionError("unexpected acquisition-root artifact")
         return observed
 
     def rebase(path: Path, destination: Path) -> Path:
@@ -499,10 +516,11 @@ def _harness(
     monkeypatch: pytest.MonkeyPatch,
     *,
     gaps: set[tuple[str, str]] | None = None,
+    silences: set[tuple[str, str]] | None = None,
 ) -> _Harness:
     project_root = Path(__file__).resolve().parents[1]
     config = load_m8_config(project_root / "configs" / "m8_multidate_trade_study.toml")
-    authority = _authority(tmp_path, config, gaps=gaps)
+    authority = _authority(tmp_path, config, gaps=gaps, silences=silences)
     source = m8_pipeline._SourceIdentity(
         commit="0" * 40,
         dirty=False,
@@ -519,6 +537,18 @@ def _harness(
         member_opens=opens,
         stage_manifests=staged,
     )
+
+
+def _refresh_failure_inventory(run_dir: Path, *changed_paths: Path) -> None:
+    inventory_path = run_dir / "data" / "failure_evidence_inventory.json"
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    by_path = {item["path"]: item for item in inventory}
+    for path in changed_paths:
+        relative = path.relative_to(run_dir).as_posix()
+        by_path[relative]["sha256"] = sha256_file(path)
+        by_path[relative]["bytes"] = path.stat().st_size
+    m8_pipeline._write_json(inventory_path, inventory)
+    write_checksum_manifest(run_dir)
 
 
 @pytest.fixture(scope="module")
@@ -828,6 +858,81 @@ def test_complete_verifier_bounds_fitted_state_reads(
         )
 
 
+def test_postlock_inventory_binding_rejects_temporary_rechecksummed_lock_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _harness(tmp_path, monkeypatch, gaps={("BTCUSDT", "2024-01-05")})
+    result = m8_pipeline.reproduce_m8(
+        harness.config,
+        harness.run_dir,
+        raw_manifest_path=harness.authority.path,
+        raw_manifest_sha256=harness.authority.sha256,
+    )
+    failure_path = result.path / "failure.json"
+    provenance_path = result.path / "provenance.json"
+    run_manifest_path = result.path / "run_manifest.json"
+    failure = json.loads(failure_path.read_text(encoding="utf-8"))
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+    aggregate_path = result.path / failure["analysis_lock_path"]
+    sidecar_path = aggregate_path.with_name("analysis_lock.sha256")
+    aggregate = json.loads(aggregate_path.read_text(encoding="utf-8"))
+    aggregate["unclaimed_rechecksummed_extension"] = True
+    replacement_bytes = json.dumps(
+        aggregate,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    replacement_sha = hashlib.sha256(replacement_bytes).hexdigest()
+    failure["analysis_lock_sha256"] = replacement_sha
+    provenance["selection_lock_sha256"] = replacement_sha
+    run_manifest["research"]["analysis_lock"]["sha256"] = replacement_sha
+    m8_pipeline._write_json(failure_path, failure)
+    m8_pipeline._write_json(provenance_path, provenance)
+    m8_pipeline._write_json(run_manifest_path, run_manifest)
+    _refresh_failure_inventory(result.path, failure_path, provenance_path, run_manifest_path)
+
+    saved_aggregate = tmp_path / "saved-analysis-lock.json"
+    saved_sidecar = tmp_path / "saved-analysis-lock.sha256"
+    replacement_aggregate = tmp_path / "replacement-analysis-lock.json"
+    replacement_sidecar = tmp_path / "replacement-analysis-lock.sha256"
+    shutil.copy2(aggregate_path, saved_aggregate)
+    shutil.copy2(sidecar_path, saved_sidecar)
+    replacement_aggregate.write_bytes(replacement_bytes)
+    replacement_sidecar.write_text(
+        f"{replacement_sha}  analysis_lock.json\n",
+        encoding="utf-8",
+    )
+    original_verify_chain = m8_pipeline._verify_insufficient_lock_chain
+    swapped = False
+
+    def swap_during_semantic_verification(*args: Any, **kwargs: Any) -> None:
+        nonlocal swapped
+        replacement_aggregate.replace(aggregate_path)
+        replacement_sidecar.replace(sidecar_path)
+        swapped = True
+        try:
+            original_verify_chain(*args, **kwargs)
+        finally:
+            saved_aggregate.replace(aggregate_path)
+            saved_sidecar.replace(sidecar_path)
+
+    monkeypatch.setattr(
+        m8_pipeline,
+        "_verify_insufficient_lock_chain",
+        swap_during_semantic_verification,
+    )
+    with pytest.raises(m8_pipeline.M8PipelineError, match="failure evidence inventory"):
+        m8_pipeline.verify_m8_result(
+            result.path,
+            harness.config,
+            raw_manifest_path=harness.authority.path,
+            raw_manifest_sha256=harness.authority.sha256,
+        )
+    assert swapped is True
+
+
 def test_descriptor_integrity_error_is_terminal_insufficient_data(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1109,9 +1214,18 @@ def test_prelock_gap_publishes_terminal_insufficient_without_held_out_open(
     assert result.normalized_manifest_sha256 is None
     failure = json.loads((result.path / "failure.json").read_text())
     assert failure["failed_after_analysis_lock"] is False
-    assert failure["reason_code"] == "ARCHIVE_NORMALIZATION_OR_DQ"
+    assert failure["reason_code"] == "ARCHIVE_PAYLOAD_OR_CONTINUITY"
     assert failure["failure_stage"] == "development_normalization"
     assert failure["failed_role"] == "train"
+    assert failure["failed_normalization_evidence"] == {
+        "schema_version": "m8-failed-normalization-evidence-v1",
+        "failure_kind": "PAYLOAD_OR_CONTINUITY",
+        "evidence_completion": "PARTIAL_STREAM",
+        "normalized_prefix": "data/normalized_input/normalized/BTCUSDT/2024-01-03",
+        "quality_prefix": "data/normalized_input/quality/BTCUSDT/2024-01-03",
+        "artifacts": [],
+        "complete_normalization": None,
+    }
     assert failure["analysis_lock"] is None
     assert failure["analysis_lock_path"] is None
     assert failure["analysis_lock_sha256"] is None
@@ -1128,6 +1242,468 @@ def test_prelock_gap_publishes_terminal_insufficient_without_held_out_open(
     assert verify_checksums(result.path) > 0
 
 
+def test_early_payload_failure_preserves_canonical_partial_parts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _harness(tmp_path, monkeypatch, gaps={("BTCUSDT", "2024-01-03")})
+    original_normalize = m8_pipeline.normalize_m8_archive
+
+    def normalize_in_small_batches(*args: Any, **kwargs: Any) -> Any:
+        kwargs["batch_rows"] = 8
+        return original_normalize(*args, **kwargs)
+
+    monkeypatch.setattr(m8_pipeline, "normalize_m8_archive", normalize_in_small_batches)
+    result = m8_pipeline.reproduce_m8(
+        harness.config,
+        harness.run_dir,
+        raw_manifest_path=harness.authority.path,
+        raw_manifest_sha256=harness.authority.sha256,
+    )
+
+    failure = json.loads((result.path / "failure.json").read_text(encoding="utf-8"))
+    evidence = failure["failed_normalization_evidence"]
+    assert evidence["evidence_completion"] == "PARTIAL_STREAM"
+    assert evidence["artifacts"]
+    assert all(
+        item["path"].endswith(".parquet") or ".manifest-" in item["path"]
+        for item in evidence["artifacts"]
+    )
+    assert not tuple((result.path / evidence["normalized_prefix"] / "_manifests").glob("*.json"))
+    assert not (result.path / evidence["quality_prefix"] / "report.json").exists()
+    assert (
+        m8_pipeline.verify_m8_result(
+            result.path,
+            harness.config,
+            raw_manifest_path=harness.authority.path,
+            raw_manifest_sha256=harness.authority.sha256,
+        ).status
+        == "INSUFFICIENT_DATA"
+    )
+
+
+def test_second_symbol_warning_preserves_separated_evidence_and_verifies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _harness(
+        tmp_path,
+        monkeypatch,
+        silences={("ETHUSDT", "2024-01-03")},
+    )
+    result = m8_pipeline.reproduce_m8(
+        harness.config,
+        harness.run_dir,
+        raw_manifest_path=harness.authority.path,
+        raw_manifest_sha256=harness.authority.sha256,
+    )
+
+    assert result.status == "INSUFFICIENT_DATA"
+    assert result.normalized_manifest_sha256 is None
+    failure = json.loads((result.path / "failure.json").read_text(encoding="utf-8"))
+    assert failure["failure_stage"] == "development_normalization"
+    assert failure["failed_symbol"] == "ETHUSDT"
+    assert failure["failed_date"] == "2024-01-03"
+    assert failure["failed_role"] == "train"
+    assert failure["reason_code"] == "ARCHIVE_QUALITY_GATE"
+    assert failure["held_out_member_opened"] is False
+    failed_evidence = failure["failed_normalization_evidence"]
+    assert failed_evidence["failure_kind"] == "QUALITY_GATE"
+    assert failed_evidence["evidence_completion"] == "COMPLETE_DATASET_AND_QUALITY"
+    assert failed_evidence["complete_normalization"]["quality_warnings"] == 1
+    assert [
+        (item["symbol"], item["date"], item["role"]) for item in failure["completed_normalizations"]
+    ] == [("BTCUSDT", "2024-01-03", "train")]
+    assert harness.member_opens == [
+        ("BTCUSDT", "2024-01-03"),
+        ("ETHUSDT", "2024-01-03"),
+    ]
+
+    raw_root = result.path / "data" / "input"
+    staged = harness.stage_manifests[0]
+    expected_raw_files = {item.path for item in staged.retained_artifacts} | {
+        staged.path.relative_to(staged.root).as_posix()
+    }
+    assert {
+        path.relative_to(raw_root).as_posix() for path in raw_root.rglob("*") if path.is_file()
+    } == expected_raw_files
+    assert {path.name for path in raw_root.iterdir()} == {"_manifests", "raw"}
+    assert not (raw_root / "normalized").exists()
+    assert not (raw_root / "quality").exists()
+
+    derived_root = result.path / "data" / "normalized_input"
+    btc_reports = tuple((derived_root / "quality" / "BTCUSDT").rglob("report.json"))
+    eth_reports = tuple((derived_root / "quality" / "ETHUSDT").rglob("report.json"))
+    assert len(btc_reports) == len(eth_reports) == 1
+    assert json.loads(btc_reports[0].read_text(encoding="utf-8"))["summary"] == {
+        "errors": 0,
+        "warnings": 0,
+    }
+    assert json.loads(eth_reports[0].read_text(encoding="utf-8"))["summary"] == {
+        "errors": 0,
+        "warnings": 1,
+    }
+    assert tuple((derived_root / "normalized" / "BTCUSDT").rglob("*.parquet"))
+    assert tuple((derived_root / "normalized" / "ETHUSDT").rglob("*.parquet"))
+    inventory = json.loads(
+        (result.path / "data" / "failure_evidence_inventory.json").read_text(encoding="utf-8")
+    )
+    assert any(
+        item["path"].startswith("data/normalized_input/quality/ETHUSDT/") for item in inventory
+    )
+
+    verified = m8_pipeline.verify_m8_result(
+        result.path,
+        harness.config,
+        raw_manifest_path=harness.authority.path,
+        raw_manifest_sha256=harness.authority.sha256,
+    )
+    assert verified.status == "INSUFFICIENT_DATA"
+    member_opens_before_reuse = len(harness.member_opens)
+    reused = m8_pipeline.reproduce_m8(
+        harness.config,
+        harness.run_dir,
+        raw_manifest_path=harness.authority.path,
+        raw_manifest_sha256=harness.authority.sha256,
+    )
+    assert reused == verified
+    assert len(harness.member_opens) == member_opens_before_reuse
+
+
+def test_quality_failure_cannot_drop_failed_evidence_and_rechecksum(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _harness(
+        tmp_path,
+        monkeypatch,
+        silences={("ETHUSDT", "2024-01-03")},
+    )
+    result = m8_pipeline.reproduce_m8(
+        harness.config,
+        harness.run_dir,
+        raw_manifest_path=harness.authority.path,
+        raw_manifest_sha256=harness.authority.sha256,
+    )
+    shutil.rmtree(
+        result.path / "data" / "normalized_input" / "normalized" / "ETHUSDT" / "2024-01-03"
+    )
+    shutil.rmtree(result.path / "data" / "normalized_input" / "quality" / "ETHUSDT" / "2024-01-03")
+    terminal_exclusions = {
+        "data/failure_evidence_inventory.json",
+        "checksums.sha256",
+        "INSUFFICIENT_DATA",
+    }
+    rebuilt_inventory = [
+        {
+            "path": path.relative_to(result.path).as_posix(),
+            "sha256": sha256_file(path),
+            "bytes": path.stat().st_size,
+        }
+        for path in sorted(result.path.rglob("*"))
+        if path.is_file() and path.relative_to(result.path).as_posix() not in terminal_exclusions
+    ]
+    m8_pipeline._write_json(
+        result.path / "data" / "failure_evidence_inventory.json",
+        rebuilt_inventory,
+    )
+    write_checksum_manifest(result.path)
+
+    with pytest.raises(m8_pipeline.M8PipelineError, match=r"failed normalization|quality-gate"):
+        m8_pipeline.verify_m8_result(
+            result.path,
+            harness.config,
+            raw_manifest_path=harness.authority.path,
+            raw_manifest_sha256=harness.authority.sha256,
+        )
+
+
+def test_inventory_semantic_read_rejects_post_hash_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _harness(
+        tmp_path,
+        monkeypatch,
+        silences={("ETHUSDT", "2024-01-03")},
+    )
+    result = m8_pipeline.reproduce_m8(
+        harness.config,
+        harness.run_dir,
+        raw_manifest_path=harness.authority.path,
+        raw_manifest_sha256=harness.authority.sha256,
+    )
+    report_relative = "data/normalized_input/quality/BTCUSDT/2024-01-03/report.json"
+    original_verify = m8_pipeline._verify_inventory_file
+    swapped = False
+
+    def verify_then_swap(root: Path, item: m8_pipeline._FailureEvidenceItem) -> None:
+        nonlocal swapped
+        original_verify(root, item)
+        if item.path == report_relative and not swapped:
+            report_path = root / report_relative
+            report_path.write_bytes(report_path.read_bytes() + b" ")
+            swapped = True
+
+    monkeypatch.setattr(m8_pipeline, "_verify_inventory_file", verify_then_swap)
+    with pytest.raises(m8_pipeline.M8PipelineError, match=r"SHA-256|inventory|canonical"):
+        m8_pipeline.verify_m8_result(
+            result.path,
+            harness.config,
+            raw_manifest_path=harness.authority.path,
+            raw_manifest_sha256=harness.authority.sha256,
+        )
+    assert swapped is True
+
+
+def test_bundled_raw_retained_artifact_rejects_rechecksummed_inventory_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _harness(tmp_path, monkeypatch, gaps={("BTCUSDT", "2024-01-03")})
+    result = m8_pipeline.reproduce_m8(
+        harness.config,
+        harness.run_dir,
+        raw_manifest_path=harness.authority.path,
+        raw_manifest_sha256=harness.authority.sha256,
+    )
+    staged = harness.stage_manifests[0]
+    retained = staged.retained_artifacts[0]
+    retained_path = result.path / "data" / "input" / retained.path
+    retained_path.write_bytes(retained_path.read_bytes() + b"\n")
+    _refresh_failure_inventory(result.path, retained_path)
+
+    with pytest.raises(m8_pipeline.M8PipelineError, match="failure evidence inventory"):
+        m8_pipeline.verify_m8_result(
+            result.path,
+            harness.config,
+            raw_manifest_path=harness.authority.path,
+            raw_manifest_sha256=harness.authority.sha256,
+        )
+
+
+def test_final_manifest_part_claim_must_match_failure_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _harness(tmp_path, monkeypatch)
+    original_evaluate = m8_pipeline._evaluate_symbol
+
+    def fail_second(symbol: str, *args: Any, **kwargs: Any) -> Any:
+        if symbol == "ETHUSDT":
+            raise MultiDateEvaluationError("fixture evaluation insufficiency")
+        return original_evaluate(symbol, *args, **kwargs)
+
+    monkeypatch.setattr(m8_pipeline, "_evaluate_symbol", fail_second)
+    result = m8_pipeline.reproduce_m8(
+        harness.config,
+        harness.run_dir,
+        raw_manifest_path=harness.authority.path,
+        raw_manifest_sha256=harness.authority.sha256,
+    )
+    original_load = m8_pipeline._load_final_input_manifest
+
+    def load_with_forged_part_claim(*args: Any, **kwargs: Any) -> Any:
+        manifest = original_load(*args, **kwargs)
+        first_entry = manifest.entries[0]
+        forged_part = replace(first_entry.normalized_parts[0], data_sha256="f" * 64)
+        forged_entry = replace(
+            first_entry,
+            normalized_parts=(forged_part, *first_entry.normalized_parts[1:]),
+        )
+        return replace(manifest, entries=(forged_entry, *manifest.entries[1:]))
+
+    monkeypatch.setattr(m8_pipeline, "_load_final_input_manifest", load_with_forged_part_claim)
+    with pytest.raises(m8_pipeline.M8PipelineError, match="failure evidence inventory"):
+        m8_pipeline.verify_m8_result(
+            result.path,
+            harness.config,
+            raw_manifest_path=harness.authority.path,
+            raw_manifest_sha256=harness.authority.sha256,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_entry",
+        "extra_entry",
+        "undeclared_file",
+        "path_escape",
+        "wrong_sha",
+        "wrong_bytes",
+        "duplicate_path",
+    ],
+)
+def test_failure_inventory_rejects_rechecksummed_physical_or_schema_tampering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    harness = _harness(
+        tmp_path,
+        monkeypatch,
+        gaps={("ETHUSDT", "2024-01-03")},
+    )
+    result = m8_pipeline.reproduce_m8(
+        harness.config,
+        harness.run_dir,
+        raw_manifest_path=harness.authority.path,
+        raw_manifest_sha256=harness.authority.sha256,
+    )
+    inventory_path = result.path / "data" / "failure_evidence_inventory.json"
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    assert isinstance(inventory, list) and inventory
+
+    if mutation == "missing_entry":
+        inventory.pop(0)
+    elif mutation == "extra_entry":
+        inventory.append(
+            {
+                "path": "zzzz-missing-evidence.bin",
+                "sha256": "0" * 64,
+                "bytes": 1,
+            }
+        )
+    elif mutation == "undeclared_file":
+        (result.path / "undeclared-evidence.bin").write_bytes(b"undeclared\n")
+    elif mutation == "path_escape":
+        inventory[0]["path"] = "../escaped-evidence.bin"
+    elif mutation == "wrong_sha":
+        inventory[0]["sha256"] = "0" * 64
+    elif mutation == "wrong_bytes":
+        inventory[0]["bytes"] += 1
+    else:
+        inventory.append(dict(inventory[0]))
+    inventory.sort(key=lambda item: item["path"])
+    inventory_path.write_text(
+        json.dumps(inventory, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    write_checksum_manifest(result.path)
+
+    with pytest.raises(m8_pipeline.M8PipelineError, match="inventory"):
+        m8_pipeline.verify_m8_result(
+            result.path,
+            harness.config,
+            raw_manifest_path=harness.authority.path,
+            raw_manifest_sha256=harness.authority.sha256,
+        )
+
+
+def test_failure_inventory_rejects_rechecksummed_completed_evidence_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _harness(
+        tmp_path,
+        monkeypatch,
+        gaps={("ETHUSDT", "2024-01-03")},
+    )
+    result = m8_pipeline.reproduce_m8(
+        harness.config,
+        harness.run_dir,
+        raw_manifest_path=harness.authority.path,
+        raw_manifest_sha256=harness.authority.sha256,
+    )
+    failure_path = result.path / "failure.json"
+    failure = json.loads(failure_path.read_text(encoding="utf-8"))
+    assert len(failure["completed_normalizations"]) == 1
+    failure["completed_normalizations"][0]["normalized_dataset_manifest_sha256"] = "0" * 64
+    failure_path.write_text(
+        json.dumps(failure, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    inventory_path = result.path / "data" / "failure_evidence_inventory.json"
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    failure_entry = next(item for item in inventory if item["path"] == "failure.json")
+    failure_entry["sha256"] = sha256_file(failure_path)
+    failure_entry["bytes"] = failure_path.stat().st_size
+    inventory_path.write_text(
+        json.dumps(inventory, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    write_checksum_manifest(result.path)
+
+    with pytest.raises(m8_pipeline.M8PipelineError, match=r"completed|normalized"):
+        m8_pipeline.verify_m8_result(
+            result.path,
+            harness.config,
+            raw_manifest_path=harness.authority.path,
+            raw_manifest_sha256=harness.authority.sha256,
+        )
+
+
+def test_producer_rejects_invalid_terminal_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _harness(tmp_path, monkeypatch, gaps={("BTCUSDT", "2024-01-03")})
+    original_publish = m8_pipeline._publish_prelock_insufficient_data
+
+    def publish_then_tamper(*args: Any, **kwargs: Any) -> None:
+        original_publish(*args, **kwargs)
+        stage = cast(Path, kwargs["stage"])
+        inventory_path = stage / "data" / "failure_evidence_inventory.json"
+        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+        inventory[0]["sha256"] = "0" * 64
+        inventory_path.write_text(
+            json.dumps(inventory, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        write_checksum_manifest(stage)
+
+    monkeypatch.setattr(
+        m8_pipeline,
+        "_publish_prelock_insufficient_data",
+        publish_then_tamper,
+    )
+    with pytest.raises(m8_pipeline.M8PipelineError, match="inventory"):
+        m8_pipeline.reproduce_m8(
+            harness.config,
+            harness.run_dir,
+            raw_manifest_path=harness.authority.path,
+            raw_manifest_sha256=harness.authority.sha256,
+        )
+    assert not harness.run_dir.exists()
+    assert not tuple(harness.run_dir.parent.glob(f".{harness.run_dir.name}.staging-*"))
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_producer_self_verifies_stage_and_published_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    complete: bool,
+) -> None:
+    harness = _harness(
+        tmp_path,
+        monkeypatch,
+        gaps=None if complete else {("BTCUSDT", "2024-01-03")},
+    )
+    function_name = "_reuse_completed" if complete else "_reuse_insufficient"
+    original_reuse = cast(Any, getattr(m8_pipeline, function_name))
+    verified_paths: list[Path] = []
+
+    def reuse_spy(target: Path, *args: Any, **kwargs: Any) -> Any:
+        verified_paths.append(target.resolve())
+        return original_reuse(target, *args, **kwargs)
+
+    monkeypatch.setattr(m8_pipeline, function_name, reuse_spy)
+    result = m8_pipeline.reproduce_m8(
+        harness.config,
+        harness.run_dir,
+        raw_manifest_path=harness.authority.path,
+        raw_manifest_sha256=harness.authority.sha256,
+    )
+
+    assert result.status == ("COMPLETE" if complete else "INSUFFICIENT_DATA")
+    assert len(verified_paths) == 2
+    assert verified_paths[0] != harness.run_dir
+    assert verified_paths[0].parent == harness.run_dir.parent
+    assert verified_paths[1] == harness.run_dir
+
+
 def test_postlock_gap_preserves_lock_and_stops_before_later_dates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1142,7 +1718,7 @@ def test_postlock_gap_preserves_lock_and_stops_before_later_dates(
     assert result.status == "INSUFFICIENT_DATA"
     failure = json.loads((result.path / "failure.json").read_text())
     assert failure["failed_after_analysis_lock"] is True
-    assert failure["reason_code"] == "ARCHIVE_NORMALIZATION_OR_DQ"
+    assert failure["reason_code"] == "ARCHIVE_PAYLOAD_OR_CONTINUITY"
     assert failure["failure_stage"] == "held_out_normalization"
     assert failure["failed_role"] == "primary_test"
     assert failure["aggregate_lock_committed"] is True
@@ -1288,8 +1864,8 @@ def test_insufficient_verifier_bounds_child_lock_reads(
     )
     child = result.path / aggregate["symbols"][0]["selection_lock_path"]
     child.write_bytes(b"x" * (m8_pipeline._MAX_LOCK_JSON_BYTES + 1))
-    write_checksum_manifest(result.path)
-    with pytest.raises(m8_pipeline.M8PipelineError, match="hard limit"):
+    _refresh_failure_inventory(result.path, child)
+    with pytest.raises(m8_pipeline.M8PipelineError, match=r"hard limit|failure evidence inventory"):
         m8_pipeline.verify_m8_result(
             result.path,
             harness.config,
@@ -1326,7 +1902,7 @@ def test_failure_rejects_rechecksummed_typed_identity_tampering(
         json.dumps(failure, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )
-    write_checksum_manifest(result.path)
+    _refresh_failure_inventory(result.path, failure_path)
     with pytest.raises(m8_pipeline.M8PipelineError, match=r"failure|reason|stage|role"):
         m8_pipeline.verify_m8_result(
             result.path,
@@ -1354,7 +1930,7 @@ def test_prelock_failure_rejects_rechecksummed_aggregate_lock_claim(
         json.dumps(failure, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )
-    write_checksum_manifest(result.path)
+    _refresh_failure_inventory(result.path, failure_path)
     with pytest.raises(m8_pipeline.M8PipelineError, match=r"pre-lock.*lock claim"):
         m8_pipeline.verify_m8_result(
             result.path,
@@ -1409,10 +1985,12 @@ def test_partial_selection_failure_preserves_and_verifies_completed_child_lock(
 
     if artifact == "child_lock":
         child_path.write_bytes(child_path.read_bytes() + b"\n")
+        changed_path = child_path
     else:
         state_path = result.path / failure["final_fitted_states"][0]["path"]
         state_path.write_bytes(state_path.read_bytes() + b"\n")
-    write_checksum_manifest(result.path)
+        changed_path = state_path
+    _refresh_failure_inventory(result.path, changed_path)
     with pytest.raises(m8_pipeline.M8PipelineError, match="partial BTCUSDT"):
         m8_pipeline.verify_m8_result(
             result.path,

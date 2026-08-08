@@ -48,6 +48,8 @@ from microstructure.m8_manifest import (
 )
 from microstructure.m8_normalization import (
     M8InsufficientDataError,
+    M8NormalizationEvidenceCompletion,
+    M8NormalizationFailureKind,
     normalize_m8_archive,
 )
 from microstructure.provenance import (
@@ -104,6 +106,9 @@ _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _ANALYSIS_LOCK_SCHEMA_VERSION = "m8-analysis-lock-v2"
 _MAX_LOCK_JSON_BYTES = 8 * 1024 * 1024
 _MAX_LOCK_DIGEST_BYTES = 512
+_MAX_FAILURE_INVENTORY_BYTES = 16 * 1024 * 1024
+_MAX_FAILURE_INVENTORY_ENTRIES = 50_000
+_MAX_FAILURE_FINDING_LINE_BYTES = 1024 * 1024
 _LOCK_READ_CHUNK_BYTES = 64 * 1024
 _DEVELOPMENT_ROLES = frozenset({"train", "validation"})
 _TEST_ROLES = frozenset({"primary_test", "replication_test"})
@@ -129,7 +134,9 @@ M8RunStatus = Literal["COMPLETE", "INSUFFICIENT_DATA"]
 
 _M8FailureReasonCode = Literal[
     "RAW_ARCHIVE_INTEGRITY",
-    "ARCHIVE_NORMALIZATION_OR_DQ",
+    "ARCHIVE_PAYLOAD_OR_CONTINUITY",
+    "ARCHIVE_QUALITY_GATE",
+    "ARCHIVE_POSTWRITE_CONSISTENCY",
     "RESEARCH_FRAME_INSUFFICIENT",
     "MODEL_SELECTION_INSUFFICIENT",
     "FINAL_NORMALIZED_MANIFEST_INCOMPLETE",
@@ -155,26 +162,53 @@ _M8FailedRole = Literal[
     "all_test_dates",
 ]
 
-_FAILURE_STAGE_CONTRACT: Mapping[str, tuple[bool, str, frozenset[str]]] = {
-    "development_acquisition": (False, "RAW_ARCHIVE_INTEGRITY", _DEVELOPMENT_ROLES),
-    "development_normalization": (
+_NORMALIZATION_REASON_CODES = frozenset(
+    {
+        "ARCHIVE_PAYLOAD_OR_CONTINUITY",
+        "ARCHIVE_QUALITY_GATE",
+        "ARCHIVE_POSTWRITE_CONSISTENCY",
+    }
+)
+_FAILURE_STAGE_CONTRACT: Mapping[str, tuple[bool, frozenset[str], frozenset[str]]] = {
+    "development_acquisition": (
         False,
-        "ARCHIVE_NORMALIZATION_OR_DQ",
+        frozenset({"RAW_ARCHIVE_INTEGRITY"}),
         _DEVELOPMENT_ROLES,
     ),
-    "development_research": (False, "RESEARCH_FRAME_INSUFFICIENT", _DEVELOPMENT_ROLES),
-    "model_selection": (False, "MODEL_SELECTION_INSUFFICIENT", frozenset({"validation"})),
-    "held_out_acquisition": (True, "RAW_ARCHIVE_INTEGRITY", _TEST_ROLES),
-    "held_out_normalization": (True, "ARCHIVE_NORMALIZATION_OR_DQ", _TEST_ROLES),
+    "development_normalization": (
+        False,
+        _NORMALIZATION_REASON_CODES,
+        _DEVELOPMENT_ROLES,
+    ),
+    "development_research": (
+        False,
+        frozenset({"RESEARCH_FRAME_INSUFFICIENT"}),
+        _DEVELOPMENT_ROLES,
+    ),
+    "model_selection": (
+        False,
+        frozenset({"MODEL_SELECTION_INSUFFICIENT"}),
+        frozenset({"validation"}),
+    ),
+    "held_out_acquisition": (
+        True,
+        frozenset({"RAW_ARCHIVE_INTEGRITY"}),
+        _TEST_ROLES,
+    ),
+    "held_out_normalization": (True, _NORMALIZATION_REASON_CODES, _TEST_ROLES),
     "final_manifest": (
         True,
-        "FINAL_NORMALIZED_MANIFEST_INCOMPLETE",
+        frozenset({"FINAL_NORMALIZED_MANIFEST_INCOMPLETE"}),
         frozenset({"study"}),
     ),
-    "held_out_research": (True, "RESEARCH_FRAME_INSUFFICIENT", _TEST_ROLES),
+    "held_out_research": (
+        True,
+        frozenset({"RESEARCH_FRAME_INSUFFICIENT"}),
+        _TEST_ROLES,
+    ),
     "locked_evaluation": (
         True,
-        "LOCKED_EVALUATION_INSUFFICIENT",
+        frozenset({"LOCKED_EVALUATION_INSUFFICIENT"}),
         frozenset({"all_test_dates"}),
     ),
 }
@@ -203,16 +237,67 @@ class _TypedInsufficientFailure:
     reason_code: _M8FailureReasonCode
     failure_stage: _M8FailureStage
     failed_role: _M8FailedRole
+    normalization_failure_kind: M8NormalizationFailureKind | None = None
+    normalization_evidence_completion: M8NormalizationEvidenceCompletion | None = None
+    normalization_completed_evidence: M8ArchiveEntry | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _FailureEvidenceItem:
+    """One canonical, checksum-bound entry in a failed run's evidence inventory."""
+
+    path: str
+    sha256: str
+    bytes: int
 
 
 def _typed_failure(
     error: M8InsufficientDataError,
     *,
-    reason_code: _M8FailureReasonCode,
+    reason_code: _M8FailureReasonCode | None = None,
     failure_stage: _M8FailureStage,
     failed_role: _M8FailedRole,
 ) -> _TypedInsufficientFailure:
     """Attach an explicit protocol classification without parsing diagnostic text."""
+
+    normalization_stage = failure_stage in {
+        "development_normalization",
+        "held_out_normalization",
+    }
+    normalization_kind = error.failure_kind
+    evidence_completion = error.evidence_completion
+    completed_evidence = error.completed_evidence
+    if normalization_stage:
+        mapping: Mapping[M8NormalizationFailureKind, _M8FailureReasonCode] = {
+            "PAYLOAD_OR_CONTINUITY": "ARCHIVE_PAYLOAD_OR_CONTINUITY",
+            "QUALITY_GATE": "ARCHIVE_QUALITY_GATE",
+            "POSTWRITE_CONSISTENCY": "ARCHIVE_POSTWRITE_CONSISTENCY",
+        }
+        if normalization_kind is None or evidence_completion is None:
+            raise M8PipelineError("normalization failure lacks its typed evidence state")
+        derived_reason = mapping[normalization_kind]
+        if reason_code is not None and reason_code != derived_reason:
+            raise M8PipelineError("normalization failure reason code was not derived from its type")
+        reason_code = derived_reason
+        if normalization_kind == "PAYLOAD_OR_CONTINUITY" and (
+            evidence_completion != "PARTIAL_STREAM" or completed_evidence is not None
+        ):
+            raise M8PipelineError("payload failure has an invalid evidence-completion state")
+        if normalization_kind == "QUALITY_GATE" and (
+            evidence_completion != "COMPLETE_DATASET_AND_QUALITY" or completed_evidence is None
+        ):
+            raise M8PipelineError("quality-gate failure lacks complete normalization evidence")
+        if normalization_kind == "POSTWRITE_CONSISTENCY" and (
+            evidence_completion != "COMPLETE_DATASET_AND_QUALITY" or completed_evidence is not None
+        ):
+            raise M8PipelineError("postwrite failure has an invalid evidence-completion state")
+    elif (
+        reason_code is None
+        or normalization_kind is not None
+        or evidence_completion is not None
+        or completed_evidence is not None
+    ):
+        raise M8PipelineError("non-normalization failure has invalid typed evidence metadata")
 
     return _TypedInsufficientFailure(
         symbol=error.symbol,
@@ -221,6 +306,9 @@ def _typed_failure(
         reason_code=reason_code,
         failure_stage=failure_stage,
         failed_role=failed_role,
+        normalization_failure_kind=normalization_kind,
+        normalization_evidence_completion=evidence_completion,
+        normalization_completed_evidence=completed_evidence,
     )
 
 
@@ -640,6 +728,1116 @@ def _read_json_object(path: Path, label: str) -> Mapping[str, Any]:
     return cast(Mapping[str, Any], payload)
 
 
+def _decode_failure_inventory(snapshot: _BoundedFileSnapshot) -> list[Any]:
+    """Decode the stable JSON-list representation used by failed evidence inventories."""
+
+    label = "INSUFFICIENT_DATA failure evidence inventory"
+    try:
+        text = snapshot.content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise M8PipelineError(f"{label} is not valid UTF-8") from exc
+
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise M8PipelineError(f"{label} repeats JSON key {key!r}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> object:
+        raise M8PipelineError(f"{label} contains forbidden JSON constant {value}")
+
+    try:
+        decoded = json.loads(
+            text,
+            object_pairs_hook=reject_duplicates,
+            parse_constant=reject_constant,
+        )
+    except M8PipelineError:
+        raise
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise M8PipelineError(f"{label} is not valid JSON") from exc
+    if not isinstance(decoded, list):
+        raise M8PipelineError(f"{label} must be a JSON array")
+    try:
+        stable = (json.dumps(decoded, indent=2, sort_keys=True, allow_nan=False) + "\n").encode(
+            "utf-8"
+        )
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise M8PipelineError(f"{label} is not stable JSON") from exc
+    if snapshot.content != stable:
+        raise M8PipelineError(f"{label} is not stable canonical JSON")
+    return decoded
+
+
+def _decode_stable_pretty_json_object(
+    snapshot: _BoundedFileSnapshot,
+    *,
+    label: str,
+) -> Mapping[str, Any]:
+    """Decode the pretty canonical JSON used by terminal and storage records."""
+
+    try:
+        text = snapshot.content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise M8PipelineError(f"{label} is not valid UTF-8") from exc
+
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise M8PipelineError(f"{label} repeats JSON key {key!r}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> object:
+        raise M8PipelineError(f"{label} contains forbidden JSON constant {value}")
+
+    try:
+        decoded = json.loads(
+            text,
+            object_pairs_hook=reject_duplicates,
+            parse_constant=reject_constant,
+        )
+    except M8PipelineError:
+        raise
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise M8PipelineError(f"{label} is not valid JSON") from exc
+    if not isinstance(decoded, Mapping):
+        raise M8PipelineError(f"{label} must be a JSON object")
+    try:
+        stable = (json.dumps(decoded, indent=2, sort_keys=True, allow_nan=False) + "\n").encode(
+            "utf-8"
+        )
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise M8PipelineError(f"{label} is not stable JSON") from exc
+    if snapshot.content != stable:
+        raise M8PipelineError(f"{label} is not stable canonical JSON")
+    return cast(Mapping[str, Any], decoded)
+
+
+def _verify_inventory_file(
+    root: Path,
+    item: _FailureEvidenceItem,
+) -> None:
+    """Hash one inventoried file through a stable non-following descriptor."""
+
+    label = f"failure evidence inventory artifact {item.path}"
+    path = _published_file(root, item.path, label)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise M8PipelineError(f"{label} cannot be opened without O_NOFOLLOW support")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        raise M8PipelineError(f"cannot open {label} as a regular file") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise M8PipelineError(f"{label} is not a regular file")
+        if before.st_size != item.bytes:
+            raise M8PipelineError(f"{label} byte count disagrees with its inventory claim")
+        digest = hashlib.sha256()
+        observed_bytes = 0
+        while chunk := os.read(descriptor, _LOCK_READ_CHUNK_BYTES):
+            digest.update(chunk)
+            observed_bytes += len(chunk)
+        after = os.fstat(descriptor)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if identity_after != identity_before or observed_bytes != item.bytes:
+            raise M8PipelineError(f"{label} changed while it was verified")
+        try:
+            linked = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise M8PipelineError(f"{label} path changed while it was verified") from exc
+        if (
+            not stat.S_ISREG(linked.st_mode)
+            or linked.st_dev != before.st_dev
+            or linked.st_ino != before.st_ino
+        ):
+            raise M8PipelineError(f"{label} path changed identity while it was verified")
+        if digest.hexdigest() != item.sha256:
+            raise M8PipelineError(f"{label} SHA-256 disagrees with its inventory claim")
+    finally:
+        os.close(descriptor)
+
+
+def _verify_failure_evidence_inventory(
+    target: Path,
+) -> dict[str, _FailureEvidenceItem]:
+    """Verify a failed bundle's pre-terminal inventory against its exact physical tree."""
+
+    inventory_relative = "data/failure_evidence_inventory.json"
+    inventory_path = _published_file(
+        target,
+        inventory_relative,
+        "INSUFFICIENT_DATA failure evidence inventory",
+    )
+    snapshot = _read_bounded_regular_snapshot(
+        inventory_path,
+        label="INSUFFICIENT_DATA failure evidence inventory",
+        max_bytes=_MAX_FAILURE_INVENTORY_BYTES,
+    )
+    raw_entries = _decode_failure_inventory(snapshot)
+    if not raw_entries or len(raw_entries) > _MAX_FAILURE_INVENTORY_ENTRIES:
+        raise M8PipelineError(
+            "INSUFFICIENT_DATA failure evidence inventory has an invalid entry count"
+        )
+
+    entries: list[_FailureEvidenceItem] = []
+    for index, raw_entry in enumerate(raw_entries):
+        label = f"failure evidence inventory[{index}]"
+        if not isinstance(raw_entry, Mapping) or set(raw_entry) != {"path", "sha256", "bytes"}:
+            raise M8PipelineError(f"{label} has an invalid schema")
+        path_value = raw_entry.get("path")
+        if type(path_value) is not str:
+            raise M8PipelineError(f"{label}.path must be a canonical bundle-relative path")
+        declared = Path(path_value)
+        if (
+            declared.is_absolute()
+            or "\\" in path_value
+            or path_value != declared.as_posix()
+            or not declared.parts
+            or any(part in {"", ".", ".."} for part in declared.parts)
+        ):
+            raise M8PipelineError(f"{label}.path is not a canonical bundle-relative path")
+        sha_value = raw_entry.get("sha256")
+        if type(sha_value) is not str:
+            raise M8PipelineError(f"{label}.sha256 must be one lowercase SHA-256")
+        digest = _require_digest(sha_value, f"{label}.sha256")
+        byte_value = raw_entry.get("bytes")
+        if isinstance(byte_value, bool) or not isinstance(byte_value, int) or byte_value < 0:
+            raise M8PipelineError(f"{label}.bytes must be a non-negative integer")
+        entries.append(_FailureEvidenceItem(path=path_value, sha256=digest, bytes=byte_value))
+
+    paths = [item.path for item in entries]
+    if paths != sorted(paths) or len(paths) != len(set(paths)):
+        raise M8PipelineError(
+            "INSUFFICIENT_DATA failure evidence inventory paths are duplicate or unordered"
+        )
+
+    actual_files: set[str] = set()
+    try:
+        for path in target.rglob("*"):
+            mode = path.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                raise M8PipelineError(
+                    "INSUFFICIENT_DATA bundle contains a symbolic link outside its inventory"
+                )
+            if stat.S_ISDIR(mode):
+                continue
+            if not stat.S_ISREG(mode):
+                raise M8PipelineError(
+                    "INSUFFICIENT_DATA bundle contains a non-regular inventory artifact"
+                )
+            actual_files.add(path.relative_to(target).as_posix())
+    except OSError as exc:
+        raise M8PipelineError("cannot enumerate INSUFFICIENT_DATA evidence inventory") from exc
+
+    terminal_exclusions = {
+        inventory_relative,
+        "checksums.sha256",
+        "INSUFFICIENT_DATA",
+    }
+    if not terminal_exclusions.issubset(actual_files):
+        raise M8PipelineError(
+            "INSUFFICIENT_DATA evidence inventory is missing a terminal publication artifact"
+        )
+    inventoried_paths = set(paths)
+    observed_scope = actual_files - terminal_exclusions
+    missing = sorted(observed_scope - inventoried_paths)
+    extra = sorted(inventoried_paths - observed_scope)
+    if missing or extra:
+        raise M8PipelineError(
+            "INSUFFICIENT_DATA failure evidence inventory differs from the physical bundle: "
+            f"missing={missing}, extra={extra}"
+        )
+
+    by_path = {item.path: item for item in entries}
+    for item in entries:
+        _verify_inventory_file(target, item)
+    return by_path
+
+
+def _canonical_inventory_child(value: object, label: str) -> str:
+    if type(value) is not str:
+        raise M8PipelineError(f"{label} must be a canonical relative path")
+    declared = Path(value)
+    if (
+        declared.is_absolute()
+        or "\\" in value
+        or value != declared.as_posix()
+        or not declared.parts
+        or any(part in {"", ".", ".."} for part in declared.parts)
+    ):
+        raise M8PipelineError(f"{label} is not a canonical relative path")
+    return value
+
+
+def _expected_completed_normalizations(
+    config: M8StudyConfig,
+    failure: Mapping[str, Any],
+) -> list[tuple[str, str, str]]:
+    declared: list[tuple[str, str, str]] = [
+        (symbol, period.date.isoformat(), period.role)
+        for period in config.periods
+        for symbol in config.study.symbols
+    ]
+    stage = failure.get("failure_stage")
+    if stage == "model_selection":
+        return [item for item in declared if item[2] in _DEVELOPMENT_ROLES]
+    if stage in {"final_manifest", "held_out_research", "locked_evaluation"}:
+        return declared
+    failed = (
+        failure.get("failed_symbol"),
+        failure.get("failed_date"),
+        failure.get("failed_role"),
+    )
+    try:
+        failed_index = declared.index(cast(tuple[str, str, str], failed))
+    except ValueError as exc:
+        raise M8PipelineError(
+            "INSUFFICIENT_DATA completed normalization progress has no declared failure boundary"
+        ) from exc
+    if stage == "development_research":
+        return declared[: failed_index + 1]
+    if stage in {
+        "development_acquisition",
+        "development_normalization",
+        "held_out_acquisition",
+        "held_out_normalization",
+    }:
+        return declared[:failed_index]
+    raise M8PipelineError(
+        "INSUFFICIENT_DATA completed normalization progress has an unsupported failure stage"
+    )
+
+
+def _require_inventory_claim(
+    inventory: Mapping[str, _FailureEvidenceItem],
+    path: str,
+    label: str,
+    *,
+    sha256: str | None = None,
+    expected_bytes: int | None = None,
+) -> _FailureEvidenceItem:
+    item = inventory.get(path)
+    if item is None:
+        raise M8PipelineError(f"{label} is absent from the failure evidence inventory")
+    if sha256 is not None and item.sha256 != sha256:
+        raise M8PipelineError(f"{label} SHA-256 differs from the failure evidence inventory")
+    if expected_bytes is not None and item.bytes != expected_bytes:
+        raise M8PipelineError(f"{label} byte count differs from the failure evidence inventory")
+    return item
+
+
+def _read_inventory_bounded_snapshot(
+    *,
+    target: Path,
+    inventory: Mapping[str, _FailureEvidenceItem],
+    relative_path: str,
+    label: str,
+    max_bytes: int,
+    expected_sha256: str | None = None,
+) -> _BoundedFileSnapshot:
+    """Read exactly the bytes already claimed by a verified failure inventory."""
+
+    item = _require_inventory_claim(
+        inventory,
+        relative_path,
+        label,
+        sha256=expected_sha256,
+    )
+    if item.bytes < 1 or item.bytes > max_bytes:
+        raise M8PipelineError(f"{label} exceeds its {max_bytes}-byte hard limit")
+    snapshot = _read_bounded_regular_snapshot(
+        _published_file(target, relative_path, label),
+        label=label,
+        max_bytes=max_bytes,
+        expected_sha256=item.sha256,
+    )
+    if len(snapshot.content) != item.bytes:
+        raise M8PipelineError(f"{label} byte count differs from the failure inventory")
+    return snapshot
+
+
+def _read_inventory_bounded_json_snapshot(
+    *,
+    target: Path,
+    inventory: Mapping[str, _FailureEvidenceItem],
+    relative_path: str,
+    label: str,
+    expected_sha256: str,
+    ensure_ascii: bool,
+) -> _BoundedJsonSnapshot:
+    """Decode canonical JSON from the same FD-bound bytes named by inventory."""
+
+    return _strict_canonical_json_snapshot(
+        _read_inventory_bounded_snapshot(
+            target=target,
+            inventory=inventory,
+            relative_path=relative_path,
+            label=label,
+            max_bytes=_MAX_LOCK_JSON_BYTES,
+            expected_sha256=expected_sha256,
+        ),
+        label=label,
+        ensure_ascii=ensure_ascii,
+    )
+
+
+def _read_inventory_exact_bounded_text(
+    *,
+    target: Path,
+    inventory: Mapping[str, _FailureEvidenceItem],
+    relative_path: str,
+    label: str,
+    expected_text: str,
+) -> None:
+    snapshot = _read_inventory_bounded_snapshot(
+        target=target,
+        inventory=inventory,
+        relative_path=relative_path,
+        label=label,
+        max_bytes=_MAX_LOCK_DIGEST_BYTES,
+    )
+    try:
+        observed = snapshot.content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise M8PipelineError(f"{label} is not valid UTF-8") from exc
+    if observed != expected_text:
+        raise M8PipelineError(f"{label} bytes are invalid")
+
+
+def _read_inventory_json_object(
+    *,
+    target: Path,
+    inventory: Mapping[str, _FailureEvidenceItem],
+    relative_path: str,
+    label: str,
+    max_bytes: int = _MAX_LOCK_JSON_BYTES,
+) -> Mapping[str, Any]:
+    """Read one semantic JSON record from the same bounded bytes bound by inventory."""
+
+    item = _require_inventory_claim(inventory, relative_path, label)
+    if item.bytes < 1 or item.bytes > max_bytes:
+        raise M8PipelineError(f"{label} exceeds its JSON byte limit")
+    snapshot = _read_bounded_regular_snapshot(
+        _published_file(target, relative_path, label),
+        label=label,
+        max_bytes=max_bytes,
+        expected_sha256=item.sha256,
+    )
+    if len(snapshot.content) != item.bytes:
+        raise M8PipelineError(f"{label} byte count differs from the failure inventory")
+    return _decode_stable_pretty_json_object(snapshot, label=label)
+
+
+def _verify_quality_findings_jsonl(
+    *,
+    target: Path,
+    item: _FailureEvidenceItem,
+    expected_errors: int,
+    expected_warnings: int,
+    label: str,
+) -> None:
+    """Stream and count one inventory-bound findings file without retaining it."""
+
+    path = _published_file(target, item.path, label)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise M8PipelineError(f"{label} cannot be opened without O_NOFOLLOW support")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        raise M8PipelineError(f"cannot open {label} as a regular file") from exc
+    digest = hashlib.sha256()
+    observed_bytes = 0
+    buffered = b""
+    errors = 0
+    warnings = 0
+
+    def parse_line(line: bytes) -> str:
+        if not line or len(line) > _MAX_FAILURE_FINDING_LINE_BYTES:
+            raise M8PipelineError(f"{label} contains an empty or oversized JSON line")
+
+        def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise M8PipelineError(f"{label} repeats JSON key {key!r}")
+                result[key] = value
+            return result
+
+        def reject_constant(value: str) -> object:
+            raise M8PipelineError(f"{label} contains forbidden JSON constant {value}")
+
+        try:
+            decoded = json.loads(
+                line.decode("utf-8"),
+                object_pairs_hook=reject_duplicates,
+                parse_constant=reject_constant,
+            )
+        except M8PipelineError:
+            raise
+        except (RecursionError, TypeError, UnicodeDecodeError, ValueError) as exc:
+            raise M8PipelineError(f"{label} contains invalid JSONL") from exc
+        if not isinstance(decoded, Mapping):
+            raise M8PipelineError(f"{label} JSONL entries must be objects")
+        try:
+            canonical = json.dumps(
+                decoded,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (RecursionError, TypeError, ValueError) as exc:
+            raise M8PipelineError(f"{label} contains unstable JSONL") from exc
+        if line != canonical:
+            raise M8PipelineError(f"{label} is not stable canonical JSONL")
+        severity = decoded.get("severity")
+        if severity not in {"ERROR", "WARNING"}:
+            raise M8PipelineError(f"{label} contains an invalid finding severity")
+        return cast(str, severity)
+
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size != item.bytes:
+            raise M8PipelineError(f"{label} byte count differs from its inventory")
+        while chunk := os.read(descriptor, _LOCK_READ_CHUNK_BYTES):
+            observed_bytes += len(chunk)
+            digest.update(chunk)
+            buffered += chunk
+            while b"\n" in buffered:
+                line, buffered = buffered.split(b"\n", 1)
+                severity = parse_line(line)
+                if severity == "ERROR":
+                    errors += 1
+                else:
+                    warnings += 1
+            if len(buffered) > _MAX_FAILURE_FINDING_LINE_BYTES:
+                raise M8PipelineError(f"{label} contains an oversized JSON line")
+        if buffered:
+            raise M8PipelineError(f"{label} must end every JSONL entry with a newline")
+        after = os.fstat(descriptor)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if before_identity != after_identity or observed_bytes != item.bytes:
+            raise M8PipelineError(f"{label} changed while it was verified")
+        linked = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(linked.st_mode)
+            or linked.st_dev != before.st_dev
+            or linked.st_ino != before.st_ino
+            or digest.hexdigest() != item.sha256
+        ):
+            raise M8PipelineError(f"{label} changed identity or SHA-256 while verified")
+    except OSError as exc:
+        raise M8PipelineError(f"cannot verify {label}") from exc
+    finally:
+        os.close(descriptor)
+    if errors != expected_errors or warnings != expected_warnings:
+        raise M8PipelineError(f"{label} severity counts differ from the quality report")
+
+
+def _verify_failed_normalization_evidence(
+    *,
+    target: Path,
+    config: M8StudyConfig,
+    raw_manifest: M8AcquisitionManifest,
+    failure: Mapping[str, Any],
+    inventory: Mapping[str, _FailureEvidenceItem],
+) -> None:
+    """Verify the stage-derived failed symbol/date evidence contract."""
+
+    reason_code = failure.get("reason_code")
+    raw_evidence = failure.get("failed_normalization_evidence")
+    reason_contract: Mapping[str, tuple[str, str]] = {
+        "ARCHIVE_PAYLOAD_OR_CONTINUITY": ("PAYLOAD_OR_CONTINUITY", "PARTIAL_STREAM"),
+        "ARCHIVE_QUALITY_GATE": ("QUALITY_GATE", "COMPLETE_DATASET_AND_QUALITY"),
+        "ARCHIVE_POSTWRITE_CONSISTENCY": (
+            "POSTWRITE_CONSISTENCY",
+            "COMPLETE_DATASET_AND_QUALITY",
+        ),
+    }
+    expected_typed = reason_contract.get(cast(str, reason_code))
+    if expected_typed is None:
+        if raw_evidence is not None:
+            raise M8PipelineError("non-normalization failure claims normalization evidence")
+        return
+    if not isinstance(raw_evidence, Mapping):
+        raise M8PipelineError("normalization failure lacks its typed evidence authority")
+    expected_keys = {
+        "schema_version",
+        "failure_kind",
+        "evidence_completion",
+        "normalized_prefix",
+        "quality_prefix",
+        "artifacts",
+        "complete_normalization",
+    }
+    if set(raw_evidence) != expected_keys:
+        raise M8PipelineError("failed normalization evidence schema is invalid")
+    symbol = failure.get("failed_symbol")
+    study_date = failure.get("failed_date")
+    role = failure.get("failed_role")
+    if type(symbol) is not str or type(study_date) is not str or type(role) is not str:
+        raise M8PipelineError("failed normalization identity is malformed")
+    normalized_prefix = f"data/normalized_input/normalized/{symbol}/{study_date}"
+    quality_prefix = f"data/normalized_input/quality/{symbol}/{study_date}"
+    kind, completion = expected_typed
+    if (
+        raw_evidence.get("schema_version") != "m8-failed-normalization-evidence-v1"
+        or raw_evidence.get("failure_kind") != kind
+        or raw_evidence.get("evidence_completion") != completion
+        or raw_evidence.get("normalized_prefix") != normalized_prefix
+        or raw_evidence.get("quality_prefix") != quality_prefix
+    ):
+        raise M8PipelineError("failed normalization evidence has inconsistent typed claims")
+
+    raw_artifacts = raw_evidence.get("artifacts")
+    if not isinstance(raw_artifacts, list):
+        raise M8PipelineError("failed normalization scoped artifacts must be a JSON array")
+    scoped_claims: list[_FailureEvidenceItem] = []
+    for index, value in enumerate(raw_artifacts):
+        label = f"failed normalization artifacts[{index}]"
+        if not isinstance(value, Mapping) or set(value) != {"path", "sha256", "bytes"}:
+            raise M8PipelineError(f"{label} schema is invalid")
+        path = value.get("path")
+        sha = value.get("sha256")
+        byte_count = value.get("bytes")
+        if type(path) is not str or not (
+            path.startswith(f"{normalized_prefix}/") or path.startswith(f"{quality_prefix}/")
+        ):
+            raise M8PipelineError(f"{label} is outside the frozen failed evidence roots")
+        if type(sha) is not str:
+            raise M8PipelineError(f"{label} lacks its SHA-256")
+        digest = _require_digest(sha, f"{label} SHA-256")
+        if isinstance(byte_count, bool) or not isinstance(byte_count, int) or byte_count < 0:
+            raise M8PipelineError(f"{label} has an invalid byte count")
+        scoped_claims.append(_FailureEvidenceItem(path, digest, byte_count))
+    claim_paths = [item.path for item in scoped_claims]
+    if claim_paths != sorted(claim_paths) or len(claim_paths) != len(set(claim_paths)):
+        raise M8PipelineError("failed normalization artifact paths are duplicate or unordered")
+    observed_scope = {
+        path: item
+        for path, item in inventory.items()
+        if path.startswith(f"{normalized_prefix}/") or path.startswith(f"{quality_prefix}/")
+    }
+    if set(claim_paths) != set(observed_scope) or any(
+        observed_scope[item.path] != item for item in scoped_claims
+    ):
+        raise M8PipelineError("failed normalization evidence differs from its inventoried tree")
+
+    dataset_paths = [
+        path
+        for path in observed_scope
+        if Path(path).parent.as_posix() == f"{normalized_prefix}/_manifests"
+        and re.fullmatch(r"trades\.manifest-[0-9a-f]{20}\.json", Path(path).name)
+    ]
+    report_path = f"{quality_prefix}/report.json"
+    findings_path = f"{quality_prefix}/findings.jsonl"
+    complete_claim = raw_evidence.get("complete_normalization")
+    if completion == "PARTIAL_STREAM":
+        if dataset_paths or report_path in observed_scope or findings_path in observed_scope:
+            raise M8PipelineError("partial payload failure contains final normalization evidence")
+        if complete_claim is not None:
+            raise M8PipelineError("partial payload failure claims a complete normalization")
+        allowed_part = re.compile(
+            rf"^{re.escape(normalized_prefix)}/trades/schema-1\.0\.0/"
+            rf"venue-binance_spot/symbol-{re.escape(symbol)}/date-{re.escape(study_date)}/"
+            r"part-[0-9a-f]{20}(?:\.parquet|\.manifest-[0-9a-f]{20}\.json)$"
+        )
+        if any(allowed_part.fullmatch(path) is None for path in observed_scope):
+            raise M8PipelineError("partial payload failure contains a noncanonical artifact")
+        return
+
+    if (
+        len(dataset_paths) != 1
+        or report_path not in observed_scope
+        or findings_path not in observed_scope
+    ):
+        raise M8PipelineError("complete failed normalization lacks dataset and quality evidence")
+    if kind == "POSTWRITE_CONSISTENCY":
+        if complete_claim is not None:
+            raise M8PipelineError("postwrite failure claims an accepted normalization entry")
+        _read_inventory_json_object(
+            target=target,
+            inventory=inventory,
+            relative_path=dataset_paths[0],
+            label="postwrite failed dataset manifest",
+        )
+        _read_inventory_json_object(
+            target=target,
+            inventory=inventory,
+            relative_path=report_path,
+            label="postwrite failed quality report",
+        )
+        return
+
+    if not isinstance(complete_claim, Mapping):
+        raise M8PipelineError("quality-gate failure lacks its complete normalization claim")
+    _verify_normalization_claims(
+        target=target,
+        config=config,
+        raw_manifest=raw_manifest,
+        inventory=inventory,
+        raw_completed=[complete_claim],
+        expected_order=[(symbol, study_date, role)],
+        require_quality_gate_failure=True,
+    )
+
+
+def _verify_normalization_claims(
+    *,
+    target: Path,
+    config: M8StudyConfig,
+    raw_manifest: M8AcquisitionManifest,
+    inventory: Mapping[str, _FailureEvidenceItem],
+    raw_completed: Sequence[Any],
+    expected_order: Sequence[tuple[str, str, str]],
+    require_quality_gate_failure: bool,
+) -> None:
+    """Bind normalization claims to raw authority, parts, and exact DQ evidence."""
+
+    observed_order: list[tuple[str, str, str]] = []
+    raw_by_key = {
+        (entry.symbol, entry.date.isoformat(), str(entry.role)): entry
+        for entry in raw_manifest.archives
+    }
+    expected_keys = {
+        "symbol",
+        "date",
+        "role",
+        "rows",
+        "raw_zip_sha256",
+        "normalized_dataset_manifest_sha256",
+        "quality_errors",
+        "quality_warnings",
+    }
+    for index, raw_claim in enumerate(raw_completed):
+        label = f"completed normalizations[{index}]"
+        if not isinstance(raw_claim, Mapping) or set(raw_claim) != expected_keys:
+            raise M8PipelineError(f"{label} has an invalid schema")
+        symbol = raw_claim.get("symbol")
+        study_date = raw_claim.get("date")
+        role = raw_claim.get("role")
+        if type(symbol) is not str or type(study_date) is not str or type(role) is not str:
+            raise M8PipelineError(f"{label} has a malformed symbol/date/role identity")
+        identity = (symbol, study_date, role)
+        observed_order.append(identity)
+        raw_entry = raw_by_key.get(identity)
+        if raw_entry is None:
+            raise M8PipelineError(f"{label} is outside the frozen raw acquisition calendar")
+
+        rows = raw_claim.get("rows")
+        errors = raw_claim.get("quality_errors")
+        warnings = raw_claim.get("quality_warnings")
+        if (
+            isinstance(rows, bool)
+            or not isinstance(rows, int)
+            or rows < 1
+            or isinstance(errors, bool)
+            or not isinstance(errors, int)
+            or errors < 0
+            or isinstance(warnings, bool)
+            or not isinstance(warnings, int)
+            or warnings < 0
+        ):
+            raise M8PipelineError(f"{label} has invalid row or quality counts")
+        raw_sha_value = raw_claim.get("raw_zip_sha256")
+        normalized_sha_value = raw_claim.get("normalized_dataset_manifest_sha256")
+        if type(raw_sha_value) is not str or type(normalized_sha_value) is not str:
+            raise M8PipelineError(f"{label} lacks required SHA-256 claims")
+        raw_sha = _require_digest(raw_sha_value, f"{label} raw ZIP SHA-256")
+        normalized_sha = _require_digest(
+            normalized_sha_value,
+            f"{label} normalized manifest SHA-256",
+        )
+        if raw_sha != raw_entry.archive_sha256:
+            raise M8PipelineError(f"{label} raw ZIP SHA-256 differs from acquisition authority")
+
+        archive_root = f"data/normalized_input/normalized/{symbol}/{study_date}"
+        dataset_directory = f"{archive_root}/_manifests"
+        dataset_matches = [
+            item
+            for path, item in inventory.items()
+            if Path(path).parent.as_posix() == dataset_directory
+            and re.fullmatch(r"trades\.manifest-[0-9a-f]{20}\.json", Path(path).name)
+            and item.sha256 == normalized_sha
+        ]
+        if len(dataset_matches) != 1:
+            raise M8PipelineError(
+                f"{label} normalized dataset manifest is absent or ambiguous in the inventory"
+            )
+        dataset_item = dataset_matches[0]
+        dataset_relative = dataset_item.path
+        if dataset_item.bytes > _MAX_LOCK_JSON_BYTES:
+            raise M8PipelineError(f"{label} normalized dataset manifest exceeds its JSON limit")
+        dataset = _read_inventory_json_object(
+            target=target,
+            inventory=inventory,
+            relative_path=dataset_relative,
+            label=f"{label} normalized dataset manifest",
+        )
+        if (
+            dataset.get("dataset") != "trades"
+            or dataset.get("source") != config.study.source
+            or dataset.get("source_uri") != raw_entry.archive_source_uri
+            or dataset.get("rows") != rows
+        ):
+            raise M8PipelineError(f"{label} normalized dataset manifest claims differ")
+        artifacts = dataset.get("artifacts")
+        if not isinstance(artifacts, list) or not artifacts:
+            raise M8PipelineError(f"{label} normalized dataset manifest has no artifacts")
+        part_rows = 0
+        part_paths: set[str] = set()
+        for part_index, raw_part in enumerate(artifacts):
+            part_label = f"{label} normalized part {part_index}"
+            if not isinstance(raw_part, Mapping):
+                raise M8PipelineError(f"{part_label} is not a JSON object")
+            ordinal = raw_part.get("write_ordinal")
+            part_row_count = raw_part.get("rows")
+            if (
+                isinstance(ordinal, bool)
+                or not isinstance(ordinal, int)
+                or ordinal != part_index
+                or isinstance(part_row_count, bool)
+                or not isinstance(part_row_count, int)
+                or part_row_count < 1
+            ):
+                raise M8PipelineError(f"{part_label} has invalid row or ordinal claims")
+            part_rows += part_row_count
+            for path_key, sha_key, kind in (
+                ("data_path", "data_sha256", "data"),
+                ("manifest_path", "manifest_sha256", "sidecar"),
+            ):
+                child = _canonical_inventory_child(
+                    raw_part.get(path_key),
+                    f"{part_label} {kind} path",
+                )
+                sha_value = raw_part.get(sha_key)
+                if type(sha_value) is not str:
+                    raise M8PipelineError(f"{part_label} {kind} lacks its SHA-256")
+                part_sha = _require_digest(sha_value, f"{part_label} {kind} SHA-256")
+                part_relative = f"{archive_root}/{child}"
+                if part_relative in part_paths:
+                    raise M8PipelineError(f"{label} normalized dataset reuses an artifact path")
+                part_paths.add(part_relative)
+                _require_inventory_claim(
+                    inventory,
+                    part_relative,
+                    f"{part_label} {kind}",
+                    sha256=part_sha,
+                )
+        if part_rows != rows:
+            raise M8PipelineError(f"{label} normalized part rows do not sum to its row claim")
+
+        quality_root = f"data/normalized_input/quality/{symbol}/{study_date}"
+        report_relative = f"{quality_root}/report.json"
+        findings_relative = f"{quality_root}/findings.jsonl"
+        report_item = _require_inventory_claim(
+            inventory,
+            report_relative,
+            f"{label} quality report",
+        )
+        findings_item = _require_inventory_claim(
+            inventory,
+            findings_relative,
+            f"{label} quality findings",
+        )
+        if report_item.bytes > _MAX_LOCK_JSON_BYTES:
+            raise M8PipelineError(f"{label} quality report exceeds its JSON limit")
+        report = _read_inventory_json_object(
+            target=target,
+            inventory=inventory,
+            relative_path=report_relative,
+            label=f"{label} quality report",
+        )
+        summary = report.get("summary")
+        if (
+            report.get("dataset") != "trades"
+            or report.get("rows_checked") != rows
+            or not isinstance(summary, Mapping)
+            or summary.get("errors") != errors
+            or summary.get("warnings") != warnings
+        ):
+            raise M8PipelineError(f"{label} quality report claims differ")
+        gate_failed = errors > 0 or (warnings > 0 and not config.quality.allow_quality_warnings)
+        if gate_failed is not require_quality_gate_failure:
+            raise M8PipelineError(f"{label} quality counts disagree with its completion state")
+        _verify_quality_findings_jsonl(
+            target=target,
+            item=findings_item,
+            expected_errors=errors,
+            expected_warnings=warnings,
+            label=f"{label} quality findings JSONL",
+        )
+        if require_quality_gate_failure:
+            expected_scope = {
+                dataset_relative,
+                report_relative,
+                findings_relative,
+                *part_paths,
+            }
+            observed_scope = {
+                path
+                for path in inventory
+                if path.startswith(f"{archive_root}/") or path.startswith(f"{quality_root}/")
+            }
+            if observed_scope != expected_scope:
+                raise M8PipelineError(
+                    f"{label} complete failed evidence omits or adds scoped artifacts"
+                )
+
+    if observed_order != expected_order:
+        raise M8PipelineError(
+            "INSUFFICIENT_DATA completed normalizations differ from frozen failure progress"
+        )
+
+
+def _verify_completed_normalization_evidence(
+    *,
+    target: Path,
+    config: M8StudyConfig,
+    raw_manifest: M8AcquisitionManifest,
+    failure: Mapping[str, Any],
+    inventory: Mapping[str, _FailureEvidenceItem],
+) -> None:
+    """Bind every successfully completed normalization before the failure boundary."""
+
+    raw_completed = failure.get("completed_normalizations")
+    if not isinstance(raw_completed, list):
+        raise M8PipelineError("INSUFFICIENT_DATA completed normalizations must be a JSON array")
+    _verify_normalization_claims(
+        target=target,
+        config=config,
+        raw_manifest=raw_manifest,
+        inventory=inventory,
+        raw_completed=raw_completed,
+        expected_order=_expected_completed_normalizations(config, failure),
+        require_quality_gate_failure=False,
+    )
+
+
+def _bind_inventory_artifact(
+    *,
+    target: Path,
+    inventory: Mapping[str, _FailureEvidenceItem],
+    path: Path,
+    sha256: str,
+    byte_count: int,
+    label: str,
+) -> str:
+    """Bind one semantic path/SHA/size claim to an inventoried same-FD read."""
+
+    try:
+        relative = path.relative_to(target.resolve()).as_posix()
+    except ValueError as exc:
+        raise M8PipelineError(f"{label} escapes the failed bundle") from exc
+    relative = _canonical_inventory_child(relative, f"{label} path")
+    item = _require_inventory_claim(
+        inventory,
+        relative,
+        label,
+        sha256=_require_digest(sha256, f"{label} SHA-256"),
+        expected_bytes=byte_count,
+    )
+    _verify_inventory_file(target, item)
+    return relative
+
+
+def _bind_raw_acquisition_inventory(
+    *,
+    target: Path,
+    inventory: Mapping[str, _FailureEvidenceItem],
+    manifest: M8AcquisitionManifest,
+    manifest_relative: str,
+) -> None:
+    """Exact-bind a bundled raw manifest and every retained raw artifact."""
+
+    manifest_item = _require_inventory_claim(
+        inventory,
+        manifest_relative,
+        "INSUFFICIENT_DATA bundled raw acquisition manifest",
+        sha256=manifest.sha256,
+    )
+    if manifest_item.bytes < 1 or manifest_item.bytes > _MAX_LOCK_JSON_BYTES:
+        raise M8PipelineError("bundled raw acquisition manifest exceeds its JSON byte limit")
+    raw_root = manifest.root
+    try:
+        raw_prefix = raw_root.relative_to(target.resolve()).as_posix()
+    except ValueError as exc:
+        raise M8PipelineError("bundled raw acquisition root escapes the failed bundle") from exc
+    expected_scope = {manifest_relative}
+    for index, artifact in enumerate(manifest.retained_artifacts):
+        child = _canonical_inventory_child(
+            artifact.path,
+            f"bundled raw retained artifact[{index}] path",
+        )
+        relative = f"{raw_prefix}/{child}"
+        expected_scope.add(relative)
+        item = _require_inventory_claim(
+            inventory,
+            relative,
+            f"bundled raw retained artifact[{index}]",
+            sha256=_require_digest(
+                artifact.sha256,
+                f"bundled raw retained artifact[{index}] SHA-256",
+            ),
+            expected_bytes=artifact.bytes,
+        )
+        _verify_inventory_file(target, item)
+    observed_scope = {
+        path for path in inventory if path == raw_prefix or path.startswith(f"{raw_prefix}/")
+    }
+    if observed_scope != expected_scope:
+        raise M8PipelineError(
+            "bundled raw acquisition paths differ from the failure evidence inventory"
+        )
+
+
+def _bind_final_input_manifest_inventory(
+    *,
+    target: Path,
+    inventory: Mapping[str, _FailureEvidenceItem],
+    manifest: M8InputManifest,
+) -> None:
+    """Exact-bind the optional final manifest and every artifact it names."""
+
+    try:
+        manifest_relative = manifest.path.relative_to(target.resolve()).as_posix()
+    except ValueError as exc:
+        raise M8PipelineError("final normalized manifest escapes the failed bundle") from exc
+    manifest_relative = _canonical_inventory_child(
+        manifest_relative,
+        "INSUFFICIENT_DATA final normalized manifest path",
+    )
+    _read_inventory_bounded_snapshot(
+        target=target,
+        inventory=inventory,
+        relative_path=manifest_relative,
+        label="INSUFFICIENT_DATA final normalized manifest",
+        max_bytes=_MAX_LOCK_JSON_BYTES,
+        expected_sha256=manifest.sha256,
+    )
+    for metadata in manifest.symbol_metadata:
+        _bind_inventory_artifact(
+            target=target,
+            inventory=inventory,
+            path=metadata.raw_path,
+            sha256=metadata.raw_sha256,
+            byte_count=metadata.raw_bytes,
+            label=f"final manifest {metadata.symbol} metadata body",
+        )
+        _bind_inventory_artifact(
+            target=target,
+            inventory=inventory,
+            path=metadata.source_manifest_path,
+            sha256=metadata.source_manifest_sha256,
+            byte_count=metadata.source_manifest_bytes,
+            label=f"final manifest {metadata.symbol} metadata source manifest",
+        )
+    for entry in manifest.entries:
+        label = f"final manifest {entry.symbol}/{entry.date.isoformat()}"
+        artifact_claims = (
+            (entry.raw_zip_path, entry.raw_zip_sha256, entry.raw_zip_bytes, "raw ZIP"),
+            (
+                entry.raw_source_manifest_path,
+                entry.raw_source_manifest_sha256,
+                entry.raw_source_manifest_bytes,
+                "raw source manifest",
+            ),
+            (
+                entry.raw_checksum_path,
+                entry.raw_checksum_sha256,
+                entry.raw_checksum_bytes,
+                "official checksum",
+            ),
+            (
+                entry.raw_checksum_source_manifest_path,
+                entry.raw_checksum_source_manifest_sha256,
+                entry.raw_checksum_source_manifest_bytes,
+                "checksum source manifest",
+            ),
+            (
+                entry.normalized_dataset_manifest_path,
+                entry.normalized_dataset_manifest_sha256,
+                entry.normalized_dataset_manifest_bytes,
+                "normalized dataset manifest",
+            ),
+            (
+                entry.quality_report_path,
+                entry.quality_report_sha256,
+                entry.quality_report_bytes,
+                "quality report",
+            ),
+            (
+                entry.quality_findings_path,
+                entry.quality_findings_sha256,
+                entry.quality_findings_bytes,
+                "quality findings",
+            ),
+        )
+        for path, digest, byte_count, kind in artifact_claims:
+            _bind_inventory_artifact(
+                target=target,
+                inventory=inventory,
+                path=path,
+                sha256=digest,
+                byte_count=byte_count,
+                label=f"{label} {kind}",
+            )
+        for part in entry.normalized_parts:
+            _bind_inventory_artifact(
+                target=target,
+                inventory=inventory,
+                path=part.data_path,
+                sha256=part.data_sha256,
+                byte_count=part.data_bytes,
+                label=f"{label} normalized part {part.write_ordinal}",
+            )
+            _bind_inventory_artifact(
+                target=target,
+                inventory=inventory,
+                path=part.sidecar_path,
+                sha256=part.sidecar_sha256,
+                byte_count=part.sidecar_bytes,
+                label=f"{label} normalized part {part.write_ordinal} sidecar",
+            )
+
+
 def _restore_fitted_state_file(
     path: Path,
     expected_sha256: str,
@@ -648,6 +1846,62 @@ def _restore_fitted_state_file(
     digest = _require_digest(expected_sha256, f"{label} SHA-256")
     snapshot = _read_bounded_json_snapshot(
         path,
+        label=label,
+        expected_sha256=digest,
+        ensure_ascii=True,
+    )
+    try:
+        state = FinalFittedState.restore(snapshot.text, digest)
+        if state.payload() != snapshot.payload:
+            raise M8PipelineError(f"{label} decoded inconsistently")
+    except (MultiDateEvaluationError, ValueError) as exc:
+        raise M8PipelineError(f"{label} is invalid") from exc
+    return state
+
+
+def _restore_inventory_analysis_lock_file(
+    *,
+    target: Path,
+    inventory: Mapping[str, _FailureEvidenceItem],
+    relative_path: str,
+    expected_sha256: str,
+    label: str,
+) -> AnalysisLock:
+    """Restore a failed-run lock only from its inventory-bound same-FD snapshot."""
+
+    digest = _require_digest(expected_sha256, f"{label} SHA-256")
+    snapshot = _read_inventory_bounded_json_snapshot(
+        target=target,
+        inventory=inventory,
+        relative_path=relative_path,
+        label=label,
+        expected_sha256=digest,
+        ensure_ascii=True,
+    )
+    try:
+        lock = AnalysisLock.restore(snapshot.text, digest)
+        if lock.payload() != snapshot.payload:
+            raise M8PipelineError(f"{label} decoded inconsistently")
+    except (MultiDateEvaluationError, ValueError) as exc:
+        raise M8PipelineError(f"{label} is invalid") from exc
+    return lock
+
+
+def _restore_inventory_fitted_state_file(
+    *,
+    target: Path,
+    inventory: Mapping[str, _FailureEvidenceItem],
+    relative_path: str,
+    expected_sha256: str,
+    label: str,
+) -> FinalFittedState:
+    """Restore a failed-run fitted state from inventory-bound same-FD bytes."""
+
+    digest = _require_digest(expected_sha256, f"{label} SHA-256")
+    snapshot = _read_inventory_bounded_json_snapshot(
+        target=target,
+        inventory=inventory,
+        relative_path=relative_path,
         label=label,
         expected_sha256=digest,
         ensure_ascii=True,
@@ -1068,9 +2322,10 @@ def _snapshot_input_evidence(
         "snapshot_created_additional_raw_evidence_copies": False,
         "normalized_rows_are_stage_local": True,
         "note": (
-            "All accepted raw archives, official checksums, source sidecars, metadata, normalized "
-            "parts, and DQ evidence are self-contained below data/input. This snapshot only "
-            "indexes those authoritative stage-local bytes and creates no further raw copy."
+            "Accepted raw archives, official checksums, source sidecars, and metadata are "
+            "self-contained below data/input; normalized parts and DQ evidence are isolated "
+            "below data/normalized_input. This snapshot only indexes those authoritative "
+            "stage-local bytes and creates no further raw copy."
         ),
     }
     _write_json(stage / "data" / "manifest_snapshot.json", snapshot)
@@ -1409,7 +2664,13 @@ def _commit_development_manifest(
     payload["entries"] = rows
     encoded = _canonical_json_bytes(payload)
     digest = hashlib.sha256(encoded).hexdigest()
-    path = stage / "data" / "input" / "_manifests" / f"m8-development.manifest-{digest[:20]}.json"
+    path = (
+        stage
+        / "data"
+        / "normalized_input"
+        / "_manifests"
+        / f"m8-development.manifest-{digest[:20]}.json"
+    )
     _atomic_write_bytes(path, encoded)
     if sha256_file(path) != digest:
         raise M8PipelineError("development normalized manifest was not durably persisted")
@@ -1823,11 +3084,13 @@ def _verify_insufficient_failure_taxonomy(
     stage = stage_value
     reason_code = reason_code_value
     role = role_value
-    contract: tuple[bool, str, frozenset[str]] | None = _FAILURE_STAGE_CONTRACT.get(stage)
+    contract: tuple[bool, frozenset[str], frozenset[str]] | None = _FAILURE_STAGE_CONTRACT.get(
+        stage
+    )
     if contract is None:
         raise M8PipelineError("INSUFFICIENT_DATA failure stage is not recognized")
-    expected_after_lock, expected_reason_code, allowed_roles = contract
-    if reason_code != expected_reason_code or role not in allowed_roles:
+    expected_after_lock, expected_reason_codes, allowed_roles = contract
+    if reason_code not in expected_reason_codes or role not in allowed_roles:
         raise M8PipelineError("INSUFFICIENT_DATA reason code/stage/role are inconsistent")
     if failure.get("failed_after_analysis_lock") is not expected_after_lock:
         raise M8PipelineError("INSUFFICIENT_DATA failure stage disagrees with lock state")
@@ -1858,6 +3121,7 @@ def _verify_insufficient_failure_taxonomy(
 def _verify_insufficient_lock_chain(
     *,
     target: Path,
+    inventory: Mapping[str, _FailureEvidenceItem],
     config: M8StudyConfig,
     raw_manifest: M8AcquisitionManifest,
     bundled_raw_sha256: str,
@@ -1896,8 +3160,24 @@ def _verify_insufficient_lock_chain(
         raise M8PipelineError("INSUFFICIENT_DATA run manifest has inconsistent status")
     artifacts = run_manifest.get("artifacts")
     research = run_manifest.get("research")
-    if not isinstance(artifacts, Mapping) or not isinstance(research, Mapping):
+    data_claims = run_manifest.get("data")
+    if (
+        not isinstance(artifacts, Mapping)
+        or not isinstance(research, Mapping)
+        or not isinstance(data_claims, Mapping)
+    ):
         raise M8PipelineError("INSUFFICIENT_DATA run manifest lacks lock authority sections")
+    evidence_claim = failure.get("failed_normalization_evidence")
+    evidence_completion = (
+        evidence_claim.get("evidence_completion") if isinstance(evidence_claim, Mapping) else None
+    )
+    if (
+        provenance.get("failure_reason_code") != failure.get("reason_code")
+        or data_claims.get("failure_reason_code") != failure.get("reason_code")
+        or provenance.get("failed_normalization_evidence_completion") != evidence_completion
+        or data_claims.get("failed_normalization_evidence_completion") != evidence_completion
+    ):
+        raise M8PipelineError("INSUFFICIENT_DATA typed failure claims differ across records")
     if artifacts.get("failure") != "failure.json" or artifacts.get(
         "raw_acquisition_manifest"
     ) != provenance.get("bundled_raw_acquisition_manifest_path"):
@@ -2029,16 +3309,22 @@ def _verify_insufficient_lock_chain(
                 lock_sha_value,
                 f"partial {expected_symbol} selection lock SHA-256",
             )
-            lock_path = _published_file(
-                target,
+            lock_relative = _canonical_inventory_child(
                 lock_claim.get("path"),
                 f"partial {expected_symbol} selection lock",
             )
-            partial_paths.append(lock_path)
-            child = _restore_analysis_lock_file(
-                lock_path,
-                lock_sha,
+            lock_path = _published_file(
+                target,
+                lock_relative,
                 f"partial {expected_symbol} selection lock",
+            )
+            partial_paths.append(lock_path)
+            child = _restore_inventory_analysis_lock_file(
+                target=target,
+                inventory=inventory,
+                relative_path=lock_relative,
+                expected_sha256=lock_sha,
+                label=f"partial {expected_symbol} selection lock",
             ).payload()
             state_sha_value = state_claim.get("sha256")
             if type(state_sha_value) is not str:
@@ -2052,16 +3338,22 @@ def _verify_insufficient_lock_chain(
                 or lock_claim.get("final_fitted_state_sha256") != state_sha
             ):
                 raise M8PipelineError(f"partial {expected_symbol} lock and state claims differ")
-            state_path = _published_file(
-                target,
+            state_relative = _canonical_inventory_child(
                 state_claim.get("path"),
                 f"partial {expected_symbol} final fitted state",
             )
-            partial_state_paths.append(state_path)
-            state = _restore_fitted_state_file(
-                state_path,
-                state_sha,
+            state_path = _published_file(
+                target,
+                state_relative,
                 f"partial {expected_symbol} final fitted state",
+            )
+            partial_state_paths.append(state_path)
+            state = _restore_inventory_fitted_state_file(
+                target=target,
+                inventory=inventory,
+                relative_path=state_relative,
+                expected_sha256=state_sha,
+                label=f"partial {expected_symbol} final fitted state",
             )
             state_payload = state.payload()
             if (
@@ -2121,17 +3413,21 @@ def _verify_insufficient_lock_chain(
     ):
         raise M8PipelineError("failure run manifest has a different aggregate lock claim")
 
-    aggregate_path = _published_file(target, failure_path, "failed aggregate lock")
-    aggregate_snapshot = _read_bounded_json_snapshot(
-        aggregate_path,
+    aggregate_relative = _canonical_inventory_child(failure_path, "failed aggregate lock")
+    aggregate_snapshot = _read_inventory_bounded_json_snapshot(
+        target=target,
+        inventory=inventory,
+        relative_path=aggregate_relative,
         label="failed aggregate lock",
         expected_sha256=failure_sha,
         ensure_ascii=False,
     )
     aggregate = aggregate_snapshot.payload
-    digest_path = aggregate_path.with_name("analysis_lock.sha256")
-    _read_exact_bounded_text(
-        digest_path,
+    digest_relative = Path(aggregate_relative).with_name("analysis_lock.sha256").as_posix()
+    _read_inventory_exact_bounded_text(
+        target=target,
+        inventory=inventory,
+        relative_path=digest_relative,
         label="failed aggregate lock digest sidecar",
         expected_text=f"{failure_sha}  analysis_lock.json\n",
     )
@@ -2169,13 +3465,14 @@ def _verify_insufficient_lock_chain(
         development_sha_value,
         "failed development manifest SHA-256",
     )
-    development_path = _published_file(
-        target,
+    development_relative = _canonical_inventory_child(
         aggregate.get("development_manifest_path"),
         "failed development manifest",
     )
-    development = _read_bounded_json_snapshot(
-        development_path,
+    development = _read_inventory_bounded_json_snapshot(
+        target=target,
+        inventory=inventory,
+        relative_path=development_relative,
         label="failed development manifest",
         expected_sha256=development_sha,
         ensure_ascii=False,
@@ -2250,16 +3547,22 @@ def _verify_insufficient_lock_chain(
             raise M8PipelineError(
                 f"failure and aggregate {expected_symbol} child-lock claims differ"
             )
-        child_path = _published_file(
-            target,
+        child_relative = _canonical_inventory_child(
             child_path_value,
             f"failed {expected_symbol} selection lock",
         )
-        child_paths.append(child_path)
-        child = _restore_analysis_lock_file(
-            child_path,
-            child_sha,
+        child_path = _published_file(
+            target,
+            child_relative,
             f"failed {expected_symbol} selection lock",
+        )
+        child_paths.append(child_path)
+        child = _restore_inventory_analysis_lock_file(
+            target=target,
+            inventory=inventory,
+            relative_path=child_relative,
+            expected_sha256=child_sha,
+            label=f"failed {expected_symbol} selection lock",
         ).payload()
         state_sha_value = raw_symbol.get("final_fitted_state_sha256")
         if type(state_sha_value) is not str:
@@ -2275,16 +3578,22 @@ def _verify_insufficient_lock_chain(
             or failure_lock.get("final_fitted_state_sha256") != state_sha
         ):
             raise M8PipelineError(f"failed {expected_symbol} final fitted-state claims differ")
-        state_path = _published_file(
-            target,
+        state_relative = _canonical_inventory_child(
             state_claim.get("path"),
             f"failed {expected_symbol} final fitted state",
         )
-        state_paths.append(state_path)
-        state = _restore_fitted_state_file(
-            state_path,
-            state_sha,
+        state_path = _published_file(
+            target,
+            state_relative,
             f"failed {expected_symbol} final fitted state",
+        )
+        state_paths.append(state_path)
+        state = _restore_inventory_fitted_state_file(
+            target=target,
+            inventory=inventory,
+            relative_path=state_relative,
+            expected_sha256=state_sha,
+            label=f"failed {expected_symbol} final fitted state",
         )
         state_payload = state.payload()
         selected = child.get("selected_candidate")
@@ -2828,6 +4137,100 @@ def _quality_payload(
     }
 
 
+def _normalization_evidence_claim(entry: M8ArchiveEntry) -> dict[str, object]:
+    """Serialize one complete normalization without treating it as accepted study input."""
+
+    return {
+        "symbol": entry.symbol,
+        "date": entry.date.isoformat(),
+        "role": entry.role,
+        "rows": entry.rows,
+        "raw_zip_sha256": entry.raw_zip_sha256,
+        "normalized_dataset_manifest_sha256": entry.normalized_dataset_manifest_sha256,
+        "quality_errors": entry.quality_errors,
+        "quality_warnings": entry.quality_warnings,
+    }
+
+
+def _failed_normalization_evidence_payload(
+    stage: Path,
+    failure: _TypedInsufficientFailure,
+) -> dict[str, object] | None:
+    """Bind the exact failed symbol/date subtree with a typed completion state."""
+
+    kind = failure.normalization_failure_kind
+    completion = failure.normalization_evidence_completion
+    complete_entry = failure.normalization_completed_evidence
+    if kind is None or completion is None:
+        if complete_entry is not None:
+            raise M8PipelineError("non-normalization failure retained a normalization entry")
+        return None
+
+    normalized_prefix = f"data/normalized_input/normalized/{failure.symbol}/{failure.study_date}"
+    quality_prefix = f"data/normalized_input/quality/{failure.symbol}/{failure.study_date}"
+    scoped_roots = (stage / normalized_prefix, stage / quality_prefix)
+    files: list[Path] = []
+    for root in scoped_roots:
+        if root.is_symlink():
+            raise M8PipelineError("failed normalization evidence root is a symbolic link")
+        if not root.exists():
+            continue
+        if not root.is_dir():
+            raise M8PipelineError("failed normalization evidence root is not a directory")
+        for path in root.rglob("*"):
+            mode = path.lstat().st_mode
+            if stat.S_ISLNK(mode) or (not stat.S_ISDIR(mode) and not stat.S_ISREG(mode)):
+                raise M8PipelineError("failed normalization evidence is not a regular tree")
+            if stat.S_ISREG(mode):
+                files.append(path)
+    artifacts = [
+        {
+            "path": path.relative_to(stage).as_posix(),
+            "sha256": sha256_file(path),
+            "bytes": path.stat().st_size,
+        }
+        for path in sorted(files)
+    ]
+    scoped_paths = {cast(str, item["path"]) for item in artifacts}
+    dataset_manifests = {
+        path
+        for path in scoped_paths
+        if Path(path).parent.as_posix() == f"{normalized_prefix}/_manifests"
+        and re.fullmatch(r"trades\.manifest-[0-9a-f]{20}\.json", Path(path).name)
+    }
+    report_path = f"{quality_prefix}/report.json"
+    findings_path = f"{quality_prefix}/findings.jsonl"
+    if completion == "PARTIAL_STREAM":
+        if kind != "PAYLOAD_OR_CONTINUITY" or complete_entry is not None:
+            raise M8PipelineError("partial failed normalization has an invalid typed state")
+        if dataset_manifests or report_path in scoped_paths or findings_path in scoped_paths:
+            raise M8PipelineError("partial failed normalization contains final evidence")
+        normalization_claim: dict[str, object] | None = None
+    else:
+        if kind not in {"QUALITY_GATE", "POSTWRITE_CONSISTENCY"}:
+            raise M8PipelineError("complete failed normalization has an invalid typed state")
+        if len(dataset_manifests) != 1 or not {report_path, findings_path}.issubset(scoped_paths):
+            raise M8PipelineError("complete failed normalization lacks final evidence")
+        if kind == "QUALITY_GATE":
+            if complete_entry is None:
+                raise M8PipelineError("quality-gate failure lacks its structured evidence")
+            normalization_claim = _normalization_evidence_claim(complete_entry)
+        else:
+            if complete_entry is not None:
+                raise M8PipelineError("postwrite failure unexpectedly claims accepted evidence")
+            normalization_claim = None
+
+    return {
+        "schema_version": "m8-failed-normalization-evidence-v1",
+        "failure_kind": kind,
+        "evidence_completion": completion,
+        "normalized_prefix": normalized_prefix,
+        "quality_prefix": quality_prefix,
+        "artifacts": artifacts,
+        "complete_normalization": normalization_claim,
+    }
+
+
 def _assert_test_open_authority(
     *,
     config: M8StudyConfig,
@@ -2970,6 +4373,7 @@ def _publish_insufficient_data(
         {"symbol": symbol, "date": study_date, "role": role}
         for symbol, study_date, role in declared_order[failed_index + 1 :]
     ]
+    failed_normalization_evidence = _failed_normalization_evidence_payload(stage, failure)
     failure_payload = {
         "schema_version": "m8-insufficient-data-v1",
         "status": "INSUFFICIENT_DATA",
@@ -2981,6 +4385,7 @@ def _publish_insufficient_data(
         "failed_symbol": failure.symbol,
         "failed_date": failure.study_date,
         "failed_role": failure.failed_role,
+        "failed_normalization_evidence": failed_normalization_evidence,
         "failed_after_analysis_lock": True,
         "replacement_date_selected": False,
         "reselection_performed": False,
@@ -3045,6 +4450,8 @@ def _publish_insufficient_data(
     provenance = {
         "generated_at_utc": generated_at_utc,
         "status": "INSUFFICIENT_DATA",
+        "failure_reason_code": failure.reason_code,
+        "failed_normalization_evidence_completion": (failure.normalization_evidence_completion),
         "config_sha256": config.hash,
         "config_source_sha256": config.source_sha256,
         "raw_acquisition_manifest_path": str(authority_manifest.path.resolve()),
@@ -3082,6 +4489,8 @@ def _publish_insufficient_data(
             "symbols": list(config.study.symbols),
             "all_requested_ranges_complete": False,
             "completed_normalizations": completed,
+            "failure_reason_code": failure.reason_code,
+            "failed_normalization_evidence_completion": (failure.normalization_evidence_completion),
             "failed_symbol": failure.symbol,
             "failed_date": failure.study_date,
             "stopped_before": stopped_before,
@@ -3214,6 +4623,7 @@ def _publish_prelock_insufficient_data(
         {"symbol": symbol, "date": study_date, "role": role}
         for symbol, study_date, role in declared[failed_index + 1 :]
     ]
+    failed_normalization_evidence = _failed_normalization_evidence_payload(stage, failure)
     failure_payload = {
         "schema_version": "m8-insufficient-data-v1",
         "status": "INSUFFICIENT_DATA",
@@ -3225,6 +4635,7 @@ def _publish_prelock_insufficient_data(
         "failed_symbol": failure.symbol,
         "failed_date": failure.study_date,
         "failed_role": failure.failed_role,
+        "failed_normalization_evidence": failed_normalization_evidence,
         "failed_after_analysis_lock": False,
         "held_out_member_opened": False,
         "analysis_lock": None,
@@ -3286,6 +4697,8 @@ def _publish_prelock_insufficient_data(
         {
             "generated_at_utc": generated_at_utc,
             "status": "INSUFFICIENT_DATA",
+            "failure_reason_code": failure.reason_code,
+            "failed_normalization_evidence_completion": (failure.normalization_evidence_completion),
             "config_sha256": config.hash,
             "config_source_sha256": config.source_sha256,
             "raw_acquisition_manifest_path": str(authority_manifest.path.resolve()),
@@ -3323,6 +4736,10 @@ def _publish_prelock_insufficient_data(
             "data": {
                 "all_requested_ranges_complete": False,
                 "completed_normalizations": completed,
+                "failure_reason_code": failure.reason_code,
+                "failed_normalization_evidence_completion": (
+                    failure.normalization_evidence_completion
+                ),
                 "failed_symbol": failure.symbol,
                 "failed_date": failure.study_date,
                 "stopped_before": stopped_before,
@@ -3405,7 +4822,9 @@ def _produce_m8(
     protocol = _freeze_protocol_and_config(config, project_root, stage)
     if authority_manifest.protocol_document_sha256 != protocol["protocol_sha256"]:
         raise M8PipelineError("raw acquisition manifest is bound to another protocol document")
-    input_root = stage / "data" / "input"
+    evidence_root = stage / "data"
+    raw_input_root = evidence_root / "input"
+    normalized_input_root = evidence_root / "normalized_input"
     planned_copy_bytes = authority_manifest.total_raw_evidence_bytes
     combined_raw_evidence_bytes = authority_manifest.total_raw_evidence_bytes + planned_copy_bytes
     if combined_raw_evidence_bytes > config.study.max_total_download_bytes:
@@ -3414,7 +4833,7 @@ def _produce_m8(
             "ceiling"
         )
     try:
-        raw_manifest = copy_m8_acquisition_into(authority_manifest, input_root)
+        raw_manifest = copy_m8_acquisition_into(authority_manifest, raw_input_root)
     except Exception as exc:
         raise M8PipelineError(f"cannot freeze raw acquisition evidence into run: {exc}") from exc
     if (
@@ -3468,7 +4887,8 @@ def _produce_m8(
                     period,
                     metadata_by_symbol[symbol],
                     acquired,
-                    input_root,
+                    raw_input_root,
+                    output_root=normalized_input_root,
                 )
             except M8InsufficientDataError as exc:
                 _publish_prelock_insufficient_data(
@@ -3482,7 +4902,6 @@ def _produce_m8(
                     completed_entries=entries,
                     failure=_typed_failure(
                         exc,
-                        reason_code="ARCHIVE_NORMALIZATION_OR_DQ",
                         failure_stage="development_normalization",
                         failed_role=period.role,
                     ),
@@ -3623,7 +5042,8 @@ def _produce_m8(
                     period,
                     metadata_by_symbol[symbol],
                     acquired,
-                    input_root,
+                    raw_input_root,
+                    output_root=normalized_input_root,
                     before_member_open=before_member_open,
                 )
             except M8InsufficientDataError as exc:
@@ -3641,7 +5061,6 @@ def _produce_m8(
                     completed_entries=entries,
                     failure=_typed_failure(
                         exc,
-                        reason_code="ARCHIVE_NORMALIZATION_OR_DQ",
                         failure_stage="held_out_normalization",
                         failed_role=period.role,
                     ),
@@ -3653,10 +5072,10 @@ def _produce_m8(
     # No endpoint artifact is constructed until all eight normalizations pass
     # and the strict legacy all-date manifest has been persisted and reloaded.
     try:
-        manifest = write_m8_input_manifest(config, input_root, entries, metadata)
+        manifest = write_m8_input_manifest(config, evidence_root, entries, metadata)
         manifest = verify_m8_input_manifest(
             config,
-            input_root,
+            evidence_root,
             manifest.path,
             manifest_sha256=manifest.sha256,
         )
@@ -4378,26 +5797,40 @@ def _reuse_insufficient(
     if (target / "_SUCCESS").exists():
         raise M8PipelineError("INSUFFICIENT_DATA target has conflicting terminal markers")
     try:
-        marker_bytes = (target / "INSUFFICIENT_DATA").read_bytes()
-    except OSError as exc:
+        marker_bytes = _read_bounded_regular_snapshot(
+            _published_file(target, "INSUFFICIENT_DATA", "INSUFFICIENT_DATA terminal marker"),
+            label="INSUFFICIENT_DATA terminal marker",
+            max_bytes=32,
+        ).content
+    except M8PipelineError as exc:
         raise M8PipelineError("INSUFFICIENT_DATA terminal marker is unavailable") from exc
     if marker_bytes != b"terminal\n":
         raise M8PipelineError("INSUFFICIENT_DATA terminal marker bytes are invalid")
     try:
         verify_checksums(target)
-        failure = json.loads((target / "failure.json").read_text(encoding="utf-8"))
-        provenance = json.loads((target / "provenance.json").read_text(encoding="utf-8"))
-        run_manifest = json.loads((target / "run_manifest.json").read_text(encoding="utf-8"))
     except Exception as exc:
         raise M8PipelineError(
             f"INSUFFICIENT_DATA target failed integrity verification: {exc}"
         ) from exc
-    if (
-        not isinstance(failure, Mapping)
-        or not isinstance(provenance, Mapping)
-        or not isinstance(run_manifest, Mapping)
-    ):
-        raise M8PipelineError("INSUFFICIENT_DATA terminal records must be JSON objects")
+    failure_inventory = _verify_failure_evidence_inventory(target)
+    failure = _read_inventory_json_object(
+        target=target,
+        inventory=failure_inventory,
+        relative_path="failure.json",
+        label="INSUFFICIENT_DATA failure record",
+    )
+    provenance = _read_inventory_json_object(
+        target=target,
+        inventory=failure_inventory,
+        relative_path="provenance.json",
+        label="INSUFFICIENT_DATA provenance record",
+    )
+    run_manifest = _read_inventory_json_object(
+        target=target,
+        inventory=failure_inventory,
+        relative_path="run_manifest.json",
+        label="INSUFFICIENT_DATA run manifest",
+    )
     if failure.get("status") != "INSUFFICIENT_DATA" or failure.get("terminal") is not True:
         raise M8PipelineError("INSUFFICIENT_DATA target lacks a terminal failure record")
     expected = {
@@ -4419,13 +5852,31 @@ def _reuse_insufficient(
     bundled_raw_sha = provenance.get("bundled_raw_acquisition_manifest_sha256")
     if type(bundled_raw_path_value) is not str or type(bundled_raw_sha) is not str:
         raise M8PipelineError("INSUFFICIENT_DATA target lacks bundled raw-manifest identity")
-    bundled_raw_path = (target / bundled_raw_path_value).resolve()
-    if not bundled_raw_path.is_relative_to(target):
-        raise M8PipelineError("INSUFFICIENT_DATA bundled raw-manifest path escapes target")
+    bundled_raw_relative = _canonical_inventory_child(
+        bundled_raw_path_value,
+        "INSUFFICIENT_DATA bundled raw acquisition manifest",
+    )
+    bundled_raw_digest = _require_digest(
+        bundled_raw_sha,
+        "INSUFFICIENT_DATA bundled raw acquisition manifest SHA-256",
+    )
+    _read_inventory_bounded_snapshot(
+        target=target,
+        inventory=failure_inventory,
+        relative_path=bundled_raw_relative,
+        label="INSUFFICIENT_DATA bundled raw acquisition manifest",
+        max_bytes=_MAX_LOCK_JSON_BYTES,
+        expected_sha256=bundled_raw_digest,
+    )
+    bundled_raw_path = _published_file(
+        target,
+        bundled_raw_relative,
+        "INSUFFICIENT_DATA bundled raw acquisition manifest",
+    )
     try:
         bundled_raw = read_m8_acquisition_manifest(
             bundled_raw_path,
-            expected_sha256=bundled_raw_sha,
+            expected_sha256=bundled_raw_digest,
             config=config,
         )
     except Exception as exc:
@@ -4437,8 +5888,15 @@ def _reuse_insufficient(
         raise M8PipelineError(
             "INSUFFICIENT_DATA bundled raw evidence differs from acquisition authority"
         )
+    _bind_raw_acquisition_inventory(
+        target=target,
+        inventory=failure_inventory,
+        manifest=bundled_raw,
+        manifest_relative=bundled_raw_relative,
+    )
     _verify_insufficient_lock_chain(
         target=target,
+        inventory=failure_inventory,
         config=config,
         raw_manifest=raw_manifest,
         bundled_raw_sha256=bundled_raw.sha256,
@@ -4447,6 +5905,20 @@ def _reuse_insufficient(
         failure=failure,
         provenance=provenance,
         run_manifest=run_manifest,
+    )
+    _verify_failed_normalization_evidence(
+        target=target,
+        config=config,
+        raw_manifest=raw_manifest,
+        failure=failure,
+        inventory=failure_inventory,
+    )
+    _verify_completed_normalization_evidence(
+        target=target,
+        config=config,
+        raw_manifest=raw_manifest,
+        failure=failure,
+        inventory=failure_inventory,
     )
     forbidden = (
         target / "models" / "predictions.parquet",
@@ -4469,20 +5941,82 @@ def _reuse_insufficient(
         final_sha = final_manifest_claim.get("sha256")
         if type(final_path_value) is not str or type(final_sha) is not str:
             raise M8PipelineError("INSUFFICIENT_DATA final-manifest identity is malformed")
-        final_path = (target / final_path_value).resolve()
-        if not final_path.is_relative_to(target):
-            raise M8PipelineError("INSUFFICIENT_DATA final-manifest path escapes target")
-        normalized_manifest_sha256 = _load_final_input_manifest(
-            config,
-            final_path,
+        final_relative = _canonical_inventory_child(
+            final_path_value,
+            "INSUFFICIENT_DATA final normalized manifest",
+        )
+        final_digest = _require_digest(
             final_sha,
-        ).sha256
+            "INSUFFICIENT_DATA final normalized manifest SHA-256",
+        )
+        _read_inventory_bounded_snapshot(
+            target=target,
+            inventory=failure_inventory,
+            relative_path=final_relative,
+            label="INSUFFICIENT_DATA final normalized manifest",
+            max_bytes=_MAX_LOCK_JSON_BYTES,
+            expected_sha256=final_digest,
+        )
+        final_manifest = _load_final_input_manifest(
+            config,
+            _published_file(
+                target,
+                final_relative,
+                "INSUFFICIENT_DATA final normalized manifest",
+            ),
+            final_digest,
+        )
+        _bind_final_input_manifest_inventory(
+            target=target,
+            inventory=failure_inventory,
+            manifest=final_manifest,
+        )
+        normalized_manifest_sha256 = final_manifest.sha256
+    if _verify_failure_evidence_inventory(target) != failure_inventory:
+        raise M8PipelineError("INSUFFICIENT_DATA evidence identity changed during verification")
     return M8RunResult(
         path=target,
         status="INSUFFICIENT_DATA",
         raw_manifest_sha256=raw_manifest.sha256,
         normalized_manifest_sha256=normalized_manifest_sha256,
     )
+
+
+def _self_verify_produced_terminal(
+    *,
+    target: Path,
+    expected_status: M8RunStatus,
+    expected_normalized_manifest_sha256: str | None,
+    config: M8StudyConfig,
+    raw_manifest: M8AcquisitionManifest,
+    project_root: Path,
+    source_identity: _SourceIdentity,
+) -> M8RunResult:
+    """Apply the external reuse contract to a just-produced terminal tree."""
+
+    if expected_status == "COMPLETE":
+        observed = _reuse_completed(
+            target,
+            config,
+            raw_manifest,
+            project_root,
+            source_identity,
+        )
+    else:
+        observed = _reuse_insufficient(
+            target,
+            config,
+            raw_manifest,
+            project_root,
+            source_identity,
+        )
+    if (
+        observed.status != expected_status
+        or observed.raw_manifest_sha256 != raw_manifest.sha256
+        or observed.normalized_manifest_sha256 != expected_normalized_manifest_sha256
+    ):
+        raise M8PipelineError("M8 producer terminal result disagrees with its reuse verifier")
+    return observed
 
 
 def verify_m8_result(
@@ -4587,21 +6121,28 @@ def reproduce_m8(
             project_root,
             source_identity,
         )
+        _self_verify_produced_terminal(
+            target=stage,
+            expected_status=status,
+            expected_normalized_manifest_sha256=normalized_manifest_sha256,
+            config=config,
+            raw_manifest=raw_manifest,
+            project_root=project_root,
+            source_identity=source_identity,
+        )
         if target.exists():
             raise M8PipelineError(f"M8 run target appeared during production: {target}")
         stage.rename(target)
         _fsync_directory(target.parent)
-        result = M8RunResult(
-            path=target,
-            status=status,
-            raw_manifest_sha256=raw_manifest.sha256,
-            normalized_manifest_sha256=normalized_manifest_sha256,
+        return _self_verify_produced_terminal(
+            target=target,
+            expected_status=status,
+            expected_normalized_manifest_sha256=normalized_manifest_sha256,
+            config=config,
+            raw_manifest=raw_manifest,
+            project_root=project_root,
+            source_identity=source_identity,
         )
-        if status == "COMPLETE":
-            load_run_bundle(target)
-        else:
-            verify_checksums(target)
-        return result
     except M8PipelineError:
         if stage.exists():
             shutil.rmtree(stage)

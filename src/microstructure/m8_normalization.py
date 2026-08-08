@@ -13,7 +13,7 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pyarrow as pa  # type: ignore[import-untyped]
 
@@ -34,14 +34,37 @@ class M8NormalizationError(RuntimeError):
     """A system or caller-contract failure while normalizing one archive."""
 
 
+M8NormalizationFailureKind = Literal[
+    "PAYLOAD_OR_CONTINUITY",
+    "QUALITY_GATE",
+    "POSTWRITE_CONSISTENCY",
+]
+M8NormalizationEvidenceCompletion = Literal[
+    "PARTIAL_STREAM",
+    "COMPLETE_DATASET_AND_QUALITY",
+]
+
+
 class M8InsufficientDataError(M8NormalizationError):
     """A deterministic archive/data-quality failure in a declared date."""
 
-    def __init__(self, symbol: str, study_date: str, reason: str) -> None:
+    def __init__(
+        self,
+        symbol: str,
+        study_date: str,
+        reason: str,
+        *,
+        failure_kind: M8NormalizationFailureKind | None = None,
+        evidence_completion: M8NormalizationEvidenceCompletion | None = None,
+        completed_evidence: M8ArchiveEntry | None = None,
+    ) -> None:
         super().__init__(f"{symbol}/{study_date}: {reason}")
         self.symbol = symbol
         self.study_date = study_date
         self.reason = reason
+        self.failure_kind = failure_kind
+        self.evidence_completion = evidence_completion
+        self.completed_evidence = completed_evidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,37 +164,46 @@ def normalize_m8_archive(
     acquired: AcquiredDailyArchive,
     input_root: str | Path,
     *,
+    output_root: str | Path | None = None,
     before_member_open: Callable[[], None] | None = None,
     batch_rows: int = _DEFAULT_BATCH_ROWS,
 ) -> M8NormalizedArchive:
     """Stream one authenticated archive through DQ and partitioned Parquet.
 
-    The function never retains a full daily trade table.  Archive parsing,
-    incremental quality validation, and Parquet writing are bounded by
-    ``batch_rows``.  Any deterministic payload/continuity/DQ failure is exposed
-    as :class:`M8InsufficientDataError` so the producer can publish a terminal
+    ``input_root`` is the immutable raw-evidence authority used for containment
+    checks.  ``output_root`` may isolate normalized and DQ artifacts elsewhere;
+    omitting it preserves the legacy co-located layout.  The function never
+    retains a full daily trade table.  Archive parsing, incremental quality
+    validation, and Parquet writing are bounded by ``batch_rows``.  Any
+    deterministic payload/continuity/DQ failure is exposed as
+    :class:`M8InsufficientDataError` so the producer can publish a terminal
     failed-result bundle without selecting a replacement date.
     """
 
     if isinstance(batch_rows, bool) or not isinstance(batch_rows, int) or batch_rows < 1:
         raise ValueError("batch_rows must be a positive integer")
-    root = Path(input_root).resolve()
-    if not root.is_dir():
-        raise M8NormalizationError(f"stage-local M8 input root is missing: {root}")
+    raw_root = Path(input_root).resolve()
+    if not raw_root.is_dir():
+        raise M8NormalizationError(f"stage-local M8 input root is missing: {raw_root}")
+    derived_root = raw_root if output_root is None else Path(output_root).resolve()
+    if derived_root.exists() and not derived_root.is_dir():
+        raise M8NormalizationError(
+            f"stage-local M8 normalization output root is not a directory: {derived_root}"
+        )
     _validate_frozen_period(config, period)
     if period.role in {"primary_test", "replication_test"} and before_member_open is None:
         raise M8NormalizationError(
             "held-out M8 archives require a lock-revalidation callback before member open"
         )
-    _validate_contract(config, period, metadata, acquired, root)
+    _validate_contract(config, period, metadata, acquired, raw_root)
     symbol = metadata.symbol
     study_date = period.date.isoformat()
-    base = root / "normalized" / symbol / study_date
+    base = derived_root / "normalized" / symbol / study_date
     if base.exists():
         raise M8NormalizationError(
             f"refusing to overwrite prior normalized evidence for {symbol}/{study_date}"
         )
-    quality_root = root / "quality" / symbol / study_date
+    quality_root = derived_root / "quality" / symbol / study_date
     if quality_root.exists():
         raise M8NormalizationError(
             f"refusing to overwrite prior quality evidence for {symbol}/{study_date}"
@@ -220,31 +252,66 @@ def normalize_m8_archive(
         report.write_json(report_path)
     except BinanceArchivePayloadError as exc:
         stream.close()
-        raise M8InsufficientDataError(symbol, study_date, str(exc)) from exc
+        raise M8InsufficientDataError(
+            symbol,
+            study_date,
+            str(exc),
+            failure_kind="PAYLOAD_OR_CONTINUITY",
+            evidence_completion="PARTIAL_STREAM",
+        ) from exc
     except BaseException:
         stream.close()
         raise
 
-    if report.error_count or (report.warning_count and not config.quality.allow_quality_warnings):
+    if summary.symbol != symbol or summary.date != study_date:
         raise M8InsufficientDataError(
             symbol,
             study_date,
-            f"quality gate reported {report.error_count} errors and "
-            f"{report.warning_count} warnings",
+            "archive summary identity disagrees",
+            failure_kind="POSTWRITE_CONSISTENCY",
+            evidence_completion="COMPLETE_DATASET_AND_QUALITY",
         )
-    if summary.symbol != symbol or summary.date != study_date:
-        raise M8InsufficientDataError(symbol, study_date, "archive summary identity disagrees")
     if summary.source_archive_sha256 != acquired.archive_artifact.sha256:
-        raise M8InsufficientDataError(symbol, study_date, "archive summary checksum disagrees")
+        raise M8InsufficientDataError(
+            symbol,
+            study_date,
+            "archive summary checksum disagrees",
+            failure_kind="POSTWRITE_CONSISTENCY",
+            evidence_completion="COMPLETE_DATASET_AND_QUALITY",
+        )
     if summary.expanded_bytes != acquired.declared_uncompressed_bytes:
-        raise M8InsufficientDataError(symbol, study_date, "expanded byte count disagrees")
+        raise M8InsufficientDataError(
+            symbol,
+            study_date,
+            "expanded byte count disagrees",
+            failure_kind="POSTWRITE_CONSISTENCY",
+            evidence_completion="COMPLETE_DATASET_AND_QUALITY",
+        )
     if storage.rows != summary.rows or report.rows_checked != summary.rows:
-        raise M8InsufficientDataError(symbol, study_date, "stream/storage/DQ row counts disagree")
+        raise M8InsufficientDataError(
+            symbol,
+            study_date,
+            "stream/storage/DQ row counts disagree",
+            failure_kind="POSTWRITE_CONSISTENCY",
+            evidence_completion="COMPLETE_DATASET_AND_QUALITY",
+        )
     if summary.last_trade_id - summary.first_trade_id + 1 != summary.rows:
-        raise M8InsufficientDataError(symbol, study_date, "aggregate trade IDs are noncontiguous")
+        raise M8InsufficientDataError(
+            symbol,
+            study_date,
+            "aggregate trade IDs are noncontiguous",
+            failure_kind="POSTWRITE_CONSISTENCY",
+            evidence_completion="COMPLETE_DATASET_AND_QUALITY",
+        )
     normalized_parts = _parts(storage)
     if not normalized_parts or sum(part.rows for part in normalized_parts) != summary.rows:
-        raise M8InsufficientDataError(symbol, study_date, "normalized part accounting failed")
+        raise M8InsufficientDataError(
+            symbol,
+            study_date,
+            "normalized part accounting failed",
+            failure_kind="POSTWRITE_CONSISTENCY",
+            evidence_completion="COMPLETE_DATASET_AND_QUALITY",
+        )
     entry = M8ArchiveEntry(
         symbol=symbol,
         date=period.date,
@@ -285,12 +352,24 @@ def normalize_m8_archive(
         quality_errors=report.error_count,
         quality_warnings=report.warning_count,
     )
-    return M8NormalizedArchive(entry=entry, output_root=root)
+    if report.error_count or (report.warning_count and not config.quality.allow_quality_warnings):
+        raise M8InsufficientDataError(
+            symbol,
+            study_date,
+            f"quality gate reported {report.error_count} errors and "
+            f"{report.warning_count} warnings",
+            failure_kind="QUALITY_GATE",
+            evidence_completion="COMPLETE_DATASET_AND_QUALITY",
+            completed_evidence=entry,
+        )
+    return M8NormalizedArchive(entry=entry, output_root=derived_root)
 
 
 __all__ = [
     "M8InsufficientDataError",
     "M8NormalizationError",
+    "M8NormalizationEvidenceCompletion",
+    "M8NormalizationFailureKind",
     "M8NormalizedArchive",
     "normalize_m8_archive",
 ]

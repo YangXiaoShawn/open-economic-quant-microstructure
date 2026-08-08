@@ -248,7 +248,7 @@ to match; an older clean bundle cannot masquerade as evidence for changed code.
 
 As of 2026-08-08:
 
-- The integrated offline suite passes 555 tests, Ruff, and strict mypy across 40
+- The integrated offline suite passes 574 tests, Ruff, and strict mypy across 40
   source modules covering the
   data, reconstruction, timing, modeling, execution, reporting, dashboard, and
   pipeline boundaries.
@@ -270,9 +270,13 @@ As of 2026-08-08:
   verified raw-only authority
   `data/m8/_manifests/m8-acquisition.manifest-04d5c01f3810b6a300ec.json`
   (SHA-256 `04d5c01f3810b6a300ec0f9317052f254b2bec5d89bc0dfefd18cd71ad6582e6`).
-  At this source freeze, no CSV member or economic field had been opened. Any
-  post-commit terminal result is read from its generated checksum bundle rather
-  than copied into this source-controlled file.
+  The raw-acquisition phase opened no CSV member. A subsequent clean-source
+  attempt opened development training members only and stopped at its frozen DQ
+  gate before selection, locks, or held-out access. Its source-tagged evidence
+  is retained but not promoted because it exposed a raw/derived bundle-layout
+  verifier defect. The corrected producer generates a fresh self-verified
+  terminal under a new clean commit; that bundle, rather than prose here, is the
+  authority for its final status.
 
 This distinction is the main research conclusion so far: a functioning simulator
 is not evidence that a market effect exists.

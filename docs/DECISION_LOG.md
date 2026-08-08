@@ -1,5 +1,24 @@
 # Decision log
 
+## 2026-08-08 — Keep raw authority separate from derived M8 failure evidence
+
+- **Discovery:** The first clean-source development attempt stopped at its
+  frozen data-quality gate before selection, locks, or held-out access, but its
+  terminal bundle could not be reused: normalized and quality artifacts had
+  been written inside the directory that the raw-acquisition verifier correctly
+  requires to be an exact raw-only authority.
+- **Decision:** Preserve the bundled raw authority unchanged below
+  `data/input`; write normalized and DQ artifacts below
+  `data/normalized_input`; root the final cross-stage manifest at `data`.
+  `INSUFFICIENT_DATA` inventories must exactly match the physical regular-file
+  tree and bind completed or failed normalization evidence. The producer runs
+  the external reuse verifier before and after atomic publication.
+- **Evidence policy:** The original source-tagged attempt is retained rather
+  than repaired or overwritten. It is not canonical research evidence, and its
+  failure opened no declared held-out member. A fresh terminal requires a new
+  clean committed source identity; the frozen dates and quality policy do not
+  change.
+
 ## 2026-08-08 — Lock transparent final fitted state before held-out access
 
 - **Decision:** Fit and calibrate the validation-selected model and an independent

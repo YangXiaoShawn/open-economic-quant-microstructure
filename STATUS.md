@@ -26,11 +26,15 @@ locks, immediate held-out member-open revalidation, and immutable complete or
 `INSUFFICIENT_DATA` terminal bundles. The frozen raw-only acquisition has now
 completed: its manifest binds two exchange-metadata responses, eight official
 ZIP/CHECKSUM pairs, and 36 retained artifacts totaling 117,897,562 bytes. Every
-archive still records `csv_member_opened=false` and
-`economic_fields_inspected=false`. At this source freeze, no archive member had
-been normalized or economically evaluated. Any post-commit M8 terminal status
-and metrics are authoritative only in their checksum-verified generated bundle;
-they are not copied back into this source-controlled status file.
+acquisition entry records `csv_member_opened=false` and
+`economic_fields_inspected=false`, proving the raw-only acquisition phase did
+not inspect economic rows. A later clean-source attempt opened development
+training members only and stopped at the frozen DQ gate before selection,
+locks, or held-out access. That source-tagged terminal is retained but not
+promoted because it exposed a raw/derived bundle-layout verification defect.
+The corrected producer requires a fresh clean-source, self-verified terminal;
+its authoritative status and any metrics live only in the generated checksum
+bundle and are not copied back into this source-controlled file.
 
 ## Milestones
 
@@ -50,7 +54,7 @@ they are not copied back into this source-controlled status file.
 
 - 2026-08-07: `make lint` passed across source, tests, and dashboard.
 - 2026-08-08: final `make check` passed Ruff, strict mypy across 40 package
-  modules, all 555 offline tests on Python 3.12.13, and a fresh current-source
+  modules, all 574 offline tests on Python 3.12.13, and a fresh current-source
   synthetic bundle. `ruff format --check` also passed across all 92 Python files.
 - 2026-08-07: `make check` passed Ruff, strict mypy, all tests, and a fresh
   current-source synthetic bundle produced in an isolated temporary target.

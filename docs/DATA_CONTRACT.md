@@ -216,6 +216,13 @@ an independent finite materialization guard checked before any Parquet row read.
 
 For M8 specifically, the raw acquisition manifest and normalized manifests are
 different immutable stages and must not be collapsed into one post hoc record.
+A self-contained run preserves the acquisition authority as an exact raw-only
+copy below `data/input`; normalization, Parquet, and DQ evidence live separately
+below `data/normalized_input`.  The final all-date manifest is rooted at `data`
+so it may bind both trees without making derived artifacts members of the raw
+authority.  A failed run inventories every pre-terminal regular file, binds any
+completed and failed normalization evidence, and applies the same verifier both
+before and after atomic publication.
 A successful final bundle binds the raw acquisition manifest, final normalized
 manifest for all eight declared symbol/dates, official `CHECKSUM` and metadata
 bodies plus their sidecars, per-symbol and aggregate lock hashes, and the clean
