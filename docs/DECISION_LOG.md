@@ -1,5 +1,71 @@
 # Decision log
 
+## 2026-08-08 — Lock transparent final fitted state before held-out access
+
+- **Decision:** Fit and calibrate the validation-selected model and an independent
+  historical prior once on train plus validation. Serialize canonical numeric
+  preprocessing, estimator, calibration, feature-order, cutoff, and fallback
+  state into each child lock; bind both state hashes into the aggregate lock.
+- **Held-out rule:** Primary and replication prediction restore those numeric
+  states. No classifier/calibrator fit, refit, recalibration, or online update is
+  permitted after the aggregate lock becomes durable.
+- **Reason:** A lock that committed only a future refit policy did not freeze the
+  actual model used on untouched data.
+
+## 2026-08-08 — Separate deterministic acquisition insufficiency from system faults
+
+- **Decision:** Declared-object absence and authenticated metadata/CHECKSUM/ZIP,
+  response-size, or total-evidence-budget violations produce a typed immutable
+  raw-only `INSUFFICIENT_DATA` authority. Transient-network exhaustion,
+  permission/local-I/O errors, collisions, and program faults do not terminalize.
+- **Reason:** Deterministic missing/invalid declared evidence consumes the frozen
+  study, while an operational failure must remain safely retryable and cannot be
+  recorded as an empirical outcome.
+
+## 2026-08-08 — Define prospective L2 coverage by observed book-state intervals
+
+- **Decision:** A frozen session counts only consecutive receipt-time intervals
+  backed by `OBSERVED` reconstructed states within one continuity epoch. Stale,
+  excluded, gapped, invalid, and silent intervals are not bridged. Cross-symbol
+  coverage is the intersection of each symbol's interval union.
+- **Publication:** Both symbols share one absolute UTC barrier and one atomic
+  terminal authority. Failed data/gates publish `INSUFFICIENT_DATA`; system
+  faults preserve nonterminal raw evidence. No failed date is replaced.
+- **Reason:** Raw first/last websocket timestamps can hide reconnects and silent
+  holes and therefore cannot prove usable simultaneous book coverage.
+
+## 2026-08-07 — Enforce raw-only acquisition and lock-before-open execution
+
+- **Decision:** Split M8 into an immutable raw authority and a one-way research
+  producer. Acquisition authenticates exchange metadata, eight ZIPs, eight
+  official CHECKSUM responses, and bounded ZIP directory metadata, but cannot
+  open a CSV member. The producer normalizes only train/validation, persists two
+  symbol locks and an aggregate lock, then revalidates every committed identity
+  immediately before each held-out member is opened.
+- **Reason:** Merely delaying a later Parquet scan would not preserve the
+  prospective boundary if held-out economic rows had already been decompressed.
+  The first decompressed member byte is therefore the enforced boundary.
+- **Failure policy:** Deterministic data insufficiency before or after locking is
+  an immutable terminal result with no replacement date, endpoint prediction,
+  execution result, or profitability/significance claim. Unexpected system
+  failures publish no partial research target.
+- **Protocol effect:** This is operational hardening only. It changes no date,
+  feature, candidate, endpoint, hypothesis, estimand, or interpretation rule.
+
+## 2026-08-07 — Count every retained raw-evidence byte and physical copy
+
+- **Decision:** Use one reservation ledger for accepted responses, retry/error
+  prefixes, CHECKSUM bodies, exchange metadata, and every source sidecar. Raw
+  manifests enumerate the exact physical inventory. A self-contained run copy
+  is a distinct retained copy and must fit under the same frozen total ceiling
+  before its first byte is written.
+- **Reason:** Per-response limits alone do not bound accumulated retries,
+  sidecars, or duplicated evidence on a 16 GB local machine. Post-hoc counting
+  could leave an oversized partial publication.
+- **Consequence:** Raw response publication is fail-closed and rollback-safe;
+  normalized Parquet and machine-generated manifest indexes remain outside the
+  raw-response byte ceiling, as declared by the protocol.
+
 ## 2026-08-07 — Freeze future live-L2 sessions before observation
 
 - **Decision:** Reserve 14:00–15:00 UTC on 2026-08-08 through 2026-08-11 for

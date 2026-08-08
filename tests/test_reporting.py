@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -200,6 +202,42 @@ def test_incomplete_and_tampered_bundles_fail_clearly(tmp_path: Path) -> None:
         load_run_bundle(tampered)
 
 
+def test_checksum_manifest_fsyncs_file_before_replace_and_parent_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "durable-checksums"
+    root.mkdir()
+    (root / "artifact.txt").write_text("evidence\n", encoding="utf-8")
+    events: list[str] = []
+    original_fsync = os.fsync
+    original_replace = os.replace
+
+    def fsync(descriptor: int) -> None:
+        mode = os.fstat(descriptor).st_mode
+        events.append("fsync_directory" if stat.S_ISDIR(mode) else "fsync_file")
+        original_fsync(descriptor)
+
+    def replace(
+        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        destination: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    ) -> None:
+        events.append("replace")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+    write_checksum_manifest(root)
+    assert events == ["fsync_file", "replace", "fsync_directory"]
+
+
+def test_complete_bundle_rejects_conflicting_insufficient_marker(tmp_path: Path) -> None:
+    complete = _build_bundle(tmp_path / "conflicting-terminal")
+    (complete / "INSUFFICIENT_DATA").write_text("terminal\n", encoding="utf-8")
+    with pytest.raises(IncompleteRunError, match="conflicting"):
+        load_run_bundle(complete)
+
+
 def test_synthetic_source_cannot_be_promoted_to_public_evidence(tmp_path: Path) -> None:
     run_dir = _build_bundle(
         tmp_path / "laundered",
@@ -373,6 +411,182 @@ def test_public_trade_only_report_uses_manifest_scope_and_excludes_execution(
         assert "0.006789" in rendered
         assert "not p-values or confirmatory significance intervals" in rendered
         assert "cannot support persistent alpha" in rendered
+
+
+def test_m8_full_archive_report_preserves_date_components_and_narrow_scope(
+    tmp_path: Path,
+) -> None:
+    run_dir = _build_bundle(
+        tmp_path / "m8-trade-only",
+        evidence_tier="FULL_DATA",
+        data_mode="binance_spot_daily_aggtrades_trade_only",
+        data_source="binance_spot_daily_aggtrades_archive",
+        finalize=False,
+    )
+    manifest_path = run_dir / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["data"]["all_requested_ranges_complete"] = True
+    manifest["data"]["date_coverage"] = [
+        {
+            "symbol": "BTCUSDT",
+            "date": "2024-01-05",
+            "role": "primary_test",
+            "rows": 100,
+            "observed_start_utc": "2024-01-05T00:00:00Z",
+            "observed_end_inclusive_utc": "2024-01-05T23:59:59.999000Z",
+            "complete": True,
+            "quality_errors": 0,
+            "quality_warnings": 0,
+        },
+        {
+            "symbol": "BTCUSDT",
+            "date": "2024-01-06",
+            "role": "replication_test",
+            "rows": 120,
+            "observed_start_utc": "2024-01-06T00:00:00Z",
+            "observed_end_inclusive_utc": "2024-01-06T23:59:59.999000Z",
+            "complete": True,
+            "quality_errors": 0,
+            "quality_warnings": 0,
+        },
+    ]
+    manifest["research"] = {
+        "scope": "trade_only",
+        "question": "Does the locked trade-only model improve next-20-trade log loss?",
+    }
+    manifest["execution_assumptions"] = {
+        "status": "NOT_RUN",
+        "reason": "No contemporaneous order book or local receipt clock.",
+    }
+    manifest["artifacts"]["hypothesis_evaluation"] = "metrics/hypothesis_evaluation.json"
+    _write_json(manifest_path, manifest)
+    _write_json(run_dir / "metrics" / "execution_metrics.json", [])
+    _write_json(run_dir / "metrics" / "execution_sensitivity.json", [])
+    _write_json(
+        run_dir / "metrics" / "predictive_metrics.json",
+        [
+            {
+                "instrument": "BTCUSDT",
+                "model": "tree_depth_2",
+                "horizon_events": 20,
+                "split": "final_test",
+                "study_date": "2024-01-05",
+                "n_obs": 100,
+                "period_start_utc": "2024-01-05T00:00:00Z",
+                "period_end_utc": "2024-01-05T23:59:59.999000Z",
+                "log_loss": 0.61,
+            },
+            {
+                "instrument": "BTCUSDT",
+                "model": "tree_depth_2",
+                "horizon_events": 20,
+                "split": "final_test",
+                "study_date": "2024-01-06",
+                "n_obs": 120,
+                "period_start_utc": "2024-01-06T00:00:00Z",
+                "period_end_utc": "2024-01-06T23:59:59.999000Z",
+                "log_loss": 0.65,
+            },
+        ],
+    )
+    _write_json(
+        run_dir / "metrics" / "hypothesis_evaluation.json",
+        {
+            "schema_version": "1.0.0",
+            "evidence_scope": "trade_only_complete_predeclared_daily_archives",
+            "selection_metric": "log_loss",
+            "caveat": "No p-values, H0 rejection, or significance claim is authorized.",
+            "cross_instrument_conclusion": {
+                "text": "BTCUSDT and ETHUSDT remain separate; no pooling is authorized."
+            },
+            "per_date": [
+                {
+                    "symbol": "BTCUSDT",
+                    "study_date": "2024-01-05",
+                    "study_role": "primary_test",
+                    "selected_model": "tree_depth_2",
+                    "baseline": "historical_prior",
+                    "selected_log_loss": 0.61,
+                    "prior_log_loss": 0.64,
+                    "point_delta": -0.03,
+                    "ci_low": -0.05,
+                    "ci_high": -0.01,
+                    "n_obs": 100,
+                    "n_blocks": 3,
+                    "bootstrap_status": "ok",
+                },
+                {
+                    "symbol": "BTCUSDT",
+                    "study_date": "2024-01-06",
+                    "study_role": "replication_test",
+                    "selected_model": "tree_depth_2",
+                    "baseline": "historical_prior",
+                    "selected_log_loss": 0.65,
+                    "prior_log_loss": 0.64,
+                    "point_delta": 0.01,
+                    "ci_low": -0.02,
+                    "ci_high": 0.04,
+                    "n_obs": 120,
+                    "n_blocks": 3,
+                    "bootstrap_status": "ok",
+                },
+            ],
+            "per_symbol": [
+                {
+                    "symbol": "BTCUSDT",
+                    "selected_model": "tree_depth_2",
+                    "baseline": "historical_prior",
+                    "point_delta": -0.01,
+                    "ci_low": -0.03,
+                    "ci_high": 0.02,
+                    "n_dates": 2,
+                    "n_obs": 220,
+                    "n_blocks": 6,
+                    "status": "mixed",
+                    "replication_status": "mixed",
+                    "validation_date": "2024-01-04",
+                    "validation_point_delta": -0.02,
+                    "primary_date": "2024-01-05",
+                    "primary_point_delta": -0.03,
+                    "replication_date": "2024-01-06",
+                    "replication_point_delta": 0.01,
+                    "direction_consistent_across_validation_primary_replication": False,
+                    "favorable_across_validation_primary_replication": False,
+                    "validation_primary_replication_status": "mixed",
+                }
+            ],
+        },
+    )
+    write_checksum_manifest(run_dir)
+    (run_dir / "_SUCCESS").write_text("complete\n", encoding="utf-8")
+
+    bundle = load_run_bundle(run_dir)
+    technical = render_technical_report(bundle)
+    memo = render_executive_memo(bundle)
+    published = write_report_set(bundle, tmp_path / "m8-published")
+    held_out_rows = comparison_rows(bundle)
+
+    assert len(held_out_rows) == 2
+    assert {row["study_date"] for row in held_out_rows} == {"2024-01-05", "2024-01-06"}
+    assert "### Per-date observed coverage" in technical
+    assert "M8 predeclared multi-date endpoint" in technical
+    assert "2024-01-05" in technical and "2024-01-06" in technical
+    assert "-0.030000" in technical and "0.010000" in technical
+    assert "Equal-date-weighted endpoint" in technical
+    assert "Validation → primary → replication direction consistency" in technical
+    assert "2024-01-04" in technical
+    assert "mixed" in technical
+    assert "not to full market observability" in technical
+    assert "contains no order-book, execution, P&L, capacity" in memo
+    for path in (
+        published.technical_report,
+        published.executive_memo,
+        published.model_comparison,
+    ):
+        regenerated = path.read_text(encoding="utf-8")
+        assert "M8 predeclared multi-date endpoint" in regenerated
+        assert "2024-01-05" in regenerated and "2024-01-06" in regenerated
+        assert "No p-values, H0 rejection, or significance claim is authorized" in regenerated
 
 
 def test_manifest_and_provenance_run_keys_must_match(tmp_path: Path) -> None:

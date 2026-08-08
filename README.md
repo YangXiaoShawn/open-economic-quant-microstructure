@@ -96,27 +96,85 @@ make verify-public-run
 make report-public
 ```
 
+## Frozen multi-date trade study
+
+The prospective M8 trade-only study uses the complete BTCUSDT and ETHUSDT
+Binance Spot daily aggregate-trade archives for 2024-01-03 through 2024-01-06.
+Acquisition is deliberately separate from research production:
+
+```bash
+# Networked, raw-only: authenticates ZIP/CHECKSUM/metadata evidence but never
+# opens a CSV member or reads an economic field.
+make download-m8
+
+# Copy the manifest path and lowercase SHA-256 printed by download-m8.
+# Production requires the exact clean committed source tree.
+make reproduce-m8 \
+  M8_RAW_MANIFEST=data/m8/_manifests/<manifest>.json \
+  M8_RAW_MANIFEST_SHA256=<64-character-sha256>
+make verify-m8-run \
+  M8_RAW_MANIFEST=data/m8/_manifests/<manifest>.json \
+  M8_RAW_MANIFEST_SHA256=<64-character-sha256>
+make report-m8 \
+  M8_RAW_MANIFEST=data/m8/_manifests/<manifest>.json \
+  M8_RAW_MANIFEST_SHA256=<64-character-sha256>
+```
+
+The producer opens and validates only the train and validation members first.
+It fits and calibrates the selected model and an independent historical prior
+exactly once on development data, persists their canonical numeric preprocessing
+and estimator states in each per-symbol lock, closes one aggregate lock, and
+revalidates the exact protocol, config, Git/source identity, raw authority,
+development manifest, fitted-state hashes, and child locks immediately before
+every held-out member is opened. Held-out evaluation restores those states with
+no fit, refit, recalibration, or update.
+A declared-data failure becomes an immutable `INSUFFICIENT_DATA` bundle with no
+replacement date or endpoint predictions. A successful bundle remains
+trade-only: execution, P&L, capacity, significance, and cross-instrument pooling
+are unauthorized by the protocol.
+
+## Frozen live-L2 sessions
+
+Each declared date is captured by one command that waits for the exact common
+UTC barrier and starts both public market-data feeds under one authority. It
+never authenticates or exposes an order-entry path:
+
+```bash
+make capture-m8-l2-session M8_L2_SESSION_DATE=2026-08-08
+```
+
+The other declared dates are 2026-08-09, 2026-08-10, and 2026-08-11. A missed,
+disconnected, gapped, warning-bearing, or otherwise insufficient date is frozen
+as such and is never replaced. Only checksum-verified `COMPLETE` bundles may be
+consumed by later L2 research.
+
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
 | `make setup` | Create/synchronize the locked Python 3.12 environment |
 | `make download-sample` | Download the bounded credential-free public trade sample |
+| `make download-m8` | Acquire the frozen M8 raw authority without opening archive members |
+| `make capture-m8-l2-session M8_L2_SESSION_DATE=YYYY-MM-DD` | Capture the frozen concurrent BTCUSDT/ETHUSDT L2 session for one declared date |
 | `make validate-data` | Run offline, non-mutating validation on the synthetic fixture |
 | `make validate-public-data` | Validate configured public normalized partitions incrementally |
 | `make smoke` | Produce or verify the immutable synthetic vertical slice |
 | `make test` | Run all unit and integration tests without network access |
 | `make reproduce-sample` | Alias for the canonical smoke producer |
 | `make reproduce-public-sample` | Produce a trade-only run from an explicit manifest path + SHA |
+| `make reproduce-m8` | Produce M8 from an explicit raw manifest + SHA under a clean commit |
 | `make verify-run` | Verify run structure and every protected checksum |
 | `make verify-public-run` | Verify the explicit public run bundle |
+| `make verify-m8-run` | Verify a complete or `INSUFFICIENT_DATA` M8 terminal bundle |
 | `make report` | Render a fresh report set from the frozen bundle |
+| `make report-m8` | Render a complete M8 bundle or expose its frozen failure report |
 | `make dashboard` | Open the local read-only Streamlit research dashboard |
 | `make check` | Run Ruff, strict mypy, pytest, and the smoke producer |
 
 The equivalent CLI is available as `microstructure` after setup. Run
-`microstructure --help` for the `ingest`, `validate`, `reproduce`, `verify`,
-`report`, and research-only `collect-l2` commands.
+`microstructure --help` for the `ingest`, `acquire-m8`, `validate`, `reproduce`,
+`reproduce-m8`, `verify-m8`, `report-m8`, generic `verify`/`report`, the frozen
+`capture-m8-l2-session`, and exploratory research-only `collect-l2` commands.
 
 ## What is implemented
 
@@ -128,7 +186,10 @@ The equivalent CLI is available as `microstructure` after setup. Run
   hard row limit.
 - Optional public live diff-depth capture plus REST snapshot anchoring and pure
   `U/u` reconstruction with stale, overlap, gap, crossed-book, and invariant
-  checks. Reconnection starts a new continuity epoch.
+  checks. Reconnection starts a new continuity epoch. The frozen L2 runner uses
+  one absolute UTC barrier for both instruments, a byte-bounded receiver queue,
+  OBSERVED-only continuity intervals, cross-symbol overlap gates, exhaustive
+  artifact inventory, and atomic `COMPLETE`/`INSUFFICIENT_DATA` evidence.
 - Typed quality findings for duplicates, ordering and clocks, invalid values,
   scale mismatches, abnormal spread, silence, gaps, and crossed books. Validation
   never repairs observations.
@@ -149,6 +210,12 @@ The equivalent CLI is available as `microstructure` after setup. Run
 - Atomic run production. `_SUCCESS` is written last; every other file is covered
   by `checksums.sha256`. A completed target is read-only and reusable only after
   verification.
+- Raw-only M8 acquisition with exact official CHECKSUM evidence, bounded ZIP
+  central-directory inspection, a hard retained-evidence byte ledger, an exact
+  content-addressed inventory, and an atomic self-contained bundle copy. The M8
+  producer enforces development-only normalization and final selected/prior
+  fitting before a durable analysis lock, restores transparent numeric states
+  for prediction, and fails closed at every held-out member-open boundary.
 - Generated technical report, two-page IC memo, held-out comparison table, and
   six-tab Streamlit dashboard, all downstream of frozen serialized artifacts.
 
@@ -179,9 +246,9 @@ to match; an older clean bundle cannot masquerade as evidence for changed code.
 
 ## Main findings and current evidence
 
-As of 2026-08-07:
+As of 2026-08-08:
 
-- The integrated offline suite passes 208 tests, Ruff, and strict mypy across 28
+- The integrated offline suite passes 555 tests, Ruff, and strict mypy across 40
   source modules covering the
   data, reconstruction, timing, modeling, execution, reporting, dashboard, and
   pipeline boundaries.
@@ -197,6 +264,15 @@ As of 2026-08-07:
   not authorize a statistical-significance, persistent-alpha, profitability,
   or capacity claim. The public bundle records execution and P&L as `NOT_RUN`;
   synthetic model/P&L values are never interpreted economically.
+- The prospective M8 acquisition, lock-before-open producer, failure bundle,
+  verifier, and report interfaces are implemented and tested offline. The eight
+  official archives and their CHECKSUM/metadata evidence are now present in the
+  verified raw-only authority
+  `data/m8/_manifests/m8-acquisition.manifest-04d5c01f3810b6a300ec.json`
+  (SHA-256 `04d5c01f3810b6a300ec0f9317052f254b2bec5d89bc0dfefd18cd71ad6582e6`).
+  At this source freeze, no CSV member or economic field had been opened. Any
+  post-commit terminal result is read from its generated checksum bundle rather
+  than copied into this source-controlled file.
 
 This distinction is the main research conclusion so far: a functioning simulator
 is not evidence that a market effect exists.
@@ -210,10 +286,13 @@ not deployable capacity. A short crypto interval cannot generalize across dates,
 venues, or asset classes; overlapping horizons also reduce effective sample size
 and make multiplicity control necessary.
 
-The next empirical milestone is a predeclared multi-date study with both default
-instruments, contiguous local L2 epochs for book claims, adjacent untouched test
-periods, reference-only regime thresholds, block uncertainty, failed-hypothesis
-disclosure, and robustness across fees, latency, fill, and liquidation choices.
+The post-commit empirical sequence is to execute the frozen M8 multi-date trade
+study from that explicit raw-only authority under a clean commit, measure peak
+resident memory on the complete archives, and publish its complete or
+`INSUFFICIENT_DATA` bundle.
+Book-dependent claims remain a separate milestone requiring the already-frozen
+prospective, simultaneous BTCUSDT/ETHUSDT local-L2 sessions and continuous valid
+epochs. No trade-only result can substitute for that evidence.
 
 See [the research protocol](docs/RESEARCH_PROTOCOL.md), [data contract](docs/DATA_CONTRACT.md),
 [project plan](docs/PROJECT_PLAN.md), [decision log](docs/DECISION_LOG.md), and

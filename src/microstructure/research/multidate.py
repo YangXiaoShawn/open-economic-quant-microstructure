@@ -1,11 +1,12 @@
 """Locked, date-level evaluation primitives for the public trade-only study.
 
 The module deliberately separates model selection from final-test evaluation.
-``select_multidate_model`` accepts development data only and emits a content-
-hashed analysis lock.  ``evaluate_locked_multidate_tests`` verifies that lock,
-fits only the locked candidate and an independent historical prior once on the
-combined train/validation reference period, and then opens all declared test
-dates without updating either model.
+``select_multidate_model`` accepts development data only, selects the requested
+candidate, fits that candidate and an independent historical prior on the
+combined train/validation reference period, and emits their transparent numeric
+state in a content-hashed analysis lock.  ``evaluate_locked_multidate_tests``
+restores only that verified state and predicts all declared test dates without
+calling a fitting or update API.
 
 Date-level uncertainty is computed from fixed 40-event block sufficient
 statistics.  Bootstrap draws never materialize resampled event rows and are
@@ -20,11 +21,12 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Literal, cast
 
 import numpy as np
 import polars as pl
+import sklearn  # type: ignore[import-untyped]
 from numpy.typing import NDArray
 
 from microstructure.config import ModelConfig
@@ -43,7 +45,10 @@ DATE_BOOTSTRAP_DRAWS = 2_000
 DATE_BOOTSTRAP_BLOCK_EVENTS = 40
 _BOOTSTRAP_DRAW_CHUNK = 32
 _MAX_BOOTSTRAP_INDEX_ELEMENTS = 1_000_000
-_LOCK_SCHEMA_VERSION = "multidate-selection-lock-v1"
+_LOCK_SCHEMA_VERSION = "multidate-selection-lock-v2"
+_FITTED_STATE_SCHEMA_VERSION = "multidate-fitted-model-state-v1"
+_FITTED_STATE_ARTIFACT_KIND = "multidate_final_fitted_models"
+_FITTED_STATE_SERIALIZATION_FORMAT = "canonical-json-numeric-v1"
 _DEVELOPMENT_ROLES = frozenset({"train", "validation"})
 _TEST_ROLES = frozenset({"test", "primary_test", "replication_test"})
 _ALL_ROLES = _DEVELOPMENT_ROLES | _TEST_ROLES
@@ -96,6 +101,47 @@ class AnalysisLock:
 
 
 @dataclass(frozen=True, slots=True)
+class FinalFittedState:
+    """Canonical, non-executable numeric state for the two final classifiers."""
+
+    payload_json: str
+    sha256: str
+
+    @classmethod
+    def create(cls, payload: Mapping[str, object]) -> FinalFittedState:
+        encoded = _canonical_json_text(payload)
+        state = cls(encoded, hashlib.sha256(encoded.encode()).hexdigest())
+        state.payload()
+        return state
+
+    @classmethod
+    def restore(cls, payload_json: str, sha256: str) -> FinalFittedState:
+        state = cls(payload_json=payload_json, sha256=sha256.lower())
+        state.payload()
+        return state
+
+    def payload(self) -> dict[str, Any]:
+        observed = hashlib.sha256(self.payload_json.encode()).hexdigest()
+        if observed != self.sha256:
+            raise MultiDateEvaluationError("fitted-state payload does not match its SHA-256")
+        decoded = _decode_json_object(self.payload_json, "fitted-state payload")
+        if self.payload_json != _canonical_json_text(decoded):
+            raise MultiDateEvaluationError("fitted-state payload is not canonical JSON")
+        _validate_final_fitted_state_payload(decoded)
+        return decoded
+
+    def predict(
+        self,
+        role: Literal["selected", "historical_prior"],
+        features: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        payload = self.payload()
+        models = cast(Mapping[str, Any], payload["models"])
+        model = cast(Mapping[str, Any], models[role])
+        return _predict_serialized_model(model, features)
+
+
+@dataclass(frozen=True, slots=True)
 class LockedSelection:
     """Validation-only model selection plus its persistable analysis lock."""
 
@@ -109,6 +155,7 @@ class LockedSelection:
     declared_test_dates: tuple[str, ...]
     development_frame_sha256: str
     fitted_data_cutoff_policy: str
+    fitted_state: FinalFittedState
 
     @property
     def selected_model(self) -> str:
@@ -154,6 +201,7 @@ class _FitOutcome:
     fit_status: str
     fit_cutoff_ts_ns: int
     effective_candidate: ModelCandidate
+    fitted_state: Mapping[str, object] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +219,378 @@ class _SelectionSpec:
     development_frame_sha256: str
     block_width_events: int
     bootstrap_draws: int
+    fitted_state: FinalFittedState
+
+
+def _canonical_json_text(value: Mapping[str, object]) -> str:
+    try:
+        return json.dumps(
+            dict(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as error:
+        raise MultiDateEvaluationError("fitted state is not finite canonical JSON") from error
+
+
+def _decode_json_object(payload_json: str, label: str) -> dict[str, Any]:
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise MultiDateEvaluationError(f"{label} repeats key {key!r}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> object:
+        raise MultiDateEvaluationError(f"{label} contains forbidden constant {value}")
+
+    try:
+        decoded = json.loads(
+            payload_json,
+            object_pairs_hook=reject_duplicates,
+            parse_constant=reject_constant,
+        )
+    except MultiDateEvaluationError:
+        raise
+    except (TypeError, json.JSONDecodeError) as error:
+        raise MultiDateEvaluationError(f"{label} is not valid JSON") from error
+    if not isinstance(decoded, dict) or not all(type(key) is str for key in decoded):
+        raise MultiDateEvaluationError(f"{label} must be a JSON object")
+    return cast(dict[str, Any], decoded)
+
+
+def _mapping(value: object, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or not all(type(key) is str for key in value):
+        raise MultiDateEvaluationError(f"{label} must be a JSON object")
+    return cast(Mapping[str, Any], value)
+
+
+def _exact_keys(value: Mapping[str, Any], expected: frozenset[str], label: str) -> None:
+    observed = frozenset(value)
+    if observed != expected:
+        raise MultiDateEvaluationError(
+            f"{label} keys differ: missing={sorted(expected - observed)}, "
+            f"extra={sorted(observed - expected)}"
+        )
+
+
+def _strict_int(value: object, label: str, *, minimum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise MultiDateEvaluationError(f"{label} must be an integer")
+    if minimum is not None and value < minimum:
+        raise MultiDateEvaluationError(f"{label} must be >= {minimum}")
+    return value
+
+
+def _finite_float(value: object, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MultiDateEvaluationError(f"{label} must be numeric")
+    result = float(value)
+    if not math.isfinite(result):
+        raise MultiDateEvaluationError(f"{label} must be finite")
+    return result
+
+
+def _string(value: object, label: str) -> str:
+    if type(value) is not str or not value:
+        raise MultiDateEvaluationError(f"{label} must be a nonempty string")
+    return value
+
+
+def _numeric_vector(value: object, label: str, *, length: int) -> list[float]:
+    if not isinstance(value, list) or len(value) != length:
+        raise MultiDateEvaluationError(f"{label} must contain exactly {length} values")
+    return [_finite_float(item, f"{label}[{index}]") for index, item in enumerate(value)]
+
+
+def _integer_vector(value: object, label: str, *, length: int) -> list[int]:
+    if not isinstance(value, list) or len(value) != length:
+        raise MultiDateEvaluationError(f"{label} must contain exactly {length} integers")
+    return [_strict_int(item, f"{label}[{index}]") for index, item in enumerate(value)]
+
+
+def _class_vector(value: object, label: str) -> list[int]:
+    if not isinstance(value, list) or not value:
+        raise MultiDateEvaluationError(f"{label} must be a nonempty class array")
+    result = [_strict_int(item, f"{label}[{index}]") for index, item in enumerate(value)]
+    if result != sorted(set(result)) or not set(result).issubset({0, 1}):
+        raise MultiDateEvaluationError(f"{label} must be unique ordered binary classes")
+    return result
+
+
+def _validate_candidate_payload_strict(value: object, label: str) -> ModelCandidate:
+    payload = _mapping(value, label)
+    _exact_keys(
+        payload,
+        frozenset({"name", "family", "c", "max_depth", "min_samples_leaf"}),
+        label,
+    )
+    name = _string(payload["name"], f"{label}.name")
+    family = _string(payload["family"], f"{label}.family")
+    if family not in {"baseline", "logistic", "logistic_l2", "shallow_tree"}:
+        raise MultiDateEvaluationError(f"{label} has an unsupported model family")
+    raw_c = payload["c"]
+    c = None if raw_c is None else _finite_float(raw_c, f"{label}.c")
+    raw_depth = payload["max_depth"]
+    max_depth = (
+        None if raw_depth is None else _strict_int(raw_depth, f"{label}.max_depth", minimum=1)
+    )
+    min_samples_leaf = _strict_int(
+        payload["min_samples_leaf"],
+        f"{label}.min_samples_leaf",
+        minimum=1,
+    )
+    if c is not None and c <= 0.0:
+        raise MultiDateEvaluationError(f"{label}.c must be positive")
+    if family == "logistic_l2" and c is None:
+        raise MultiDateEvaluationError(f"{label}.c is required for logistic_l2")
+    if family != "logistic_l2" and c is not None:
+        raise MultiDateEvaluationError(f"{label}.c is only valid for logistic_l2")
+    if family == "shallow_tree" and max_depth is None:
+        raise MultiDateEvaluationError(f"{label}.max_depth is required for shallow_tree")
+    if family != "shallow_tree" and max_depth is not None:
+        raise MultiDateEvaluationError(f"{label}.max_depth is only valid for shallow_tree")
+    return ModelCandidate(
+        name=name,
+        family=cast(Any, family),
+        c=c,
+        max_depth=max_depth,
+        min_samples_leaf=min_samples_leaf,
+    )
+
+
+def _validate_classifier_payload(
+    value: object,
+    *,
+    feature_count: int,
+    effective: ModelCandidate,
+    label: str,
+) -> None:
+    payload = _mapping(value, label)
+    kind = _string(payload.get("kind"), f"{label}.kind")
+    if kind == "prior":
+        _exact_keys(payload, frozenset({"kind", "classes", "class_probabilities"}), label)
+        classes = _class_vector(payload["classes"], f"{label}.classes")
+        probabilities = _numeric_vector(
+            payload["class_probabilities"],
+            f"{label}.class_probabilities",
+            length=len(classes),
+        )
+        if any(not 0.0 <= item <= 1.0 for item in probabilities) or not math.isclose(
+            sum(probabilities), 1.0, rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise MultiDateEvaluationError(f"{label} has invalid class probabilities")
+        if effective.family != "baseline":
+            raise MultiDateEvaluationError(
+                f"{label} prior state disagrees with effective candidate"
+            )
+        return
+    if kind == "logistic":
+        _exact_keys(
+            payload,
+            frozenset(
+                {
+                    "kind",
+                    "classes",
+                    "scaler_mean",
+                    "scaler_scale",
+                    "coefficients",
+                    "intercept",
+                }
+            ),
+            label,
+        )
+        if _class_vector(payload["classes"], f"{label}.classes") != [0, 1]:
+            raise MultiDateEvaluationError(f"{label} logistic state requires classes [0, 1]")
+        _numeric_vector(payload["scaler_mean"], f"{label}.scaler_mean", length=feature_count)
+        scales = _numeric_vector(
+            payload["scaler_scale"], f"{label}.scaler_scale", length=feature_count
+        )
+        if any(item <= 0.0 for item in scales):
+            raise MultiDateEvaluationError(f"{label} scaler scales must be positive")
+        _numeric_vector(payload["coefficients"], f"{label}.coefficients", length=feature_count)
+        _finite_float(payload["intercept"], f"{label}.intercept")
+        if effective.family not in {"logistic", "logistic_l2"}:
+            raise MultiDateEvaluationError(
+                f"{label} logistic state disagrees with effective candidate"
+            )
+        return
+    if kind != "decision_tree":
+        raise MultiDateEvaluationError(f"{label} has an unsupported classifier kind")
+    _exact_keys(
+        payload,
+        frozenset(
+            {
+                "kind",
+                "classes",
+                "node_count",
+                "children_left",
+                "children_right",
+                "feature",
+                "threshold",
+                "positive_probability",
+            }
+        ),
+        label,
+    )
+    if effective.family != "shallow_tree":
+        raise MultiDateEvaluationError(f"{label} tree state disagrees with effective candidate")
+    _class_vector(payload["classes"], f"{label}.classes")
+    node_count = _strict_int(payload["node_count"], f"{label}.node_count", minimum=1)
+    left = _integer_vector(payload["children_left"], f"{label}.children_left", length=node_count)
+    right = _integer_vector(payload["children_right"], f"{label}.children_right", length=node_count)
+    features = _integer_vector(payload["feature"], f"{label}.feature", length=node_count)
+    _numeric_vector(payload["threshold"], f"{label}.threshold", length=node_count)
+    positive = _numeric_vector(
+        payload["positive_probability"],
+        f"{label}.positive_probability",
+        length=node_count,
+    )
+    if any(not 0.0 <= item <= 1.0 for item in positive):
+        raise MultiDateEvaluationError(f"{label} has an invalid leaf probability")
+    for index, (left_child, right_child, feature) in enumerate(
+        zip(left, right, features, strict=True)
+    ):
+        leaf = left_child == -1 and right_child == -1
+        if leaf:
+            continue
+        if not (0 <= left_child < node_count and 0 <= right_child < node_count):
+            raise MultiDateEvaluationError(f"{label} node {index} has an invalid child")
+        if not 0 <= feature < feature_count:
+            raise MultiDateEvaluationError(f"{label} node {index} has an invalid feature")
+
+
+def _validate_calibrator_payload(value: object, label: str) -> None:
+    payload = _mapping(value, label)
+    kind = _string(payload.get("kind"), f"{label}.kind")
+    if kind == "identity":
+        _exact_keys(payload, frozenset({"kind", "status"}), label)
+        status = _string(payload["status"], f"{label}.status")
+        if not status.startswith("identity_"):
+            raise MultiDateEvaluationError(f"{label} identity status is invalid")
+        return
+    if kind != "sigmoid":
+        raise MultiDateEvaluationError(f"{label} has an unsupported calibrator kind")
+    _exact_keys(
+        payload,
+        frozenset({"kind", "status", "classes", "coefficient", "intercept"}),
+        label,
+    )
+    if payload["status"] != "sigmoid":
+        raise MultiDateEvaluationError(f"{label} sigmoid status is invalid")
+    if _class_vector(payload["classes"], f"{label}.classes") != [0, 1]:
+        raise MultiDateEvaluationError(f"{label} sigmoid state requires classes [0, 1]")
+    _finite_float(payload["coefficient"], f"{label}.coefficient")
+    _finite_float(payload["intercept"], f"{label}.intercept")
+
+
+def _validate_serialized_model(
+    value: object,
+    *,
+    role: str,
+    feature_count: int,
+) -> None:
+    label = f"fitted state model {role}"
+    payload = _mapping(value, label)
+    _exact_keys(
+        payload,
+        frozenset(
+            {
+                "role",
+                "requested_candidate",
+                "effective_candidate",
+                "fit_status",
+                "fit_cutoff_ts_ns",
+                "base_fit_rows",
+                "calibration_rows",
+                "imputer_statistics",
+                "classifier",
+                "calibrator",
+            }
+        ),
+        label,
+    )
+    if payload["role"] != role:
+        raise MultiDateEvaluationError(f"{label} has a mismatched role")
+    _validate_candidate_payload_strict(payload["requested_candidate"], f"{label}.requested")
+    effective = _validate_candidate_payload_strict(
+        payload["effective_candidate"], f"{label}.effective"
+    )
+    _string(payload["fit_status"], f"{label}.fit_status")
+    _strict_int(payload["fit_cutoff_ts_ns"], f"{label}.fit_cutoff_ts_ns", minimum=1)
+    _strict_int(payload["base_fit_rows"], f"{label}.base_fit_rows", minimum=1)
+    _strict_int(payload["calibration_rows"], f"{label}.calibration_rows", minimum=0)
+    _numeric_vector(
+        payload["imputer_statistics"],
+        f"{label}.imputer_statistics",
+        length=feature_count,
+    )
+    _validate_classifier_payload(
+        payload["classifier"],
+        feature_count=feature_count,
+        effective=effective,
+        label=f"{label}.classifier",
+    )
+    _validate_calibrator_payload(payload["calibrator"], f"{label}.calibrator")
+
+
+def _validate_final_fitted_state_payload(payload: Mapping[str, Any]) -> None:
+    _exact_keys(
+        payload,
+        frozenset(
+            {
+                "schema_version",
+                "artifact_kind",
+                "serialization_format",
+                "library_versions",
+                "feature_columns",
+                "target",
+                "development_frame_sha256",
+                "fit_cutoff_ts_ns",
+                "eligible_development_rows",
+                "models",
+            }
+        ),
+        "final fitted state",
+    )
+    if payload["schema_version"] != _FITTED_STATE_SCHEMA_VERSION:
+        raise MultiDateEvaluationError("unsupported fitted-state schema version")
+    if payload["artifact_kind"] != _FITTED_STATE_ARTIFACT_KIND:
+        raise MultiDateEvaluationError("unsupported fitted-state artifact kind")
+    if payload["serialization_format"] != _FITTED_STATE_SERIALIZATION_FORMAT:
+        raise MultiDateEvaluationError("unsupported fitted-state serialization format")
+    versions = _mapping(payload["library_versions"], "fitted-state library versions")
+    _exact_keys(versions, frozenset({"numpy", "scikit_learn"}), "fitted-state library versions")
+    _string(versions["numpy"], "fitted-state NumPy version")
+    _string(versions["scikit_learn"], "fitted-state scikit-learn version")
+    features_raw = payload["feature_columns"]
+    if not isinstance(features_raw, list) or not features_raw:
+        raise MultiDateEvaluationError("fitted-state feature columns must be nonempty")
+    features = tuple(_string(item, "fitted-state feature") for item in features_raw)
+    if len(set(features)) != len(features):
+        raise MultiDateEvaluationError("fitted-state feature columns must be unique")
+    _string(payload["target"], "fitted-state target")
+    development_sha = _string(payload["development_frame_sha256"], "fitted-state development SHA")
+    if len(development_sha) != 64 or any(
+        character not in "0123456789abcdef" for character in development_sha
+    ):
+        raise MultiDateEvaluationError("fitted-state development SHA is invalid")
+    cutoff = _strict_int(payload["fit_cutoff_ts_ns"], "fitted-state cutoff", minimum=1)
+    _strict_int(
+        payload["eligible_development_rows"],
+        "fitted-state eligible rows",
+        minimum=1,
+    )
+    models = _mapping(payload["models"], "fitted-state models")
+    _exact_keys(models, frozenset({"selected", "historical_prior"}), "fitted-state models")
+    for role in ("selected", "historical_prior"):
+        _validate_serialized_model(models[role], role=role, feature_count=len(features))
+        model = _mapping(models[role], f"fitted-state model {role}")
+        if model["fit_cutoff_ts_ns"] != cutoff:
+            raise MultiDateEvaluationError("fitted-state model cutoffs disagree")
 
 
 _TEMPORAL_COLUMNS = frozenset(
@@ -464,11 +884,197 @@ def _positive_probability(estimator: Any, features: NDArray[np.float64]) -> NDAr
     return np.asarray(probabilities[:, int(positive[0])], dtype=np.float64)
 
 
+def _float_list(values: object) -> list[float]:
+    array = np.asarray(values, dtype=np.float64).reshape(-1)
+    result = [float(value) for value in array]
+    if any(not math.isfinite(value) for value in result):
+        raise MultiDateEvaluationError("fitted estimator contains a non-finite parameter")
+    return result
+
+
+def _integer_list(values: object) -> list[int]:
+    return [int(value) for value in np.asarray(values).reshape(-1)]
+
+
+def _classifier_state(estimator: Any, effective: ModelCandidate) -> dict[str, object]:
+    model = estimator.named_steps["model"]
+    classes = _integer_list(model.classes_)
+    if effective.family == "baseline":
+        return {
+            "kind": "prior",
+            "classes": classes,
+            "class_probabilities": _float_list(model.class_prior_),
+        }
+    if effective.family in {"logistic", "logistic_l2"}:
+        scaler = estimator.named_steps["scale"]
+        coefficients = np.asarray(model.coef_, dtype=np.float64)
+        intercept = np.asarray(model.intercept_, dtype=np.float64)
+        if coefficients.shape[0] != 1 or intercept.shape != (1,):
+            raise MultiDateEvaluationError("final logistic estimator is not binary")
+        return {
+            "kind": "logistic",
+            "classes": classes,
+            "scaler_mean": _float_list(scaler.mean_),
+            "scaler_scale": _float_list(scaler.scale_),
+            "coefficients": _float_list(coefficients[0]),
+            "intercept": float(intercept[0]),
+        }
+    if effective.family != "shallow_tree":
+        raise MultiDateEvaluationError("cannot serialize an unsupported final classifier")
+    tree = model.tree_
+    values = np.asarray(tree.value, dtype=np.float64)
+    if values.ndim != 3 or values.shape[1] != 1 or values.shape[0] != int(tree.node_count):
+        raise MultiDateEvaluationError("final decision-tree state has an unsupported shape")
+    positive_index = classes.index(1) if 1 in classes else None
+    totals = values[:, 0, :].sum(axis=1)
+    if np.any(totals <= 0.0):
+        raise MultiDateEvaluationError("final decision tree contains an empty node")
+    positive_probability = (
+        np.zeros(int(tree.node_count), dtype=np.float64)
+        if positive_index is None
+        else values[:, 0, positive_index] / totals
+    )
+    return {
+        "kind": "decision_tree",
+        "classes": classes,
+        "node_count": int(tree.node_count),
+        "children_left": _integer_list(tree.children_left),
+        "children_right": _integer_list(tree.children_right),
+        "feature": _integer_list(tree.feature),
+        "threshold": _float_list(tree.threshold),
+        "positive_probability": _float_list(positive_probability),
+    }
+
+
+def _calibrator_state(calibrator: SigmoidCalibrator) -> dict[str, object]:
+    if calibrator.estimator is None:
+        return {"kind": "identity", "status": calibrator.status}
+    estimator = calibrator.estimator
+    classes = _integer_list(estimator.classes_)
+    coefficients = np.asarray(estimator.coef_, dtype=np.float64)
+    intercept = np.asarray(estimator.intercept_, dtype=np.float64)
+    if classes != [0, 1] or coefficients.shape != (1, 1) or intercept.shape != (1,):
+        raise MultiDateEvaluationError("final sigmoid calibrator is not binary")
+    return {
+        "kind": "sigmoid",
+        "status": calibrator.status,
+        "classes": classes,
+        "coefficient": float(coefficients[0, 0]),
+        "intercept": float(intercept[0]),
+    }
+
+
+def _serialized_model_state(
+    *,
+    role: Literal["selected", "historical_prior"],
+    requested: ModelCandidate,
+    effective: ModelCandidate,
+    estimator: Any,
+    calibrator: SigmoidCalibrator,
+    fit_status: str,
+    matrices: _FitMatrices,
+) -> dict[str, object]:
+    imputer = estimator.named_steps["imputer"]
+    return {
+        "role": role,
+        "requested_candidate": _candidate_payload(requested),
+        "effective_candidate": _candidate_payload(effective),
+        "fit_status": fit_status,
+        "fit_cutoff_ts_ns": matrices.fit_cutoff_ts_ns,
+        "base_fit_rows": int(matrices.y_base.size),
+        "calibration_rows": int(matrices.y_calibration.size),
+        "imputer_statistics": _float_list(imputer.statistics_),
+        "classifier": _classifier_state(estimator, effective),
+        "calibrator": _calibrator_state(calibrator),
+    }
+
+
+def _stable_sigmoid(value: NDArray[np.float64]) -> NDArray[np.float64]:
+    result = np.empty_like(value, dtype=np.float64)
+    nonnegative = value >= 0.0
+    result[nonnegative] = 1.0 / (1.0 + np.exp(-value[nonnegative]))
+    exponential = np.exp(value[~nonnegative])
+    result[~nonnegative] = exponential / (1.0 + exponential)
+    return result
+
+
+def _predict_serialized_model(
+    payload: Mapping[str, Any],
+    features: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    statistics = np.asarray(payload["imputer_statistics"], dtype=np.float64)
+    matrix = np.asarray(features, dtype=np.float64)
+    if matrix.ndim != 2 or matrix.shape[1] != statistics.size:
+        raise MultiDateEvaluationError("test feature matrix disagrees with fitted state")
+    imputed = np.where(np.isnan(matrix), statistics.reshape(1, -1), matrix)
+    if not np.isfinite(imputed).all():
+        raise MultiDateEvaluationError(
+            "test feature matrix contains non-finite values after imputation"
+        )
+    classifier = cast(Mapping[str, Any], payload["classifier"])
+    kind = str(classifier["kind"])
+    if kind == "prior":
+        classes = [int(value) for value in classifier["classes"]]
+        probabilities = [float(value) for value in classifier["class_probabilities"]]
+        positive = probabilities[classes.index(1)] if 1 in classes else 0.0
+        raw = np.full(matrix.shape[0], positive, dtype=np.float64)
+    elif kind == "logistic":
+        mean = np.asarray(classifier["scaler_mean"], dtype=np.float64)
+        scale = np.asarray(classifier["scaler_scale"], dtype=np.float64)
+        coefficient = np.asarray(classifier["coefficients"], dtype=np.float64)
+        linear = ((imputed - mean) / scale) @ coefficient + float(classifier["intercept"])
+        raw = _stable_sigmoid(np.asarray(linear, dtype=np.float64))
+    elif kind == "decision_tree":
+        left = np.asarray(classifier["children_left"], dtype=np.int64)
+        right = np.asarray(classifier["children_right"], dtype=np.int64)
+        split_feature = np.asarray(classifier["feature"], dtype=np.int64)
+        threshold = np.asarray(classifier["threshold"], dtype=np.float64)
+        leaf_probability = np.asarray(classifier["positive_probability"], dtype=np.float64)
+        tree_features = np.asarray(imputed, dtype=np.float32)
+        raw = np.empty(matrix.shape[0], dtype=np.float64)
+        for row_index in range(matrix.shape[0]):
+            node = 0
+            for _ in range(left.size + 1):
+                if left[node] == -1 and right[node] == -1:
+                    raw[row_index] = leaf_probability[node]
+                    break
+                node = (
+                    int(left[node])
+                    if tree_features[row_index, split_feature[node]] <= threshold[node]
+                    else int(right[node])
+                )
+            else:
+                raise MultiDateEvaluationError("fitted decision-tree state contains a cycle")
+    else:
+        raise MultiDateEvaluationError("fitted state has an unsupported classifier kind")
+
+    calibrator = cast(Mapping[str, Any], payload["calibrator"])
+    if calibrator["kind"] == "identity":
+        calibrated = np.clip(raw, 1e-12, 1.0 - 1e-12)
+    else:
+        clipped = np.clip(raw, 1e-6, 1.0 - 1e-6)
+        logit = np.log(clipped / (1.0 - clipped))
+        calibrated = _stable_sigmoid(
+            logit * float(calibrator["coefficient"]) + float(calibrator["intercept"])
+        )
+    raw = np.asarray(raw, dtype=np.float64)
+    calibrated = np.asarray(calibrated, dtype=np.float64)
+    if (
+        not np.isfinite(raw).all()
+        or not np.isfinite(calibrated).all()
+        or np.any((raw < 0.0) | (raw > 1.0))
+        or np.any((calibrated < 0.0) | (calibrated > 1.0))
+    ):
+        raise MultiDateEvaluationError("fitted state produced invalid probabilities")
+    return raw, calibrated
+
+
 def _fit_candidate(
     candidate: ModelCandidate,
     matrices: _FitMatrices,
     *,
     seed: int,
+    state_role: Literal["selected", "historical_prior"] | None = None,
 ) -> _FitOutcome:
     effective = candidate
     fit_status = "ok"
@@ -481,14 +1087,33 @@ def _fit_candidate(
     if matrices.y_calibration.size:
         raw_calibration = _positive_probability(estimator, matrices.x_calibration)
         calibrator.fit(matrices.y_calibration, raw_calibration)
-    raw = _positive_probability(estimator, matrices.x_evaluate)
-    calibrated = calibrator.transform(raw)
+    if matrices.x_evaluate.shape[0]:
+        raw = _positive_probability(estimator, matrices.x_evaluate)
+        calibrated = calibrator.transform(raw)
+    else:
+        raw = np.empty(0, dtype=np.float64)
+        calibrated = np.empty(0, dtype=np.float64)
+    status = f"{fit_status};{calibrator.status}"
+    fitted_state = (
+        _serialized_model_state(
+            role=state_role,
+            requested=candidate,
+            effective=effective,
+            estimator=estimator,
+            calibrator=calibrator,
+            fit_status=status,
+            matrices=matrices,
+        )
+        if state_role is not None
+        else None
+    )
     return _FitOutcome(
         raw_probability=raw,
         probability=calibrated,
-        fit_status=f"{fit_status};{calibrator.status}",
+        fit_status=status,
         fit_cutoff_ts_ns=matrices.fit_cutoff_ts_ns,
         effective_candidate=effective,
+        fitted_state=fitted_state,
     )
 
 
@@ -653,10 +1278,67 @@ def select_multidate_model(
 
     development_sha = _frame_sha256(development)
     comparison_sha = _frame_sha256(comparison)
+    final_matrices = _fit_matrices(
+        eligible,
+        eligible.head(min(1_024, eligible.height)),
+        features=features,
+        target=target,
+        calibration_fraction=calibration_fraction,
+    )
+    final_selected = _fit_candidate(
+        selected,
+        final_matrices,
+        seed=seed,
+        state_role="selected",
+    )
+    historical_prior = ModelCandidate("historical_prior", "baseline")
+    final_prior = _fit_candidate(
+        historical_prior,
+        final_matrices,
+        seed=seed,
+        state_role="historical_prior",
+    )
+    if final_selected.fitted_state is None or final_prior.fitted_state is None:
+        raise MultiDateEvaluationError("final development fit did not produce serializable state")
+    primary_start = int(
+        datetime.fromisoformat(f"{test_dates[0]}T00:00:00+00:00").timestamp() * 1_000_000_000
+    )
+    if final_matrices.fit_cutoff_ts_ns >= primary_start:
+        raise MultiDateEvaluationError("final development fitting information reaches primary test")
+    fitted_state = FinalFittedState.create(
+        {
+            "schema_version": _FITTED_STATE_SCHEMA_VERSION,
+            "artifact_kind": _FITTED_STATE_ARTIFACT_KIND,
+            "serialization_format": _FITTED_STATE_SERIALIZATION_FORMAT,
+            "library_versions": {
+                "numpy": np.__version__,
+                "scikit_learn": sklearn.__version__,
+            },
+            "feature_columns": list(features),
+            "target": target,
+            "development_frame_sha256": development_sha,
+            "fit_cutoff_ts_ns": final_matrices.fit_cutoff_ts_ns,
+            "eligible_development_rows": eligible.height,
+            "models": {
+                "selected": dict(final_selected.fitted_state),
+                "historical_prior": dict(final_prior.fitted_state),
+            },
+        }
+    )
+    serialized_selected = fitted_state.predict("selected", final_matrices.x_evaluate)
+    serialized_prior = fitted_state.predict("historical_prior", final_matrices.x_evaluate)
+    if not (
+        np.allclose(serialized_selected[0], final_selected.raw_probability, rtol=0.0, atol=1e-12)
+        and np.allclose(serialized_selected[1], final_selected.probability, rtol=0.0, atol=1e-12)
+        and np.allclose(serialized_prior[0], final_prior.raw_probability, rtol=0.0, atol=1e-12)
+        and np.allclose(serialized_prior[1], final_prior.probability, rtol=0.0, atol=1e-12)
+    ):
+        raise MultiDateEvaluationError("serialized final fitted state changes model predictions")
     fitted_policy = (
         "selection fits each declared candidate on train-role rows only; final evaluation "
-        "refits only the locked selected specification and an independent historical prior "
-        "once on eligible train+validation rows; neither model updates between test dates"
+        "fits only the locked selected specification and an independent historical prior once "
+        "on eligible train+validation rows before the lock; test evaluation restores numeric "
+        "state and neither model updates between test dates"
     )
     lock = AnalysisLock.create(
         {
@@ -692,6 +1374,8 @@ def select_multidate_model(
                 "all fitted labels end before the first validation decision"
             ),
             "final_fit_policy": fitted_policy,
+            "final_fitted_state_sha256": fitted_state.sha256,
+            "final_fitted_state": fitted_state.payload(),
             "test_rows_accessed_during_selection": False,
             "test_update_policy": "fit_once_before_primary_test; no updates through replication",
             "bootstrap": {
@@ -713,6 +1397,7 @@ def select_multidate_model(
         declared_test_dates=test_dates,
         development_frame_sha256=development_sha,
         fitted_data_cutoff_policy=fitted_policy,
+        fitted_state=fitted_state,
     )
 
 
@@ -794,10 +1479,17 @@ def _selection_spec(selection: LockedSelection | AnalysisLock) -> _SelectionSpec
     payload = lock.payload()
     try:
         bootstrap = cast(Mapping[str, Any], payload["bootstrap"])
+        fitted_payload = _mapping(payload["final_fitted_state"], "locked final fitted state")
+        fitted_state = FinalFittedState.create(cast(Mapping[str, object], fitted_payload))
+        claimed_state_sha = str(payload["final_fitted_state_sha256"])
+        if fitted_state.sha256 != claimed_state_sha:
+            raise MultiDateEvaluationError(
+                "selection lock final fitted-state hash does not match its bytes"
+            )
         spec = _SelectionSpec(
             lock=lock,
-            candidate=_candidate_from_payload(
-                cast(Mapping[str, Any], payload["selected_candidate"])
+            candidate=_validate_candidate_payload_strict(
+                payload["selected_candidate"], "selection lock selected candidate"
             ),
             feature_columns=tuple(str(value) for value in payload["feature_columns"]),
             target=str(payload["target"]),
@@ -810,13 +1502,35 @@ def _selection_spec(selection: LockedSelection | AnalysisLock) -> _SelectionSpec
             development_frame_sha256=str(payload["development_frame_sha256"]),
             block_width_events=int(bootstrap["block_width_events"]),
             bootstrap_draws=int(bootstrap["draws"]),
+            fitted_state=fitted_state,
         )
+    except MultiDateEvaluationError:
+        raise
     except (KeyError, TypeError, ValueError) as error:
         raise MultiDateEvaluationError("selection lock is missing typed protocol fields") from error
     if spec.block_width_events != DATE_BOOTSTRAP_BLOCK_EVENTS:
         raise MultiDateEvaluationError("selection lock changed the frozen 40-event block width")
     if spec.bootstrap_draws != DATE_BOOTSTRAP_DRAWS:
         raise MultiDateEvaluationError("selection lock changed the frozen 2000-draw bootstrap")
+    fitted_payload = spec.fitted_state.payload()
+    if (
+        tuple(fitted_payload["feature_columns"]) != spec.feature_columns
+        or fitted_payload["target"] != spec.target
+        or fitted_payload["development_frame_sha256"] != spec.development_frame_sha256
+    ):
+        raise MultiDateEvaluationError("selection lock and fitted-state contracts disagree")
+    selected_model = cast(
+        Mapping[str, Any], cast(Mapping[str, Any], fitted_payload["models"])["selected"]
+    )
+    requested = _validate_candidate_payload_strict(
+        selected_model["requested_candidate"], "fitted selected requested candidate"
+    )
+    if requested != spec.candidate:
+        raise MultiDateEvaluationError(
+            "selection lock candidate differs from fitted selected state"
+        )
+    if isinstance(selection, LockedSelection) and selection.fitted_state != fitted_state:
+        raise MultiDateEvaluationError("in-memory fitted state differs from selection lock")
     return spec
 
 
@@ -1147,23 +1861,21 @@ def evaluate_locked_multidate_tests(
         target=spec.target,
     )
     plan = build_multidate_walk_forward_plan(combined)
-    final_train = _rows_by_indices(combined, plan.final_train_indices)
     final_test = _rows_by_indices(combined, plan.test_indices)
-    matrices = _fit_matrices(
-        final_train,
-        final_test,
-        features=spec.feature_columns,
-        target=spec.target,
-        calibration_fraction=spec.calibration_fraction,
+    test_matrix = final_test.select(spec.feature_columns).to_numpy().astype(np.float64, copy=False)
+    selected_raw, selected_probability = spec.fitted_state.predict("selected", test_matrix)
+    prior_raw, prior_probability = spec.fitted_state.predict("historical_prior", test_matrix)
+    state_payload = spec.fitted_state.payload()
+    state_models = cast(Mapping[str, Any], state_payload["models"])
+    selected_state = cast(Mapping[str, Any], state_models["selected"])
+    prior_state = cast(Mapping[str, Any], state_models["historical_prior"])
+    selected_effective = _validate_candidate_payload_strict(
+        selected_state["effective_candidate"], "locked selected effective candidate"
     )
-    selected = _fit_candidate(spec.candidate, matrices, seed=spec.seed)
-    historical_prior = ModelCandidate("historical_prior", "baseline")
-    prior = _fit_candidate(historical_prior, matrices, seed=spec.seed)
+    selected_cutoff = int(selected_state["fit_cutoff_ts_ns"])
+    prior_cutoff = int(prior_state["fit_cutoff_ts_ns"])
     first_test_decision = int(cast(int, final_test.get_column("decision_ts_ns").min()))
-    if (
-        selected.fit_cutoff_ts_ns >= first_test_decision
-        or prior.fit_cutoff_ts_ns >= first_test_decision
-    ):
+    if selected_cutoff >= first_test_decision or prior_cutoff >= first_test_decision:
         raise MultiDateEvaluationError("final fitting information reaches the primary test")
 
     identity_columns = [
@@ -1181,17 +1893,17 @@ def evaluate_locked_multidate_tests(
         final_test.select(*identity_columns, spec.target)
         .rename({"_research_row_id": "row_id", spec.target: "y_true"})
         .with_columns(
-            pl.Series("selected_raw_probability", selected.raw_probability),
-            pl.Series("selected_probability", selected.probability),
-            pl.Series("prior_raw_probability", prior.raw_probability),
-            pl.Series("prior_probability", prior.probability),
+            pl.Series("selected_raw_probability", selected_raw),
+            pl.Series("selected_probability", selected_probability),
+            pl.Series("prior_raw_probability", prior_raw),
+            pl.Series("prior_probability", prior_probability),
             _test_phase_expression(spec.test_dates[0]),
             pl.lit(spec.candidate.name).alias("selected_model"),
-            pl.lit(selected.effective_candidate.name).alias("selected_effective_model"),
-            pl.lit(selected.fit_status).alias("selected_fit_status"),
-            pl.lit(selected.fit_cutoff_ts_ns).alias("selected_fit_cutoff_ts_ns"),
-            pl.lit(prior.fit_status).alias("prior_fit_status"),
-            pl.lit(prior.fit_cutoff_ts_ns).alias("prior_fit_cutoff_ts_ns"),
+            pl.lit(selected_effective.name).alias("selected_effective_model"),
+            pl.lit(str(selected_state["fit_status"])).alias("selected_fit_status"),
+            pl.lit(selected_cutoff).alias("selected_fit_cutoff_ts_ns"),
+            pl.lit(str(prior_state["fit_status"])).alias("prior_fit_status"),
+            pl.lit(prior_cutoff).alias("prior_fit_cutoff_ts_ns"),
             pl.lit(spec.lock.sha256).alias("selection_lock_sha256"),
             pl.lit(True).alias("is_oos"),
             pl.lit(False).alias("model_updated_between_test_dates"),
@@ -1223,6 +1935,7 @@ __all__ = [
     "DATE_BOOTSTRAP_BLOCK_EVENTS",
     "DATE_BOOTSTRAP_DRAWS",
     "AnalysisLock",
+    "FinalFittedState",
     "LockedMultiDateTestResult",
     "LockedSelection",
     "MultiDateEvaluationError",

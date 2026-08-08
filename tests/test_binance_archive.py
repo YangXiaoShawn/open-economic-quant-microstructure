@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import zipfile
 from collections.abc import Iterator, Mapping
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -19,7 +21,9 @@ from microstructure.data.binance_archive import (
     BinanceArchiveHTTPError,
     BinanceArchivePayloadError,
     DailyArchiveRequest,
+    RetryPolicy,
 )
+from microstructure.data.evidence_budget import EvidenceBudgetExceeded, RetainedEvidenceBudget
 from microstructure.data.schemas import ensure_schema
 from microstructure.provenance import sha256_file
 
@@ -36,11 +40,13 @@ class _Response:
         headers: Mapping[str, str] | None = None,
         status_code: int = 200,
         interrupt_after: int | None = None,
+        final_url: str | None = None,
     ) -> None:
         self.chunks = chunks
         self.headers = dict(headers or {})
         self.status_code = status_code
         self.interrupt_after = interrupt_after
+        self.final_url = final_url
         self.url = ""
         self.closed = False
         self.chunk_sizes: list[int] = []
@@ -67,14 +73,16 @@ class _Response:
 
 
 class _Session:
-    def __init__(self, responses: list[_Response]) -> None:
+    def __init__(self, responses: list[_Response | requests.RequestException]) -> None:
         self.responses = responses
         self.calls: list[dict[str, object]] = []
 
     def get(self, url: str, *, timeout: float, stream: bool) -> _Response:
         self.calls.append({"url": url, "timeout": timeout, "stream": stream})
         response = self.responses.pop(0)
-        response.url = url
+        if isinstance(response, requests.RequestException):
+            raise response
+        response.url = response.final_url or url
         return response
 
 
@@ -179,6 +187,10 @@ def _acquire(
     return acquired, session, archive
 
 
+def _retained_regular_file_bytes(root: Path) -> int:
+    return sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+
+
 def test_acquire_is_bounded_content_addressed_and_does_not_open_csv(tmp_path: Path) -> None:
     csv_content = (
         b"\n".join(
@@ -204,7 +216,10 @@ def test_acquire_is_bounded_content_addressed_and_does_not_open_csv(tmp_path: Pa
     assert acquired.archive_artifact.bytes == len(archive)
     assert acquired.declared_uncompressed_bytes == len(csv_content)
     assert acquired.archive_artifact.path.read_bytes() == archive
-    assert acquired.checksum_artifact.path.name.endswith(".CHECKSUM")
+    assert acquired.checksum_artifact.path.name == f"{_request().archive_name}.CHECKSUM"
+    checksum_manifest = json.loads(acquired.checksum_artifact.manifest_path.read_text())
+    assert checksum_manifest["source"] == "binance_spot_daily_aggtrades_archive_checksum"
+    assert checksum_manifest["path"] == f"{_request().archive_name}.CHECKSUM"
     assert sha256_file(acquired.archive_artifact.manifest_path) == (
         acquired.archive_artifact.manifest_sha256
     )
@@ -220,6 +235,133 @@ def test_acquire_is_bounded_content_addressed_and_does_not_open_csv(tmp_path: Pa
     assert [call["timeout"] for call in session.calls] == [7.5, 7.5]
     assert checksum_response.closed and archive_response.closed
     assert archive_response.chunk_sizes == [13]
+    assert not list(tmp_path.rglob(".download-*.tmp"))
+
+
+def test_shared_evidence_budget_charges_every_success_artifact_exactly_once(
+    tmp_path: Path,
+) -> None:
+    archive = _zip_bytes(_row(1, timestamp_ms=START_MS) + b"\n")
+    session, _, _ = _responses(archive)
+    budget = RetainedEvidenceBudget(tmp_path, limit_bytes=1_000_000)
+
+    acquired = BinanceArchiveClient(
+        session=session,  # type: ignore[arg-type]
+        base_url=BASE_URL,
+        retained_evidence_budget=budget,
+    ).acquire(_request(), raw_root=tmp_path, limits=_limits())
+
+    assert acquired.archive_artifact.path.is_file()
+    assert acquired.checksum_artifact.path.is_file()
+    assert acquired.archive_artifact.manifest_path.is_file()
+    assert acquired.checksum_artifact.manifest_path.is_file()
+    assert budget.reserved_bytes == 0
+    assert budget.used_bytes == _retained_regular_file_bytes(tmp_path)
+
+
+def test_budgeted_content_reuse_releases_download_reservations_without_double_charge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "microstructure.data.binance_archive.utc_now_iso",
+        lambda: "2026-08-07T00:00:00Z",
+    )
+    archive = _zip_bytes(_row(1, timestamp_ms=START_MS) + b"\n")
+    first_session, _, _ = _responses(archive)
+    budget = RetainedEvidenceBudget(tmp_path, limit_bytes=1_000_000)
+    first = BinanceArchiveClient(
+        session=first_session,  # type: ignore[arg-type]
+        base_url=BASE_URL,
+        retained_evidence_budget=budget,
+    ).acquire(_request(), raw_root=tmp_path, limits=_limits())
+    first_used = budget.used_bytes
+    first_files = sorted(
+        path.relative_to(tmp_path) for path in tmp_path.rglob("*") if path.is_file()
+    )
+
+    second_session, _, _ = _responses(archive)
+    second = BinanceArchiveClient(
+        session=second_session,  # type: ignore[arg-type]
+        base_url=BASE_URL,
+        retained_evidence_budget=budget,
+    ).acquire(_request(), raw_root=tmp_path, limits=_limits())
+
+    assert second.archive_artifact.path == first.archive_artifact.path
+    assert second.checksum_artifact.path == first.checksum_artifact.path
+    assert second.archive_artifact.manifest_path == first.archive_artifact.manifest_path
+    assert second.checksum_artifact.manifest_path == first.checksum_artifact.manifest_path
+    assert budget.used_bytes == first_used == _retained_regular_file_bytes(tmp_path)
+    assert budget.reserved_bytes == 0
+    assert sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*") if path.is_file()) == (
+        first_files
+    )
+    assert not list(tmp_path.rglob(".download-*.tmp"))
+
+
+def test_budgeted_retries_charge_one_duplicate_prefix_and_every_distinct_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "microstructure.data.binance_archive.utc_now_iso",
+        lambda: "2026-08-07T00:00:00Z",
+    )
+    archive = _zip_bytes(_row(1, timestamp_ms=START_MS) + b"\n")
+    _, checksum_response, archive_response = _responses(archive)
+    first_interrupted = _Response(
+        [archive[:12], archive[12:]],
+        headers={"Content-Length": str(len(archive))},
+        interrupt_after=1,
+    )
+    second_interrupted = _Response(
+        [archive[:12], archive[12:]],
+        headers={"Content-Length": str(len(archive))},
+        interrupt_after=1,
+    )
+    session = _Session([checksum_response, first_interrupted, second_interrupted, archive_response])
+    budget = RetainedEvidenceBudget(tmp_path, limit_bytes=1_000_000)
+
+    BinanceArchiveClient(
+        session=session,  # type: ignore[arg-type]
+        base_url=BASE_URL,
+        retry_policy=RetryPolicy(max_retries=2, base_delay_seconds=0.0),
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+        retained_evidence_budget=budget,
+    ).acquire(_request(), raw_root=tmp_path, limits=_limits())
+
+    assert len(list(tmp_path.rglob("*.zip.rejected"))) == 1
+    rejected_manifests = list(tmp_path.rglob("*.zip.rejected.manifest-*.json"))
+    assert len(rejected_manifests) == 2
+    assert {
+        json.loads(path.read_text())["response_headers"]["x-local-download-attempt"]
+        for path in rejected_manifests
+    } == {"1", "2"}
+    assert budget.used_bytes == _retained_regular_file_bytes(tmp_path)
+    assert budget.reserved_bytes == 0
+    assert not list(tmp_path.rglob(".download-*.tmp"))
+
+
+def test_sidecar_budget_failure_rolls_back_new_body_and_all_reservations(
+    tmp_path: Path,
+) -> None:
+    archive = _zip_bytes(_row(1, timestamp_ms=START_MS) + b"\n")
+    session, checksum_response, archive_response = _responses(archive)
+    checksum_bytes = sum(len(chunk) for chunk in checksum_response.chunks)
+    budget = RetainedEvidenceBudget(tmp_path, limit_bytes=checksum_bytes)
+
+    with pytest.raises(EvidenceBudgetExceeded, match="raw source manifest"):
+        BinanceArchiveClient(
+            session=session,  # type: ignore[arg-type]
+            base_url=BASE_URL,
+            retained_evidence_budget=budget,
+        ).acquire(_request(), raw_root=tmp_path, limits=_limits())
+
+    assert checksum_response.closed
+    assert archive_response.chunks_read == 0
+    assert budget.used_bytes == budget.reserved_bytes == 0
+    assert _retained_regular_file_bytes(tmp_path) == 0
     assert not list(tmp_path.rglob(".download-*.tmp"))
 
 
@@ -268,6 +410,51 @@ def test_normalized_stream_is_one_shot_bounded_and_terminally_summarized(
     assert summary.compressed_bytes == len(archive)
     with pytest.raises(StopIteration):
         next(stream)
+
+
+def test_member_stream_hash_directory_and_rows_are_bound_to_one_open_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    official_csv = _row(1, timestamp_ms=START_MS, price="42000.01") + b"\n"
+    malicious_csv = _row(1, timestamp_ms=START_MS, price="99999.99") + b"\n"
+    assert len(official_csv) == len(malicious_csv)
+    acquired, _, _ = _acquire(tmp_path, official_csv)
+    acquired = replace(acquired, requires_member_open_guard=True)
+    official_path = acquired.archive_artifact.path
+    official_sha = acquired.archive_artifact.sha256
+    malicious_path = tmp_path / "malicious.zip"
+    malicious_path.write_bytes(_zip_bytes(malicious_csv))
+    official_backup = tmp_path / "official-backup.zip"
+    malicious_backup = tmp_path / "malicious-backup.zip"
+    original_zipfile = zipfile.ZipFile
+    swapped = False
+
+    def swapping_zipfile(source: object, *args: object, **kwargs: object) -> zipfile.ZipFile:
+        nonlocal swapped
+        if not swapped:
+            os.replace(official_path, official_backup)
+            os.replace(malicious_path, official_path)
+            swapped = True
+        return original_zipfile(source, *args, **kwargs)  # type: ignore[arg-type]
+
+    def restore_and_verify_authority() -> None:
+        os.replace(official_path, malicious_backup)
+        os.replace(official_backup, official_path)
+        assert sha256_file(official_path) == official_sha
+
+    monkeypatch.setattr(zipfile, "ZipFile", swapping_zipfile)
+    batches = list(
+        acquired.iter_normalized_batches(
+            batch_rows=1,
+            before_member_open=restore_and_verify_authority,
+        )
+    )
+
+    table = pa.Table.from_batches(batches)
+    assert swapped is True
+    assert table.column("price").to_pylist() == [42000.01]
+    assert sha256_file(official_path) == official_sha
 
 
 def test_early_close_cannot_fabricate_summary(tmp_path: Path) -> None:
@@ -336,12 +523,193 @@ def test_interrupted_archive_stream_preserves_prefix_and_closes(tmp_path: Path) 
         BinanceArchiveClient(
             session=session,  # type: ignore[arg-type]
             base_url=BASE_URL,
+            retry_policy=RetryPolicy(max_retries=0),
         ).acquire(_request(), raw_root=tmp_path, limits=_limits())
 
     rejected = list(tmp_path.rglob("*.zip.rejected"))
     assert len(rejected) == 1
     assert rejected[0].read_bytes() == archive[:12]
     assert archive_response.closed
+
+
+def test_retryable_503_is_evidenced_then_succeeds(tmp_path: Path) -> None:
+    archive = _zip_bytes(_row(1, timestamp_ms=START_MS))
+    _, checksum_response, archive_response = _responses(archive)
+    unavailable = _Response([], status_code=503)
+    session = _Session([unavailable, checksum_response, archive_response])
+    delays: list[float] = []
+
+    acquired = BinanceArchiveClient(
+        session=session,  # type: ignore[arg-type]
+        base_url=BASE_URL,
+        retry_policy=RetryPolicy(
+            max_retries=1,
+            base_delay_seconds=4.0,
+            max_delay_seconds=1.0,
+        ),
+        sleep=delays.append,
+        random_value=lambda: 0.5,
+    ).acquire(_request(), raw_root=tmp_path, limits=_limits())
+
+    assert acquired.archive_artifact.path.read_bytes() == archive
+    assert len(session.calls) == 3
+    assert unavailable.closed and checksum_response.closed and archive_response.closed
+    assert delays == [0.5]
+    rejected = list(tmp_path.rglob("*.CHECKSUM.rejected"))
+    manifests = list(tmp_path.rglob("*.CHECKSUM.rejected.manifest-*.json"))
+    assert len(rejected) == len(manifests) == 1
+    evidence = json.loads(manifests[0].read_text())
+    assert evidence["response_headers"]["x-local-download-attempt"] == "1"
+    assert "HTTP 503" in evidence["response_headers"]["x-local-rejection-reason"]
+    assert not session.responses
+
+
+def test_mid_body_interruption_retries_after_retaining_prefix_and_sidecar(
+    tmp_path: Path,
+) -> None:
+    archive = _zip_bytes(_row(1, timestamp_ms=START_MS))
+    _, checksum_response, archive_response = _responses(archive)
+    interrupted = _Response(
+        [archive[:12], archive[12:]],
+        headers={"Content-Length": str(len(archive))},
+        interrupt_after=1,
+    )
+    session = _Session([checksum_response, interrupted, archive_response])
+
+    acquired = BinanceArchiveClient(
+        session=session,  # type: ignore[arg-type]
+        base_url=BASE_URL,
+        retry_policy=RetryPolicy(max_retries=1, base_delay_seconds=0.0),
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+    ).acquire(_request(), raw_root=tmp_path, limits=_limits())
+
+    rejected = list(tmp_path.rglob("*.zip.rejected"))
+    manifests = list(tmp_path.rglob("*.zip.rejected.manifest-*.json"))
+    assert len(rejected) == len(manifests) == 1
+    assert rejected[0].read_bytes() == archive[:12]
+    assert acquired.archive_artifact.path.read_bytes() == archive
+    assert interrupted.closed and archive_response.closed
+    assert not session.responses
+
+
+def test_429_honors_retry_after_and_closes_before_sleep(tmp_path: Path) -> None:
+    archive = _zip_bytes(_row(1, timestamp_ms=START_MS))
+    _, checksum_response, archive_response = _responses(archive)
+    throttled = _Response([], status_code=429, headers={"Retry-After": "2.75"})
+    session = _Session([throttled, checksum_response, archive_response])
+    delays: list[float] = []
+
+    def record_sleep(delay: float) -> None:
+        assert throttled.closed
+        delays.append(delay)
+
+    def unexpected_random() -> float:
+        raise AssertionError("valid Retry-After must bypass jitter")
+
+    BinanceArchiveClient(
+        session=session,  # type: ignore[arg-type]
+        base_url=BASE_URL,
+        retry_policy=RetryPolicy(max_retries=1),
+        sleep=record_sleep,
+        random_value=unexpected_random,
+    ).acquire(_request(), raw_root=tmp_path, limits=_limits())
+
+    assert delays == [2.75]
+    assert not session.responses
+
+
+def test_content_length_truncation_is_evidenced_and_retried(tmp_path: Path) -> None:
+    archive = _zip_bytes(_row(1, timestamp_ms=START_MS))
+    _, checksum_response, archive_response = _responses(archive)
+    truncated = _Response(
+        [archive],
+        headers={"Content-Length": str(len(archive) + 7)},
+    )
+    session = _Session([checksum_response, truncated, archive_response])
+
+    acquired = BinanceArchiveClient(
+        session=session,  # type: ignore[arg-type]
+        base_url=BASE_URL,
+        retry_policy=RetryPolicy(max_retries=1, base_delay_seconds=0.0),
+        sleep=lambda _: None,
+        random_value=lambda: 0.0,
+    ).acquire(_request(), raw_root=tmp_path, limits=_limits())
+
+    rejected = list(tmp_path.rglob("*.zip.rejected"))
+    assert len(rejected) == 1 and rejected[0].read_bytes() == archive
+    assert acquired.archive_artifact.path.read_bytes() == archive
+    assert truncated.closed
+    assert not session.responses
+
+
+@pytest.mark.parametrize("failure_kind", ["404", "redirect"])
+def test_nonretryable_http_failures_stop_after_one_attempt(
+    tmp_path: Path,
+    failure_kind: str,
+) -> None:
+    if failure_kind == "404":
+        failure = _Response([], status_code=404)
+        message = "HTTP 404"
+    else:
+        failure = _Response([], final_url="https://redirect.invalid/archive")
+        message = "redirected"
+    session = _Session([failure])
+    delays: list[float] = []
+
+    with pytest.raises(BinanceArchiveHTTPError, match=message):
+        BinanceArchiveClient(
+            session=session,  # type: ignore[arg-type]
+            base_url=BASE_URL,
+            retry_policy=RetryPolicy(max_retries=3),
+            sleep=delays.append,
+        ).acquire(_request(), raw_root=tmp_path, limits=_limits())
+
+    assert len(session.calls) == 1
+    assert not delays
+    assert failure.closed
+    manifests = list(tmp_path.rglob("*.CHECKSUM.rejected.manifest-*.json"))
+    assert len(manifests) == 1
+
+
+def test_retry_attempt_exhaustion_retains_evidence_for_every_connect_failure(
+    tmp_path: Path,
+) -> None:
+    session = _Session(
+        [
+            requests.ConnectionError("connect one"),
+            requests.Timeout("connect two"),
+            requests.ConnectionError("connect three"),
+        ]
+    )
+    delays: list[float] = []
+
+    with pytest.raises(BinanceArchiveHTTPError, match="failed before a response") as raised:
+        BinanceArchiveClient(
+            session=session,  # type: ignore[arg-type]
+            base_url=BASE_URL,
+            retry_policy=RetryPolicy(
+                max_retries=2,
+                base_delay_seconds=2.0,
+                max_delay_seconds=3.0,
+            ),
+            sleep=delays.append,
+            random_value=lambda: 0.5,
+        ).acquire(_request(), raw_root=tmp_path, limits=_limits())
+
+    assert delays == [1.0, 1.5]
+    assert len(session.calls) == 3
+    assert any("exhausted 3" in note for note in raised.value.__notes__)
+    rejected = list(tmp_path.rglob("*.CHECKSUM.rejected"))
+    manifests = list(tmp_path.rglob("*.CHECKSUM.rejected.manifest-*.json"))
+    assert len(rejected) == 1
+    assert len(manifests) == 3
+    attempts = sorted(
+        json.loads(path.read_text())["response_headers"]["x-local-download-attempt"]
+        for path in manifests
+    )
+    assert attempts == ["1", "2", "3"]
+    assert not list(tmp_path.rglob(".download-*.tmp"))
 
 
 def test_official_checksum_mismatch_never_publishes_trusted_zip(tmp_path: Path) -> None:
@@ -360,7 +728,9 @@ def test_official_checksum_mismatch_never_publishes_trusted_zip(tmp_path: Path) 
     assert archive_response.closed
 
 
-def test_official_basename_is_immutable_across_conflicting_acquisitions(tmp_path: Path) -> None:
+def test_official_checksum_basename_is_immutable_across_conflicting_acquisitions(
+    tmp_path: Path,
+) -> None:
     first_archive = _zip_bytes(_row(1, timestamp_ms=START_MS))
     first_session, _, _ = _responses(first_archive)
     first = BinanceArchiveClient(
@@ -370,7 +740,7 @@ def test_official_basename_is_immutable_across_conflicting_acquisitions(tmp_path
 
     second_archive = _zip_bytes(_row(2, timestamp_ms=START_MS + 1))
     second_session, _, _ = _responses(second_archive)
-    with pytest.raises(BinanceArchivePayloadError, match="official archive basename collides"):
+    with pytest.raises(BinanceArchivePayloadError, match="official CHECKSUM basename collides"):
         BinanceArchiveClient(
             session=second_session,  # type: ignore[arg-type]
             base_url=BASE_URL,
@@ -378,8 +748,12 @@ def test_official_basename_is_immutable_across_conflicting_acquisitions(tmp_path
 
     assert first.archive_artifact.path.name == _request().archive_name
     assert first.archive_artifact.path.read_bytes() == first_archive
-    rejected = list(tmp_path.rglob("*.zip.rejected"))
-    assert len(rejected) == 1 and rejected[0].read_bytes() == second_archive
+    assert len(second_session.calls) == 1
+    rejected = list(tmp_path.rglob("*.CHECKSUM.rejected"))
+    expected_checksum = (
+        f"{hashlib.sha256(second_archive).hexdigest()}  {_request().archive_name}\n".encode()
+    )
+    assert len(rejected) == 1 and rejected[0].read_bytes() == expected_checksum
     assert not list(tmp_path.rglob(".download-*.tmp"))
 
 
@@ -390,6 +764,7 @@ def test_official_basename_is_immutable_across_conflicting_acquisitions(tmp_path
         f"{'0' * 64} {_request().archive_name}\n".encode(),
         f"{'0' * 64}  WRONG.zip\n".encode(),
         f"{'A' * 64}  {_request().archive_name}\n".encode(),
+        f"{'0' * 64}  {_request().archive_name}\r".encode(),
     ],
 )
 def test_malformed_checksum_fails_before_archive_request(tmp_path: Path, checksum: bytes) -> None:

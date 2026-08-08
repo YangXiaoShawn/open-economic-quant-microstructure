@@ -38,6 +38,16 @@ from microstructure.ingestion import (
     ingest_from_config,
     validate_configured_input,
 )
+from microstructure.m8_acquisition import (
+    M8AcquisitionFailureResult,
+    M8AcquisitionResult,
+    acquire_m8_archives,
+)
+from microstructure.m8_config import load_m8_config
+from microstructure.m8_l2_binance import BinanceM8L2Capture
+from microstructure.m8_l2_capture import M8L2SessionBundle, capture_m8_l2_session
+from microstructure.m8_l2_config import load_m8_l2_config
+from microstructure.m8_pipeline import M8RunResult, reproduce_m8, verify_m8_result
 from microstructure.pipeline import reproduce
 from microstructure.provenance import read_json, sha256_file, utc_now_iso, write_json
 from microstructure.reporting import load_run_bundle, verify_checksums, write_report_set
@@ -104,6 +114,58 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _m8_acquisition_payload(result: M8AcquisitionResult) -> dict[str, Any]:
+    return {
+        "status": "acquired",
+        "scope": "raw_only",
+        "output_root": result.output_root,
+        "raw_manifest": result.manifest_path,
+        "raw_manifest_sha256": result.manifest_sha256,
+        "metadata_responses": result.metadata_count,
+        "archives": result.archive_count,
+        "total_raw_evidence_bytes": result.total_raw_evidence_bytes,
+        "csv_members_opened": False,
+        "economic_fields_inspected": False,
+    }
+
+
+def _m8_acquisition_failure_payload(result: M8AcquisitionFailureResult) -> dict[str, Any]:
+    failed_date = result.failed_date
+    return {
+        "status": "INSUFFICIENT_DATA",
+        "scope": "raw_only",
+        "output_root": result.output_root,
+        "attempt_dir": result.attempt_dir,
+        "failure_manifest": result.attempt_manifest_path,
+        "failure_manifest_sha256": result.attempt_manifest_sha256,
+        "checksums": result.checksums_path,
+        "checksums_sha256": result.checksums_sha256,
+        "terminal_marker": result.terminal_path,
+        "reason_code": result.reason_code,
+        "diagnostic": result.diagnostic,
+        "failed_symbol": result.failed_symbol,
+        "failed_date": None if failed_date is None else failed_date.isoformat(),
+        "failed_role": result.failed_role,
+        "completed_steps": result.completed_count,
+        "remaining_steps": result.remaining_count,
+        "retained_inventory_sha256": result.retained_inventory_sha256,
+        "retained_artifacts": result.retained_artifact_count,
+        "total_raw_evidence_bytes": result.total_raw_evidence_bytes,
+        "csv_members_opened": False,
+        "economic_fields_inspected": False,
+    }
+
+
+def _cmd_acquire_m8(args: argparse.Namespace) -> int:
+    config = load_m8_config(args.config)
+    result = acquire_m8_archives(config, Path(args.output_root).resolve())
+    if isinstance(result, M8AcquisitionFailureResult):
+        _print_json(_m8_acquisition_failure_payload(result))
+        return 1
+    _print_json(_m8_acquisition_payload(result))
+    return 0
+
+
 def _synthetic_tables(config: ProjectConfig) -> dict[str, Any]:
     events = config.data.events_per_symbol
     if events is None:
@@ -162,6 +224,105 @@ def _cmd_reproduce(args: argparse.Namespace) -> int:
         }
     )
     return 0
+
+
+def _cmd_reproduce_m8(args: argparse.Namespace) -> int:
+    config = load_m8_config(args.config)
+    result = reproduce_m8(
+        config,
+        Path(args.run_dir),
+        raw_manifest_path=Path(args.raw_manifest),
+        raw_manifest_sha256=str(args.raw_manifest_sha256),
+    )
+    if result.status == "INSUFFICIENT_DATA":
+        _print_json(_m8_run_result_payload(result))
+        return 1
+    bundle = load_run_bundle(result.path)
+    _print_json(
+        {
+            "run_dir": result.path,
+            "run_id": bundle.run_id,
+            "evidence_tier": bundle.evidence_tier,
+            "observed_start_utc": bundle.observed_start_utc,
+            "observed_end_utc": bundle.observed_end_utc,
+            "status": result.status,
+            "raw_manifest_sha256": result.raw_manifest_sha256,
+            "normalized_manifest_sha256": result.normalized_manifest_sha256,
+        }
+    )
+    return 0
+
+
+def _m8_run_result_payload(result: M8RunResult) -> dict[str, Any]:
+    return {
+        "run_dir": result.path,
+        "status": result.status,
+        "raw_manifest_sha256": result.raw_manifest_sha256,
+        "normalized_manifest_sha256": result.normalized_manifest_sha256,
+    }
+
+
+def _cmd_verify_m8(args: argparse.Namespace) -> int:
+    config = load_m8_config(args.config)
+    result = verify_m8_result(
+        args.run_dir,
+        config,
+        raw_manifest_path=args.raw_manifest,
+        raw_manifest_sha256=args.raw_manifest_sha256,
+    )
+    payload = _m8_run_result_payload(result)
+    payload.update(
+        {
+            "integrity": "verified",
+            "protected_files": verify_checksums(result.path),
+        }
+    )
+    _print_json(payload)
+    return 0
+
+
+def _cmd_report_m8(args: argparse.Namespace) -> int:
+    config = load_m8_config(args.config)
+    result = verify_m8_result(
+        args.run_dir,
+        config,
+        raw_manifest_path=args.raw_manifest,
+        raw_manifest_sha256=args.raw_manifest_sha256,
+    )
+    if result.status == "COMPLETE":
+        bundle = load_run_bundle(result.path)
+        output = (
+            Path(args.output_dir).resolve()
+            if args.output_dir
+            else bundle.root.with_name(f"{bundle.root.name}-reports")
+        )
+        paths = write_report_set(bundle, output)
+        _print_json(
+            {
+                **_m8_run_result_payload(result),
+                "output_dir": output,
+                "reports_regenerated": True,
+                **asdict(paths),
+            }
+        )
+    else:
+        failure_report = result.path / "reports" / "insufficient_data.md"
+        if not failure_report.is_file():
+            raise ValueError("verified INSUFFICIENT_DATA result lacks its failure report")
+        _print_json(
+            {
+                **_m8_run_result_payload(result),
+                "report": failure_report,
+                "reports_regenerated": False,
+            }
+        )
+    return 0
+
+
+def _lowercase_sha256(value: str) -> str:
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise argparse.ArgumentTypeError("must be a 64-character lowercase SHA-256 digest")
+    return value
 
 
 def _cmd_verify(args: argparse.Namespace) -> int:
@@ -1040,6 +1201,37 @@ def _cmd_collect_l2(args: argparse.Namespace) -> int:
     return 0 if result.reconstruction_status == "LIVE" and result.quality_errors == 0 else 1
 
 
+def _m8_l2_session_payload(result: M8L2SessionBundle) -> dict[str, object]:
+    return {
+        "status": result.status,
+        "session_id": result.session_id,
+        "session_date": result.session_date,
+        "role": result.role,
+        "output_root": result.root,
+        "session_manifest": result.manifest_path,
+        "session_manifest_sha256": result.manifest_sha256,
+        "checksums": result.checksum_path,
+        "terminal_marker": result.marker_path,
+        "reason_codes": list(result.reason_codes),
+        "source": "binance_spot_public_live_diff_depth",
+        "live_trading": False,
+    }
+
+
+def _cmd_capture_m8_l2_session(args: argparse.Namespace) -> int:
+    config = load_m8_l2_config(args.config)
+    result = asyncio.run(
+        capture_m8_l2_session(
+            config,
+            str(args.date),
+            Path(args.output_root).resolve(),
+            BinanceM8L2Capture(),
+        )
+    )
+    _print_json(_m8_l2_session_payload(result))
+    return 0 if result.status == "COMPLETE" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="microstructure",
@@ -1052,6 +1244,14 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--config", required=True, type=Path)
     ingest.add_argument("--output-root", type=Path)
     ingest.set_defaults(handler=_cmd_ingest)
+
+    acquire_m8 = subparsers.add_parser(
+        "acquire-m8",
+        help="acquire raw M8 evidence without opening any archive CSV member",
+    )
+    acquire_m8.add_argument("--config", required=True, type=Path)
+    acquire_m8.add_argument("--output-root", required=True, type=Path)
+    acquire_m8.set_defaults(handler=_cmd_acquire_m8)
 
     validate = subparsers.add_parser("validate", help="run non-mutating data validation")
     validate.add_argument("--config", required=True, type=Path)
@@ -1072,6 +1272,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="SHA-256 of --ingestion-manifest; required for public mode",
     )
     reproduce_parser.set_defaults(handler=_cmd_reproduce)
+
+    reproduce_m8_parser = subparsers.add_parser(
+        "reproduce-m8",
+        help="produce the frozen M8 study from one explicit raw acquisition authority",
+    )
+    reproduce_m8_parser.add_argument("--config", required=True, type=Path)
+    reproduce_m8_parser.add_argument("--run-dir", required=True, type=Path)
+    reproduce_m8_parser.add_argument("--raw-manifest", required=True, type=Path)
+    reproduce_m8_parser.add_argument(
+        "--raw-manifest-sha256",
+        required=True,
+        type=_lowercase_sha256,
+    )
+    reproduce_m8_parser.set_defaults(handler=_cmd_reproduce_m8)
+
+    verify_m8_parser = subparsers.add_parser(
+        "verify-m8",
+        help="verify a complete or INSUFFICIENT_DATA M8 result and its raw authority",
+    )
+    verify_m8_parser.add_argument("--config", required=True, type=Path)
+    verify_m8_parser.add_argument("--run-dir", required=True, type=Path)
+    verify_m8_parser.add_argument("--raw-manifest", required=True, type=Path)
+    verify_m8_parser.add_argument(
+        "--raw-manifest-sha256",
+        required=True,
+        type=_lowercase_sha256,
+    )
+    verify_m8_parser.set_defaults(handler=_cmd_verify_m8)
+
+    report_m8_parser = subparsers.add_parser(
+        "report-m8",
+        help="render a complete M8 result or expose its frozen failure report",
+    )
+    report_m8_parser.add_argument("--config", required=True, type=Path)
+    report_m8_parser.add_argument("--run-dir", required=True, type=Path)
+    report_m8_parser.add_argument("--raw-manifest", required=True, type=Path)
+    report_m8_parser.add_argument(
+        "--raw-manifest-sha256",
+        required=True,
+        type=_lowercase_sha256,
+    )
+    report_m8_parser.add_argument("--output-dir", type=Path)
+    report_m8_parser.set_defaults(handler=_cmd_report_m8)
 
     verify = subparsers.add_parser("verify", help="verify a frozen run and all checksums")
     verify.add_argument("--run-dir", required=True, type=Path)
@@ -1097,6 +1340,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     collect.add_argument("--output-root", type=Path, default=Path("data"))
     collect.set_defaults(handler=_cmd_collect_l2)
+
+    capture_m8_l2 = subparsers.add_parser(
+        "capture-m8-l2-session",
+        help="capture one frozen concurrent BTCUSDT/ETHUSDT prospective L2 session",
+    )
+    capture_m8_l2.add_argument("--config", required=True, type=Path)
+    capture_m8_l2.add_argument("--date", required=True)
+    capture_m8_l2.add_argument("--output-root", required=True, type=Path)
+    capture_m8_l2.set_defaults(handler=_cmd_capture_m8_l2_session)
     return parser
 
 

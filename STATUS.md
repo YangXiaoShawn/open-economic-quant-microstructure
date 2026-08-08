@@ -1,6 +1,6 @@
 # Status
 
-Last updated: 2026-08-07 UTC
+Last updated: 2026-08-08 UTC
 
 ## Current evidence
 
@@ -19,6 +19,19 @@ producer uses per-symbol purged folds and paired model-minus-prior uncertainty;
 execution and P&L are explicitly `NOT_RUN` because no contemporaneous book is
 present.
 
+The prospective M8 implementation now has a raw-only acquisition authority,
+strict retained-evidence byte accounting, bounded ZIP-directory verification,
+development-only normalization, durable per-symbol and aggregate analysis
+locks, immediate held-out member-open revalidation, and immutable complete or
+`INSUFFICIENT_DATA` terminal bundles. The frozen raw-only acquisition has now
+completed: its manifest binds two exchange-metadata responses, eight official
+ZIP/CHECKSUM pairs, and 36 retained artifacts totaling 117,897,562 bytes. Every
+archive still records `csv_member_opened=false` and
+`economic_fields_inspected=false`. At this source freeze, no archive member had
+been normalized or economically evaluated. Any post-commit M8 terminal status
+and metrics are authoritative only in their checksum-verified generated bundle;
+they are not copied back into this source-controlled status file.
+
 ## Milestones
 
 | Milestone | Status | Evidence |
@@ -31,15 +44,29 @@ present.
 | M5 Execution research | Complete | OOS-only costs, two-stage latency, market/limit partial fills, queue proxy, inventory, liquidation and sensitivity |
 | M6 Reproducible vertical slice | Complete | Atomic CLI producer, immutable checksum bundle, deterministic run key, idempotent verification |
 | M7 Research communication | Complete | Code-generated report/memo/table, read-only six-tab dashboard, limitations and portfolio material |
-| M8 Broader empirical study | In progress | Prospective four-date trade protocol is frozen before acquisition; complete archives, untouched-date results, and contiguous locally captured L2 epochs remain |
+| M8 Broader empirical study | In progress | Raw-only authority acquired and verified; canonical trade terminal/resource evidence is generated post-commit, while four prospective local-L2 sessions remain required |
 
 ## Verification ledger
 
 - 2026-08-07: `make lint` passed across source, tests, and dashboard.
-- 2026-08-07: `make typecheck` passed in strict mode across 28 package modules.
-- 2026-08-07: `make test` passed all 208 offline tests on Python 3.12.13.
+- 2026-08-08: final `make check` passed Ruff, strict mypy across 40 package
+  modules, all 555 offline tests on Python 3.12.13, and a fresh current-source
+  synthetic bundle. `ruff format --check` also passed across all 92 Python files.
 - 2026-08-07: `make check` passed Ruff, strict mypy, all tests, and a fresh
   current-source synthetic bundle produced in an isolated temporary target.
+- 2026-08-07: adversarial M8 tests proved that raw acquisition opens no CSV
+  member, unsafe ZIP metadata is rejected before the standard ZIP parser, both
+  symbol locks precede the first held-out open, tampered/missing authorities
+  expose zero held-out rows, and deterministic data failures publish no endpoint.
+- 2026-08-08: raw-only M8 acquisition published and independently reverified
+  `data/m8/_manifests/m8-acquisition.manifest-04d5c01f3810b6a300ec.json`
+  (SHA-256 `04d5c01f3810b6a300ec0f9317052f254b2bec5d89bc0dfefd18cd71ad6582e6`).
+  Verification opened no CSV member and found no extra, missing, symlinked, or
+  unmanifested raw artifact.
+- 2026-08-08: the frozen dual-symbol L2 session core and Binance adapter passed
+  82 joint tests. A real adapter-produced mock bundle exposed 19 artifacts that
+  passed strict raw-journal, snapshot, Parquet footer/schema, quality, manifest,
+  absolute-time, overlap, and 29-gate reconciliation.
 - 2026-08-07: pipeline tests independently reproduced two semantically identical
   run bundles, verified their checksums, rejected corruption, and preserved an
   incomplete target without repair.
@@ -68,10 +95,13 @@ present.
   capped date cannot test persistence or book/liquidity hypotheses, and
   synthetic output cannot evaluate a market hypothesis.
 
-## Immediate next milestone
+## Post-commit evidence sequence
 
-Implement and run the frozen
-[`M8_MULTIDATE_TRADE_PROTOCOL.md`](docs/M8_MULTIDATE_TRADE_PROTOCOL.md) without
-changing its 2024-01-03 through 2024-01-06 date roles after acquisition. Retain
-the current single-date bundle unchanged. In parallel, freeze and collect the
-separate continuous public L2 evidence required for book-dependent claims.
+From a clean committed source tree, run `make reproduce-m8`,
+`make verify-m8-run`, and `make report-m8` with those exact coordinates. Measure
+peak resident memory on the complete eight-archive run and publish either the
+complete trade-only evidence bundle or the protocol-declared
+`INSUFFICIENT_DATA` result. Retain the current single-date bundle unchanged.
+Use the acquired manifest path and SHA above; do not rediscover a "latest"
+input. Separately collect the frozen simultaneous public L2 sessions required
+for book-dependent claims; they cannot be inferred from the trade archives.

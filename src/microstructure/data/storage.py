@@ -9,7 +9,7 @@ import re
 import tempfile
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +19,7 @@ import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.compute as pc  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
+from microstructure.data.evidence_budget import RetainedEvidenceBudget
 from microstructure.data.schemas import SCHEMA_VERSION, ensure_schema, get_schema
 from microstructure.provenance import read_json, sha256_file, utc_now_iso, write_json
 
@@ -86,16 +87,53 @@ def _partition_date(timestamp_ns: int) -> str:
     return datetime.fromtimestamp(seconds, tz=UTC).date().isoformat()
 
 
-def _immutable_json(directory: Path, stem: str, payload: Mapping[str, Any]) -> tuple[Path, str]:
+def _immutable_json(
+    directory: Path,
+    stem: str,
+    payload: Mapping[str, Any],
+    *,
+    retained_evidence_budget: RetainedEvidenceBudget | None = None,
+) -> tuple[Path, str]:
     identity = _stable_sha(payload)
     destination = directory / f"{stem}-{identity[:20]}.json"
-    if destination.exists():
-        existing = read_json(destination)
-        if existing != dict(payload):
-            raise StorageError(f"immutable manifest collision at {destination}")
-    else:
-        write_json(destination, payload)
-    return destination, sha256_file(destination)
+    if retained_evidence_budget is not None:
+        retained_evidence_budget.assert_contains(destination)
+    transaction = (
+        retained_evidence_budget.write_transaction()
+        if retained_evidence_budget is not None
+        else nullcontext()
+    )
+    with transaction:
+        if destination.exists():
+            existing = read_json(destination)
+            if existing != dict(payload):
+                raise StorageError(f"immutable manifest collision at {destination}")
+        else:
+            encoded = (
+                json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+            ).encode()
+            reservation = (
+                retained_evidence_budget.reserve(
+                    len(encoded),
+                    label=f"raw source manifest {destination.name}",
+                )
+                if retained_evidence_budget is not None
+                else None
+            )
+            try:
+                write_json(destination, payload)
+                if destination.stat().st_size != len(encoded):
+                    raise StorageError(
+                        f"source manifest byte count changed while writing {destination}"
+                    )
+                if reservation is not None:
+                    reservation.commit()
+            except BaseException:
+                destination.unlink(missing_ok=True)
+                if reservation is not None and reservation.active:
+                    reservation.release()
+                raise
+        return destination, sha256_file(destination)
 
 
 def write_source_manifest(
@@ -108,6 +146,7 @@ def write_source_manifest(
     requested_end_ns: int | None,
     upstream_checksum_sha256: str | None = None,
     response_headers: Mapping[str, str] | None = None,
+    retained_evidence_budget: RetainedEvidenceBudget | None = None,
 ) -> tuple[Path, str]:
     """Write an immutable sidecar for an untouched raw response or archive."""
     path = Path(raw_path)
@@ -127,7 +166,12 @@ def write_source_manifest(
         "path": path.name,
         "response_headers": dict(sorted((response_headers or {}).items())),
     }
-    manifest_path, manifest_sha = _immutable_json(path.parent, f"{path.name}.manifest", payload)
+    manifest_path, manifest_sha = _immutable_json(
+        path.parent,
+        f"{path.name}.manifest",
+        payload,
+        retained_evidence_budget=retained_evidence_budget,
+    )
     return manifest_path, manifest_sha
 
 

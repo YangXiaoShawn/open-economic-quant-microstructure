@@ -26,6 +26,18 @@ must be copied into the final study bundle. Changing a date, role, feature,
 model, endpoint, or interpretation rule creates a new protocol version and may
 not overwrite this study.
 
+### Protocol-boundary clarification
+
+The acquisition/locking rules below are an operational hardening of the
+existing outcome-blind protocol, not an outcome-driven amendment. They change
+no date, role, feature, label, candidate, hypothesis, estimand, or interpretation
+rule. No declared economic outcome was opened to motivate this clarification:
+in particular, no declared price, quantity, buyer-maker value, class balance,
+feature, label, fit, score, or test result has been inspected. The historical
+coverage-only disclosure above remains the complete exception. An
+implementation that cannot enforce the hardened boundary does not execute this
+protocol.
+
 ## Data calendar and completeness
 
 Use the complete Binance Spot daily aggregate-trade archive for both BTCUSDT and
@@ -51,10 +63,81 @@ quality error makes the study `INSUFFICIENT_DATA`. Such a failure is reported;
 it is not repaired by choosing another date. Raw archives remain immutable and
 uncommitted. Normalized data is partitioned by venue, symbol, and UTC date.
 
-Archive download and CSV normalization must be streaming and byte-bounded. The
-compressed, expanded, and total byte ceilings in the machine-readable protocol
-are hard safety limits, not sampling rules. Crossing one fails closed before a
-research result is produced.
+Acquisition of all eight archives is **raw-only**. It may verify the exact
+official `CHECKSUM` response, response lengths and hashes, and bounded ZIP
+end-of-central-directory/central-directory metadata for exactly one
+expected-name member and its declared sizes. It must not open, extract, or read
+the CSV member; stream decompressed member bytes; parse even its header; expose
+an economic field; or derive row, ID, timestamp, or class-balance coverage.
+Those operations constitute economic-data opening and belong to the staged
+normalization boundary below. Public `exchangeInfo` may be parsed only for the
+declared symbol's status and exact tick/lot filters, with its exact response and
+response sidecar preserved.
+
+Archive transfer and later CSV normalization must both be streaming and
+byte-bounded. The byte ceilings in the machine-readable protocol are hard
+safety limits, not sampling rules:
+
+- `max_archive_compressed_bytes` bounds each archive ZIP response body while it
+  is transferred; an asserted `Content-Length` does not replace streamed byte
+  accounting.
+- `max_archive_uncompressed_bytes` bounds both the central-directory-declared
+  size and the actual expanded bytes of each sole CSV member. The limit is
+  rechecked while the member is normalized.
+- `max_total_download_bytes` bounds the total immutable raw-evidence bytes
+  accepted for this study. The total includes every retained ZIP body, official
+  `CHECKSUM` body, raw-response sidecar, `exchangeInfo` metadata body and
+  sidecar, and every retained rejected-response prefix and its rejection
+  sidecar. A failed attempt or retry does not reset this total. A
+  content-addressed file is counted once if it is physically retained once;
+  distinct retained copies are counted separately. Derived normalized files,
+  quality reports, and aggregate manifest/checksum indexes are not raw-response
+  evidence and do not enter this ceiling.
+
+The smaller `CHECKSUM`, metadata, and rejected-prefix responses also have fixed
+per-response bounds in the adapter and remain subject to the hard total above.
+Before accepting another raw artifact, the acquisition layer must reserve and
+account for its bounded body and sidecar; no published raw acquisition manifest
+may exceed the total. Crossing any per-response, expanded, or total limit fails
+closed before a research result is produced. Every accepted and rejected raw
+artifact is immutable, byte-counted, hashed, and enumerated by the raw
+acquisition manifest.
+
+## Prospective materialization and lock boundary
+
+The study executes in the following one-way order:
+
+1. Acquire and authenticate all eight raw ZIPs, all eight official `CHECKSUM`
+   responses, and the exact symbol-metadata responses. Publish the immutable raw
+   acquisition manifest without opening any CSV member.
+2. Open, stream-normalize, and quality-check only the train and validation CSV
+   members. Publish an immutable development normalized manifest that binds
+   every normalized part, sidecar, quality artifact, and its raw source.
+3. Select and refit using only those development rows. Persist one lock per
+   symbol, then an aggregate lock that commits the exact bytes and SHA-256 of
+   both symbol locks. Each symbol lock commits its selected specification,
+   development-frame identity, and deterministic final-fit policy; the aggregate
+   lock also commits the frozen
+   protocol/config, raw acquisition manifest, development normalized manifest,
+   and clean real Git revision. Close and `fsync` every lock and digest file and
+   `fsync` its containing directory. The aggregate lock is not durable until
+   all child locks and their directories are durable.
+4. Immediately before the first decompressed CSV byte of every primary or
+   replication archive is read, re-read and re-hash the exact durable aggregate
+   lock and all identities it commits. Only then may that member be
+   stream-normalized and quality-checked. Both untouched dates use the same
+   locked fit and transformation state; there is no reselection, refit,
+   recalibration, threshold change, feature change, or model update after the
+   lock, including between primary and replication.
+5. On success, publish a final normalized manifest covering all eight declared
+   symbol/dates. Only that final manifest may authorize endpoint evaluation and
+   final-bundle publication.
+
+For this boundary, "opened" means the first decompressed byte of a CSV member,
+not a later Parquet scan. Inspecting ZIP directory metadata is not opening the
+member. Merely writing a lock path is not persistence: exact bytes, hashes,
+file descriptors, and containing directories must meet the durability rule
+above before a held-out member-open callback can succeed.
 
 ## Timing and continuity
 
@@ -137,6 +220,24 @@ The run must publish, by symbol and date:
 No date or instrument may disappear because its result is unfavorable. Any
 aggregate row must be accompanied by its component date rows.
 
+If primary or replication normalization, completeness validation, or data
+quality fails after the aggregate lock is durable, the run stops at the first
+deterministic failure and publishes immutable `INSUFFICIENT_DATA` terminal
+evidence. That evidence binds the same protocol/config, clean Git revision, raw
+acquisition manifest, development normalized manifest, per-symbol locks, and
+aggregate lock; it records the failing symbol/date/role, typed reason, retained
+partial evidence hashes, and which later members remained unopened. It contains
+no endpoint result. Its checksum manifest and terminal marker are written last,
+and publication uses a new atomic target followed by directory durability.
+
+The same run identity may only verify and reuse that terminal evidence. It may
+not overwrite or delete it, reopen candidate selection, substitute an input,
+replace a date, relax quality, or continue with a partial aggregate. A source
+fix has a different clean Git revision and therefore a different run identity;
+it still cannot erase the original failed evidence. A failure before locking is
+also reported as `INSUFFICIENT_DATA`, but it cannot create a test-evaluation
+bundle or claim that held-out data was opened under a lock.
+
 ## Explicit exclusions and promotion boundary
 
 Aggregate trades contain no contemporaneous bid/ask, depth, cancellation,
@@ -155,9 +256,14 @@ and execution artifacts.
 ## Required immutable outputs
 
 The atomic final bundle must contain the frozen protocol and machine spec,
-analysis lock, acquisition and normalized manifests, per-date quality summary,
-research/evaluation frames, predictions, candidate comparison, paired hypothesis
-artifact, feature stability, generated report/memo/table, resolved configuration,
-Git/source-tree provenance, checksum manifest, and `_SUCCESS` written last.
-Corruption, input relocation without matching bytes, a dirty/different source
-identity, or any incomplete date must fail verification and reuse.
+per-symbol and aggregate analysis locks, raw acquisition manifest, development
+and final normalized manifests, exact official `CHECKSUM` responses and
+sidecars, exact exchange metadata responses and sidecars, per-date quality
+summary, research/evaluation frames, predictions, candidate comparison, paired
+hypothesis artifact, feature stability, generated report/memo/table, resolved
+configuration, and a clean real Git revision/source-tree identity. The final
+manifest binds all of those exact bytes and hashes. The checksum manifest and
+`_SUCCESS` are written last only after atomic publication and directory
+durability. Corruption, input relocation without matching bytes, a dirty,
+unborn, synthetic, or different source identity, or any incomplete date must
+fail verification and reuse.

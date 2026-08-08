@@ -103,6 +103,8 @@ def _paired_hypothesis_section(bundle: RunBundle) -> str:
     payload = bundle.hypothesis_evaluation
     if not payload:
         return ""
+    if payload.get("evidence_scope") == "trade_only_complete_predeclared_daily_archives":
+        return _m8_multidate_hypothesis_section(payload)
     values = payload.get("per_symbol")
     if not isinstance(values, list) or not values:
         return (
@@ -196,6 +198,157 @@ def _paired_hypothesis_section(bundle: RunBundle) -> str:
     return "\n".join(lines)
 
 
+def _m8_multidate_hypothesis_section(payload: Mapping[str, Any]) -> str:
+    """Render the frozen M8 component dates and equal-date endpoint verbatim."""
+
+    raw_dates = payload.get("per_date")
+    raw_symbols = payload.get("per_symbol")
+    date_rows = (
+        [row for row in raw_dates if isinstance(row, Mapping)]
+        if isinstance(raw_dates, list)
+        else []
+    )
+    symbol_rows = (
+        [row for row in raw_symbols if isinstance(row, Mapping)]
+        if isinstance(raw_symbols, list)
+        else []
+    )
+    lines = [
+        "## M8 predeclared multi-date endpoint",
+        "",
+        (
+            "`FULL_DATA` here means only that every byte of all eight predeclared "
+            "Binance daily aggregate-trade archives was verified and included. This is a "
+            "trade-only study; it does not mean full market observability, order-book "
+            "evidence, execution evidence, or deployable performance."
+        ),
+        "",
+        "### Untouched-date components",
+        "",
+        (
+            "| Symbol | UTC date | Frozen role | Locked model | Baseline | Selected log loss | "
+            "Prior log loss | Point Δ | Paired 95% interval | N | Blocks | Status |"
+        ),
+        "| --- | --- | --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | --- |",
+    ]
+    for row in sorted(
+        date_rows,
+        key=lambda value: (str(value.get("symbol", "")), str(value.get("study_date", ""))),
+    ):
+        interval = (
+            f"[{_hypothesis_number(row.get('ci_low'))}, {_hypothesis_number(row.get('ci_high'))}]"
+        )
+        date_cells = (
+            row.get("symbol"),
+            row.get("study_date"),
+            row.get("study_role"),
+            row.get("selected_model"),
+            row.get("baseline"),
+            _hypothesis_number(row.get("selected_log_loss")),
+            _hypothesis_number(row.get("prior_log_loss")),
+            _hypothesis_number(row.get("point_delta")),
+            interval,
+            row.get("n_obs"),
+            row.get("n_blocks"),
+            row.get("bootstrap_status"),
+        )
+        lines.append("| " + " | ".join(_display(cell) for cell in date_cells) + " |")
+    if not date_rows:
+        lines.append(
+            "| N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | missing |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "### Equal-date-weighted endpoint",
+            "",
+            (
+                "| Symbol | Locked model | Baseline | Point Δ | Paired 95% interval | "
+                "Dates | N | Blocks | Status | Replication status |"
+            ),
+            "| --- | --- | --- | ---: | --- | ---: | ---: | ---: | --- | --- |",
+        ]
+    )
+    for row in sorted(symbol_rows, key=lambda value: str(value.get("symbol", ""))):
+        interval = (
+            f"[{_hypothesis_number(row.get('ci_low'))}, {_hypothesis_number(row.get('ci_high'))}]"
+        )
+        aggregate_cells = (
+            row.get("symbol"),
+            row.get("selected_model"),
+            row.get("baseline"),
+            _hypothesis_number(row.get("point_delta")),
+            interval,
+            row.get("n_dates"),
+            row.get("n_obs"),
+            row.get("n_blocks"),
+            row.get("status"),
+            row.get("replication_status"),
+        )
+        lines.append("| " + " | ".join(_display(cell) for cell in aggregate_cells) + " |")
+    if not symbol_rows:
+        lines.append("| N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | insufficient_data | N/A |")
+
+    direction_rows = [row for row in symbol_rows if "validation_primary_replication_status" in row]
+    if direction_rows:
+        lines.extend(
+            [
+                "",
+                "### Validation → primary → replication direction consistency",
+                "",
+                (
+                    "| Symbol | Validation date | Validation Δ | Primary date | Primary Δ | "
+                    "Replication date | Replication Δ | Same direction | All favorable | Status |"
+                ),
+                "| --- | --- | ---: | --- | ---: | --- | ---: | --- | --- | --- |",
+            ]
+        )
+        for row in sorted(direction_rows, key=lambda value: str(value.get("symbol", ""))):
+            direction_cells = (
+                row.get("symbol"),
+                row.get("validation_date"),
+                _hypothesis_number(row.get("validation_point_delta")),
+                row.get("primary_date"),
+                _hypothesis_number(row.get("primary_point_delta")),
+                row.get("replication_date"),
+                _hypothesis_number(row.get("replication_point_delta")),
+                row.get("direction_consistent_across_validation_primary_replication"),
+                row.get("favorable_across_validation_primary_replication"),
+                row.get("validation_primary_replication_status"),
+            )
+            lines.append("| " + " | ".join(_display(cell) for cell in direction_cells) + " |")
+
+    caveat = payload.get("caveat")
+    cross = payload.get("cross_instrument_conclusion")
+    cross_text = cross.get("text") if isinstance(cross, Mapping) else None
+    lines.extend(
+        [
+            "",
+            (
+                "Negative Δ log loss favors the locked selected model. The two date rows "
+                "are mandatory components of each equal-date estimate; neither date nor "
+                "instrument is omitted because of its direction."
+            ),
+            (
+                _display(caveat)
+                if isinstance(caveat, str) and caveat.strip()
+                else (
+                    "Intervals are descriptive paired block-bootstrap diagnostics. No "
+                    "p-value, H0 rejection, or significance claim is authorized."
+                )
+            ),
+            (
+                _display(cross_text)
+                if isinstance(cross_text, str) and cross_text.strip()
+                else "No cross-instrument estimate or persistent-alpha conclusion is inferred."
+            ),
+            "No execution, P&L, capacity, or profitability claim is authorized.",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _symbol_coverage_table(bundle: RunBundle) -> str:
     coverage = bundle.data.get("symbol_coverage")
     if not isinstance(coverage, list):
@@ -233,6 +386,39 @@ def _symbol_coverage_table(bundle: RunBundle) -> str:
     return "\n".join(lines)
 
 
+def _date_coverage_table(bundle: RunBundle) -> str:
+    coverage = bundle.data.get("date_coverage")
+    if not isinstance(coverage, list):
+        return ""
+    lines = [
+        "### Per-date observed coverage",
+        "",
+        (
+            "| Symbol | UTC date | Frozen role | Rows | Observed start (UTC) | "
+            "Observed end (UTC, inclusive) | Complete | DQ errors | DQ warnings |"
+        ),
+        "| --- | --- | --- | ---: | --- | --- | --- | ---: | ---: |",
+    ]
+    for item in coverage:
+        if not isinstance(item, Mapping):
+            continue
+        cells = (
+            item.get("symbol"),
+            item.get("date"),
+            item.get("role"),
+            item.get("rows"),
+            item.get("observed_start_utc"),
+            item.get("observed_end_inclusive_utc"),
+            item.get("complete"),
+            item.get("quality_errors"),
+            item.get("quality_warnings"),
+        )
+        lines.append("| " + " | ".join(_display(cell) for cell in cells) + " |")
+    if len(lines) == 3:
+        lines.append("| N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |")
+    return "\n".join(lines)
+
+
 def _execution_not_run(assumptions: Mapping[str, Any]) -> bool:
     return assumptions.get("status") == "NOT_RUN"
 
@@ -259,6 +445,15 @@ def _executive_summary(bundle: RunBundle) -> str:
             "reports serialized held-out diagnostics without extrapolating beyond the stated "
             f"UTC interval. The bundle contains {row_count} comparison row(s)."
         )
+    research = bundle.manifest.get("research")
+    trade_only = isinstance(research, Mapping) and research.get("scope") == "trade_only"
+    if trade_only:
+        return (
+            "This full-data label is narrowly scoped to every byte of the predeclared "
+            "trade archives, not to full market observability. The run is exchange-specific "
+            "and contains no order-book, execution, P&L, capacity, or profitability evidence. "
+            f"The bundle contains {row_count} held-out comparison row(s)."
+        )
     return (
         "This bundle is labeled as a full-data research run. Results remain simulated, "
         "exchange-specific, and conditional on the recorded execution assumptions. "
@@ -273,7 +468,9 @@ def render_technical_report(bundle: RunBundle) -> str:
     hypothesis_text = f"\n\n{hypothesis_section}" if hypothesis_section else ""
     quality = _mapping_table(bundle.quality)
     coverage_table = _symbol_coverage_table(bundle)
-    coverage_text = f"\n\n{coverage_table}\n\n" if coverage_table else " "
+    date_coverage_table = _date_coverage_table(bundle)
+    coverage_sections = [value for value in (coverage_table, date_coverage_table) if value]
+    coverage_text = "\n\n" + "\n\n".join(coverage_sections) + "\n\n" if coverage_sections else " "
     execution_assumptions = bundle.manifest.get("execution_assumptions", {})
     if not isinstance(execution_assumptions, Mapping):
         execution_assumptions = {"serialized_value": execution_assumptions}
@@ -539,6 +736,16 @@ class ReportPaths:
     model_comparison: Path
 
 
+def render_model_comparison_report(bundle: RunBundle) -> str:
+    """Render the comparison table together with its frozen hypothesis evidence."""
+
+    content = render_model_comparison(bundle).rstrip()
+    hypothesis_section = _paired_hypothesis_section(bundle)
+    if hypothesis_section:
+        content += "\n\n" + hypothesis_section
+    return content + "\n"
+
+
 def _atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -566,11 +773,7 @@ def write_report_set(bundle: RunBundle, output_dir: str | Path) -> ReportPaths:
     comparison = output / "model_comparison.md"
     _atomic_write(technical, render_technical_report(bundle))
     _atomic_write(memo, render_executive_memo(bundle))
-    comparison_content = render_model_comparison(bundle).rstrip()
-    hypothesis_section = _paired_hypothesis_section(bundle)
-    if hypothesis_section:
-        comparison_content += "\n\n" + hypothesis_section
-    _atomic_write(comparison, comparison_content)
+    _atomic_write(comparison, render_model_comparison_report(bundle))
     return ReportPaths(
         technical_report=technical,
         executive_memo=memo,

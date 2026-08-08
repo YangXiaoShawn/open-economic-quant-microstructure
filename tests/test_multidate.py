@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import numpy as np
 import polars as pl
 import pytest
 
+import microstructure.research.multidate as multidate
 from microstructure.config import FeatureConfig, ModelConfig
+from microstructure.research.models import ModelCandidate, build_model_candidates
 from microstructure.research.multidate import (
     DATE_BOOTSTRAP_BLOCK_EVENTS,
     DATE_BOOTSTRAP_DRAWS,
     AnalysisLock,
+    FinalFittedState,
     MultiDateEvaluationError,
     build_multidate_walk_forward_plan,
     evaluate_locked_multidate_tests,
@@ -226,6 +230,151 @@ def test_lock_can_be_persisted_and_tampering_is_rejected() -> None:
         evaluate_locked_multidate_tests(development, mislabeled, restored)
     with pytest.raises(MultiDateEvaluationError, match="does not match"):
         AnalysisLock.restore(selected.lock.payload_json + " ", selected.lock.sha256)
+
+
+def test_final_fitted_state_is_development_only_canonical_and_hash_bound() -> None:
+    development, _ = _study_frames()
+    selection = select_multidate_model(
+        development,
+        _model_config(),
+        feature_columns=("signal", "slow_feature"),
+        declared_test_dates=("2024-01-05", "2024-01-06"),
+        seed=17,
+        calibration_bins=5,
+    )
+
+    state = selection.fitted_state
+    restored = FinalFittedState.restore(state.payload_json, state.sha256)
+    payload = restored.payload()
+    primary_start_ns = int(datetime(2024, 1, 5, tzinfo=UTC).timestamp() * 1_000_000_000)
+    assert restored == state
+    assert json.dumps(payload, sort_keys=True, separators=(",", ":")) == state.payload_json
+    assert payload["serialization_format"] == "canonical-json-numeric-v1"
+    assert set(payload["library_versions"]) == {"numpy", "scikit_learn"}
+    assert payload["development_frame_sha256"] == selection.development_frame_sha256
+    assert payload["fit_cutoff_ts_ns"] < primary_start_ns
+    assert selection.lock.payload()["final_fitted_state_sha256"] == state.sha256
+
+    changed = json.loads(state.payload_json)
+    changed["library_versions"]["numpy"] = "tampered"
+    changed_json = json.dumps(changed, sort_keys=True, separators=(",", ":"))
+    with pytest.raises(MultiDateEvaluationError, match="does not match"):
+        FinalFittedState.restore(changed_json, state.sha256)
+
+    changed_lock = json.loads(selection.lock.payload_json)
+    changed_lock["final_fitted_state"]["library_versions"]["numpy"] = "tampered"
+    rewritten = AnalysisLock.create(changed_lock)
+    with pytest.raises(MultiDateEvaluationError, match="hash does not match"):
+        evaluate_locked_multidate_tests(development, _study_frames()[1], rewritten)
+
+
+def test_locked_test_evaluation_invokes_no_fit_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    development, tests = _study_frames()
+    selection = select_multidate_model(
+        development,
+        _model_config(),
+        feature_columns=("signal", "slow_feature"),
+        declared_test_dates=("2024-01-05", "2024-01-06"),
+        seed=17,
+        calibration_bins=5,
+    )
+    restored = AnalysisLock.restore(selection.lock.payload_json, selection.lock.sha256)
+
+    def forbidden_fit(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("test evaluation must not fit or recalibrate")
+
+    monkeypatch.setattr(multidate, "make_classifier", forbidden_fit)
+    monkeypatch.setattr(multidate.SigmoidCalibrator, "fit", forbidden_fit)
+
+    result = evaluate_locked_multidate_tests(development, tests, restored)
+    assert result.predictions.height == 240
+
+
+def test_every_candidate_numeric_state_matches_original_sklearn_predictions() -> None:
+    development, _ = _study_frames()
+    combined = multidate._combine_date_frames(
+        development,
+        allowed_roles=multidate._DEVELOPMENT_ROLES,
+        label="development fixture",
+    )
+    eligible = combined.filter(multidate._eligible() & pl.col("future_trade_up").is_not_null())
+    matrices = multidate._fit_matrices(
+        eligible,
+        eligible.head(37),
+        features=("signal", "slow_feature"),
+        target="future_trade_up",
+        calibration_fraction=0.2,
+    )
+    candidates = build_model_candidates(_model_config())
+    assert {candidate.family for candidate in candidates} == {
+        "baseline",
+        "logistic",
+        "logistic_l2",
+        "shallow_tree",
+    }
+    for candidate in candidates:
+        outcome = multidate._fit_candidate(
+            candidate,
+            matrices,
+            seed=31,
+            state_role="selected",
+        )
+        assert outcome.fitted_state is not None
+        raw, calibrated = multidate._predict_serialized_model(
+            outcome.fitted_state,
+            matrices.x_evaluate,
+        )
+        assert raw == pytest.approx(outcome.raw_probability, abs=1e-12)
+        assert calibrated == pytest.approx(outcome.probability, abs=1e-12)
+
+
+def test_single_class_fallback_state_preserves_one_class_prior() -> None:
+    development, _ = _study_frames()
+    development = [
+        frame.with_columns(
+            pl.when(pl.col("right_censored"))
+            .then(None)
+            .otherwise(1)
+            .cast(pl.Int8)
+            .alias("future_trade_up")
+        )
+        for frame in development
+    ]
+    combined = multidate._combine_date_frames(
+        development,
+        allowed_roles=multidate._DEVELOPMENT_ROLES,
+        label="single-class development fixture",
+    )
+    eligible = combined.filter(multidate._eligible() & pl.col("future_trade_up").is_not_null())
+    matrices = multidate._fit_matrices(
+        eligible,
+        eligible.head(11),
+        features=("signal", "slow_feature"),
+        target="future_trade_up",
+        calibration_fraction=0.2,
+    )
+    outcome = multidate._fit_candidate(
+        ModelCandidate("logistic_l2_fixture", "logistic_l2", c=1.0),
+        matrices,
+        seed=9,
+        state_role="selected",
+    )
+    assert outcome.fitted_state is not None
+    classifier = outcome.fitted_state["classifier"]
+    assert classifier == {
+        "kind": "prior",
+        "classes": [1],
+        "class_probabilities": [1.0],
+    }
+    raw, calibrated = multidate._predict_serialized_model(
+        outcome.fitted_state,
+        matrices.x_evaluate,
+    )
+    assert raw == pytest.approx(np.ones(matrices.x_evaluate.shape[0]))
+    assert calibrated == pytest.approx(np.full(matrices.x_evaluate.shape[0], 1.0 - 1e-12))
 
 
 @pytest.mark.parametrize("kind", ["label", "continuity"])

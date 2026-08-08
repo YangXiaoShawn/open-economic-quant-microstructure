@@ -22,8 +22,10 @@ from microstructure.data.binance import (
     RawDepthFrame,
     RawPage,
     RetryPolicy,
+    _write_raw_response,
     parse_depth_message,
 )
+from microstructure.data.evidence_budget import EvidenceBudgetExceeded, RetainedEvidenceBudget
 
 
 class _FakeWebSocket:
@@ -148,6 +150,25 @@ class InterruptedChunkedResponse(ChunkedResponse):
         raise requests.ConnectionError("fixture stream interrupted")
 
 
+def _write_budget_fixture_raw(
+    root: Path,
+    *,
+    budget: RetainedEvidenceBudget | None = None,
+) -> RawPage:
+    return _write_raw_response(
+        b'{"fixture":true}',
+        raw_root=root,
+        dataset="budget_fixture",
+        symbol="BTCUSDT",
+        request_uri="https://data-api.binance.vision/fixture",
+        downloaded_at_utc="2026-08-07T00:00:00.000000000Z",
+        requested_start_ns=1,
+        requested_end_ns=2,
+        response_headers={"content-type": "application/json"},
+        retained_evidence_budget=budget,
+    )
+
+
 def _client(session: FakeSession, *, sleeps: list[float] | None = None) -> BinancePublicClient:
     recorded_sleeps = sleeps if sleeps is not None else []
     return BinancePublicClient(
@@ -237,6 +258,101 @@ def test_interrupted_stream_retries_after_preserving_failed_attempt(tmp_path: Pa
     rejected = _raw_trade_payloads(tmp_path, dataset="agg_trades_rejected")
     assert len(rejected) == 1
     assert rejected[0].read_bytes() == prefix
+
+
+def test_retained_budget_charges_retry_prefix_and_success_sidecars(tmp_path: Path) -> None:
+    prefix = b'[{"a":1'
+    successful = json.dumps([_trade(1)], separators=(",", ":")).encode()
+    interrupted = InterruptedChunkedResponse([prefix])
+    completed = ChunkedResponse([successful])
+    session = StreamingSession([interrupted, completed])
+    budget = RetainedEvidenceBudget(tmp_path, limit_bytes=100_000)
+    downloader = BinanceHistoricalTradeDownloader(
+        client=BinancePublicClient(
+            session=session,  # type: ignore[arg-type]
+            retry_policy=RetryPolicy(max_retries=1, base_delay_seconds=0.0),
+            sleep=lambda _: None,
+            random_value=lambda: 0.0,
+            retained_evidence_budget=budget,
+        ),
+        raw_root=tmp_path,
+        tick_size=Decimal("0.01"),
+        lot_size=Decimal("0.001"),
+    )
+
+    batch = next(
+        downloader.stream(
+            symbol="BTCUSDT",
+            start_ts_ns=1_000_000_000,
+            end_ts_ns=2_000_000_000,
+            max_events=1,
+        )
+    )
+
+    retained_files = [path for path in tmp_path.rglob("*") if path.is_file()]
+    assert batch.num_rows == 1
+    assert any(path.read_bytes() == prefix for path in retained_files)
+    assert any(path.read_bytes() == successful for path in retained_files)
+    assert len([path for path in retained_files if ".manifest-" in path.name]) == 2
+    assert budget.used_bytes == sum(path.stat().st_size for path in retained_files)
+    assert budget.reserved_bytes == 0
+
+
+def test_raw_body_and_sidecar_honor_exact_combined_budget_and_deduplicate(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference"
+    reference_page = _write_budget_fixture_raw(reference)
+    exact_bytes = reference_page.path.stat().st_size + reference_page.manifest_path.stat().st_size
+
+    root = tmp_path / "bounded"
+    budget = RetainedEvidenceBudget(root, limit_bytes=exact_bytes)
+    first = _write_budget_fixture_raw(root, budget=budget)
+    assert budget.used_bytes == exact_bytes
+    assert budget.remaining_bytes == 0
+
+    duplicate = _write_budget_fixture_raw(root, budget=budget)
+    assert duplicate.path == first.path
+    assert duplicate.manifest_path == first.manifest_path
+    assert budget.used_bytes == exact_bytes
+    assert budget.reserved_bytes == 0
+
+
+def test_raw_sidecar_overage_rolls_back_new_body_and_reservation(tmp_path: Path) -> None:
+    reference = tmp_path / "reference"
+    reference_page = _write_budget_fixture_raw(reference)
+    exact_bytes = reference_page.path.stat().st_size + reference_page.manifest_path.stat().st_size
+
+    root = tmp_path / "bounded"
+    budget = RetainedEvidenceBudget(root, limit_bytes=exact_bytes - 1)
+
+    with pytest.raises(EvidenceBudgetExceeded, match="raw source manifest"):
+        _write_budget_fixture_raw(root, budget=budget)
+
+    assert [path for path in root.rglob("*") if path.is_file()] == []
+    assert budget.used_bytes == 0
+    assert budget.reserved_bytes == 0
+    assert budget.remaining_bytes == exact_bytes - 1
+
+
+def test_raw_temp_creation_failure_releases_body_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    budget = RetainedEvidenceBudget(tmp_path, limit_bytes=10_000)
+
+    def fail_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        raise OSError("fixture temp failure")
+
+    monkeypatch.setattr("microstructure.data.binance.tempfile.mkstemp", fail_mkstemp)
+
+    with pytest.raises(OSError, match="fixture temp failure"):
+        _write_budget_fixture_raw(tmp_path, budget=budget)
+
+    assert [path for path in tmp_path.rglob("*") if path.is_file()] == []
+    assert budget.used_bytes == 0
+    assert budget.reserved_bytes == 0
+    assert budget.remaining_bytes == 10_000
 
 
 def test_exchange_info_response_is_transport_bounded_and_preserved(tmp_path: Path) -> None:

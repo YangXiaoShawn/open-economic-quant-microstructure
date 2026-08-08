@@ -36,7 +36,7 @@ FULL_DATA_WATERMARK = "FULL-DATA RESEARCH RUN — SIMULATED RESULTS ARE NOT LIVE
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _GIT_REVISION = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _CHECKSUM_LINE = re.compile(r"^([0-9a-f]{64})  ([^\n]+)$")
-_CHECKSUM_EXCLUSIONS = frozenset({"checksums.sha256", "_SUCCESS"})
+_CHECKSUM_EXCLUSIONS = frozenset({"checksums.sha256", "_SUCCESS", "INSUFFICIENT_DATA"})
 
 
 class RunBundleError(ValueError):
@@ -329,7 +329,14 @@ def _atomic_write_text(path: Path, content: str) -> None:
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary_name, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     except BaseException:
         Path(temporary_name).unlink(missing_ok=True)
         raise
@@ -344,6 +351,8 @@ def write_checksum_manifest(run_dir: str | Path) -> Path:
     root = Path(run_dir).resolve()
     if not root.is_dir():
         raise IncompleteRunError(f"run directory does not exist: {root}")
+    if (root / "_SUCCESS").exists() and (root / "INSUFFICIENT_DATA").exists():
+        raise IncompleteRunError("run has conflicting completion and insufficient-data markers")
     if (root / "_SUCCESS").exists():
         raise RunBundleValidationError(
             "cannot rewrite checksums for a completed run; create a new run bundle"
@@ -408,6 +417,8 @@ def load_run_bundle(
     root = Path(run_dir).resolve()
     if not root.is_dir():
         raise IncompleteRunError(f"run directory does not exist: {root}")
+    if (root / "_SUCCESS").exists() and (root / "INSUFFICIENT_DATA").exists():
+        raise IncompleteRunError("run has conflicting completion and insufficient-data markers")
     if require_complete and not (root / "_SUCCESS").is_file():
         raise IncompleteRunError("missing _SUCCESS completion marker")
     if require_complete and verify_integrity:

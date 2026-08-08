@@ -130,7 +130,14 @@ def write_json(path: str | Path, payload: Mapping[str, Any] | list[Any]) -> None
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             json.dump(payload, stream, indent=2, sort_keys=True, allow_nan=False)
             stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary_name, destination)
+        directory_descriptor = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     except BaseException:
         Path(temporary_name).unlink(missing_ok=True)
         raise

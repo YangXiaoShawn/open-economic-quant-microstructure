@@ -10,6 +10,7 @@ import random
 import tempfile
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -22,6 +23,7 @@ import websockets
 from websockets.exceptions import WebSocketException
 
 from microstructure.data.book import BookSnapshot, DepthDelta
+from microstructure.data.evidence_budget import RetainedEvidenceBudget
 from microstructure.data.schemas import SCHEMA_VERSION, get_schema, table_from_records
 from microstructure.data.storage import write_source_manifest
 from microstructure.provenance import sha256_file
@@ -37,9 +39,32 @@ class BinanceError(RuntimeError):
 class BinanceHTTPError(BinanceError):
     """Raised when a public market-data GET cannot be completed safely."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_exhausted: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_exhausted = retry_exhausted
+
 
 class BinancePayloadError(BinanceError):
     """Raised when Binance returns malformed or scale-incompatible data."""
+
+    def __init__(self, message: str, *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
+
+
+class BinanceMetadataContractError(BinancePayloadError):
+    """A bounded exchangeInfo response violates the declared metadata contract."""
+
+
+class BinanceResponseSizeLimitError(BinancePayloadError):
+    """A public response violates its frozen body-size contract."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +212,14 @@ def _close_response(response: object) -> None:
         cast(Callable[[], object], close)()
 
 
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 class BinancePublicClient:
     """Retrying client for market-data-only GET endpoints."""
 
@@ -200,6 +233,7 @@ class BinancePublicClient:
         sleep: Callable[[float], None] = time.sleep,
         random_value: Callable[[], float] = random.random,
         max_response_bytes: int = 8 * 1024 * 1024,
+        retained_evidence_budget: RetainedEvidenceBudget | None = None,
     ) -> None:
         if max_response_bytes < 1:
             raise ValueError("max_response_bytes must be positive")
@@ -210,6 +244,7 @@ class BinancePublicClient:
         self._sleep = sleep
         self._random_value = random_value
         self.max_response_bytes = max_response_bytes
+        self.retained_evidence_budget = retained_evidence_budget
 
     def _session_get(
         self,
@@ -265,7 +300,8 @@ class BinancePublicClient:
                     else response.text[:200]
                 )
                 last_error = BinanceHTTPError(
-                    f"GET {response.url} returned HTTP {response.status_code}: {response_detail}"
+                    f"GET {response.url} returned HTTP {response.status_code}: {response_detail}",
+                    status_code=response.status_code,
                 )
                 if not retryable:
                     _close_response(response)
@@ -293,8 +329,11 @@ class BinancePublicClient:
             if response is not None:
                 _close_response(response)
             self._sleep(delay)
+        status_code = last_error.status_code if isinstance(last_error, BinanceHTTPError) else None
         raise BinanceHTTPError(
-            f"public Binance GET failed after {self.retry_policy.max_retries + 1} attempts"
+            f"public Binance GET failed after {self.retry_policy.max_retries + 1} attempts",
+            status_code=status_code,
+            retry_exhausted=True,
         ) from last_error
 
     def _bounded_request_body(
@@ -345,9 +384,12 @@ class BinancePublicClient:
                 requested_start_ns=requested_start_ns,
                 requested_end_ns=requested_end_ns,
                 response_headers=rejected_headers,
+                retained_evidence_budget=self.retained_evidence_budget,
             )
             if not bounded_body.retryable or attempt >= self.retry_policy.max_retries:
-                raise BinancePayloadError(bounded_body.error_message)
+                if bounded_body.retryable:
+                    raise BinancePayloadError(bounded_body.error_message, transient=True)
+                raise BinanceResponseSizeLimitError(bounded_body.error_message)
             exponential_cap = min(
                 self.retry_policy.max_delay_seconds,
                 self.retry_policy.base_delay_seconds * (2**attempt),
@@ -377,12 +419,13 @@ class BinancePublicClient:
             requested_start_ns=None,
             requested_end_ns=None,
             response_headers=response_headers,
+            retained_evidence_budget=self.retained_evidence_budget,
         )
         try:
             payload = cast(dict[str, Any], json.loads(content))
             symbols = cast(list[dict[str, Any]], payload["symbols"])
             if len(symbols) != 1 or str(symbols[0]["symbol"]).upper() != symbol:
-                raise BinancePayloadError(
+                raise BinanceMetadataContractError(
                     "exchangeInfo did not return exactly the requested symbol"
                 )
             item = symbols[0]
@@ -395,7 +438,9 @@ class BinancePublicClient:
             tick_size = Decimal(str(price_filter["tickSize"]))
             lot_size = Decimal(str(lot_filter["stepSize"]))
             if tick_size <= 0 or lot_size <= 0:
-                raise BinancePayloadError("exchangeInfo returned a nonpositive tick or lot size")
+                raise BinanceMetadataContractError(
+                    "exchangeInfo returned a nonpositive tick or lot size"
+                )
             return SymbolMetadata(
                 venue="binance_spot",
                 symbol=symbol,
@@ -413,10 +458,14 @@ class BinancePublicClient:
                 source_path=raw_page.path,
                 source_manifest_path=raw_page.manifest_path,
             )
-        except BinancePayloadError:
+        except (BinanceMetadataContractError, BinanceResponseSizeLimitError):
             raise
+        except BinancePayloadError as exc:
+            if exc.transient:
+                raise
+            raise BinanceMetadataContractError(str(exc)) from exc
         except (InvalidOperation, KeyError, TypeError, ValueError) as exc:
-            raise BinancePayloadError("malformed Binance exchangeInfo response") from exc
+            raise BinanceMetadataContractError("malformed Binance exchangeInfo response") from exc
 
     def fetch_depth_snapshot(
         self,
@@ -458,6 +507,7 @@ class BinancePublicClient:
             requested_start_ns=None,
             requested_end_ns=None,
             response_headers=response_headers,
+            retained_evidence_budget=self.retained_evidence_budget,
         )
         try:
             payload = cast(dict[str, Any], json.loads(content))
@@ -891,6 +941,7 @@ class BinanceTradeBatchStream(Iterator[pa.RecordBatch]):
                 requested_start_ns=self._start_ts_ns,
                 requested_end_ns=self._end_ts_ns,
                 response_headers=response_headers,
+                retained_evidence_budget=self._client.retained_evidence_budget,
             )
             parsed = _parse_aggregate_trade_page(content, request_limit=self._request_limit)
             raw_page = RawPage(
@@ -1064,41 +1115,80 @@ def _write_raw_response(
     requested_start_ns: int | None,
     requested_end_ns: int | None,
     response_headers: Mapping[str, str],
+    retained_evidence_budget: RetainedEvidenceBudget | None = None,
 ) -> RawPage:
     checksum = hashlib.sha256(content).hexdigest()
     directory = raw_root / "binance_spot" / dataset / symbol.upper()
-    directory.mkdir(parents=True, exist_ok=True)
     destination = directory / f"{checksum}.json"
-    if destination.exists():
-        if sha256_file(destination) != checksum:
-            raise BinancePayloadError(f"raw content-address collision at {destination}")
-    else:
-        handle, temporary_name = tempfile.mkstemp(dir=directory, prefix=".raw-", suffix=".tmp")
+    if retained_evidence_budget is not None:
+        retained_evidence_budget.assert_contains(destination)
+    transaction = (
+        retained_evidence_budget.write_transaction()
+        if retained_evidence_budget is not None
+        else nullcontext()
+    )
+    with transaction:
+        directory.mkdir(parents=True, exist_ok=True)
+        body_reservation = None
+        created_body = False
+        if destination.exists():
+            if sha256_file(destination) != checksum:
+                raise BinancePayloadError(f"raw content-address collision at {destination}")
+        else:
+            if retained_evidence_budget is not None:
+                body_reservation = retained_evidence_budget.reserve(
+                    len(content),
+                    label=f"raw Binance response {destination.name}",
+                )
+            try:
+                handle, temporary_name = tempfile.mkstemp(
+                    dir=directory,
+                    prefix=".raw-",
+                    suffix=".tmp",
+                )
+            except BaseException:
+                if body_reservation is not None and body_reservation.active:
+                    body_reservation.release()
+                raise
+            try:
+                with os.fdopen(handle, "wb") as stream:
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary_name, destination)
+                _fsync_directory(directory)
+                created_body = True
+            except BaseException:
+                Path(temporary_name).unlink(missing_ok=True)
+                if body_reservation is not None and body_reservation.active:
+                    body_reservation.release()
+                raise
         try:
-            with os.fdopen(handle, "wb") as stream:
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary_name, destination)
+            manifest_path, _ = write_source_manifest(
+                destination,
+                source="binance_spot_public_api",
+                source_uri=request_uri,
+                downloaded_at_utc=downloaded_at_utc,
+                requested_start_ns=requested_start_ns,
+                requested_end_ns=requested_end_ns,
+                response_headers=response_headers,
+                retained_evidence_budget=retained_evidence_budget,
+            )
+            if body_reservation is not None:
+                body_reservation.commit()
         except BaseException:
-            Path(temporary_name).unlink(missing_ok=True)
+            if created_body:
+                destination.unlink(missing_ok=True)
+            if body_reservation is not None and body_reservation.active:
+                body_reservation.release()
             raise
-    manifest_path, _ = write_source_manifest(
-        destination,
-        source="binance_spot_public_api",
-        source_uri=request_uri,
-        downloaded_at_utc=downloaded_at_utc,
-        requested_start_ns=requested_start_ns,
-        requested_end_ns=requested_end_ns,
-        response_headers=response_headers,
-    )
-    return RawPage(
-        path=destination,
-        manifest_path=manifest_path,
-        sha256=checksum,
-        request_uri=request_uri,
-        row_count=0,
-    )
+        return RawPage(
+            path=destination,
+            manifest_path=manifest_path,
+            sha256=checksum,
+            request_uri=request_uri,
+            row_count=0,
+        )
 
 
 def parse_depth_message(

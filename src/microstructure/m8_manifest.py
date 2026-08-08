@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import struct
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -31,7 +32,7 @@ from microstructure.data.schemas import SCHEMA_VERSION, get_schema
 from microstructure.m8_config import M8PeriodRole, M8StudyConfig
 from microstructure.provenance import sha256_file
 
-M8_INPUT_MANIFEST_VERSION = "1.1.0"
+M8_INPUT_MANIFEST_VERSION = "1.2.0"
 _STORAGE_MANIFEST_VERSION = "1.0.0"
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _UTC_TIMESTAMP = re.compile(
@@ -40,8 +41,18 @@ _UTC_TIMESTAMP = re.compile(
 )
 _MAX_JSON_BYTES = 8 * 1024 * 1024
 _MAX_SYMBOL_METADATA_BYTES = 1 * 1024 * 1024
+_MAX_ARCHIVE_CHECKSUM_BYTES = 4_096
+_MAX_ZIP_DIRECTORY_BYTES = 256 * 1_024
+_MAX_ZIP_TAIL_BYTES = 22 + 65_535
 _NS_PER_DAY = 86_400 * 1_000_000_000
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_ZIP_CENTRAL_SIGNATURE = b"PK\x01\x02"
+_ZIP_CENTRAL_STRUCT = struct.Struct("<4s6H3L5H2L")
+_ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
+_ZIP_EOCD_STRUCT = struct.Struct("<4s4H2LH")
+_ZIP64_EXTRA_FIELD_ID = 0x0001
+_ZIP16_SENTINEL = 0xFFFF
+_ZIP32_SENTINEL = 0xFFFFFFFF
 
 _TOP_KEYS = frozenset(
     {
@@ -68,6 +79,17 @@ _SYMBOL_METADATA_KEYS = frozenset(
         "raw_path",
         "raw_sha256",
         "raw_bytes",
+        "source_uri",
+        "source_manifest_path",
+        "source_manifest_sha256",
+        "source_manifest_bytes",
+    }
+)
+_ARCHIVE_CHECKSUM_KEYS = frozenset(
+    {
+        "path",
+        "sha256",
+        "bytes",
         "source_uri",
         "source_manifest_path",
         "source_manifest_sha256",
@@ -105,6 +127,7 @@ _RAW_KEYS = frozenset(
         "source_manifest_path",
         "source_manifest_sha256",
         "source_manifest_bytes",
+        "checksum",
     }
 )
 _NORMALIZED_KEYS = frozenset(
@@ -261,6 +284,13 @@ class M8ArchiveEntry:
     raw_source_manifest_path: Path
     raw_source_manifest_sha256: str
     raw_source_manifest_bytes: int
+    raw_checksum_path: Path
+    raw_checksum_sha256: str
+    raw_checksum_bytes: int
+    raw_checksum_source_uri: str
+    raw_checksum_source_manifest_path: Path
+    raw_checksum_source_manifest_sha256: str
+    raw_checksum_source_manifest_bytes: int
     normalized_dataset_manifest_path: Path
     normalized_dataset_manifest_sha256: str
     normalized_dataset_manifest_bytes: int
@@ -637,6 +667,23 @@ def _entry_payload(root: Path, entry: M8ArchiveEntry) -> dict[str, object]:
             ),
             "source_manifest_sha256": entry.raw_source_manifest_sha256,
             "source_manifest_bytes": entry.raw_source_manifest_bytes,
+            "checksum": {
+                "path": _relative_file(
+                    root,
+                    entry.raw_checksum_path,
+                    "official archive CHECKSUM",
+                ),
+                "sha256": entry.raw_checksum_sha256,
+                "bytes": entry.raw_checksum_bytes,
+                "source_uri": entry.raw_checksum_source_uri,
+                "source_manifest_path": _relative_file(
+                    root,
+                    entry.raw_checksum_source_manifest_path,
+                    "official archive CHECKSUM source sidecar",
+                ),
+                "source_manifest_sha256": entry.raw_checksum_source_manifest_sha256,
+                "source_manifest_bytes": entry.raw_checksum_source_manifest_bytes,
+            },
         },
         "normalized": {
             "dataset_manifest_path": _relative_file(
@@ -698,8 +745,8 @@ def _manifest_payload(
 
 
 def _verify_exchange_info_uri(source_uri: str, symbol: str, label: str) -> None:
-    parsed = urlparse(source_uri)
     try:
+        parsed = urlparse(source_uri)
         port = parsed.port
     except ValueError as exc:
         raise M8ManifestError(f"{label} has an invalid network location") from exc
@@ -714,6 +761,7 @@ def _verify_exchange_info_uri(source_uri: str, symbol: str, label: str) -> None:
         raise M8ManifestError(f"{label} has an invalid query") from exc
     if (
         parsed.scheme != "https"
+        or parsed.netloc != "data-api.binance.vision"
         or parsed.hostname != "data-api.binance.vision"
         or port is not None
         or parsed.username is not None
@@ -722,6 +770,7 @@ def _verify_exchange_info_uri(source_uri: str, symbol: str, label: str) -> None:
         or parsed.params
         or parsed.fragment
         or query != [("symbol", symbol)]
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in source_uri)
     ):
         raise M8ManifestError(
             f"{label} is not the exact official exchangeInfo request for {symbol}"
@@ -887,6 +936,145 @@ def _verify_symbol_metadata(
     )
 
 
+def _verify_official_daily_uri(
+    source_uri: str,
+    *,
+    symbol: str,
+    expected_name: str,
+    label: str,
+) -> None:
+    try:
+        parsed_uri = urlparse(source_uri)
+        port = parsed_uri.port
+    except ValueError as exc:
+        raise M8ManifestError(f"{label} has an invalid network location") from exc
+    expected_uri_path = f"/data/spot/daily/aggTrades/{symbol}/{expected_name}"
+    expected_uri = f"https://data.binance.vision{expected_uri_path}"
+    if (
+        source_uri != expected_uri
+        or parsed_uri.scheme != "https"
+        or parsed_uri.netloc != "data.binance.vision"
+        or parsed_uri.hostname != "data.binance.vision"
+        or port is not None
+        or parsed_uri.username is not None
+        or parsed_uri.password is not None
+        or parsed_uri.path != expected_uri_path
+        or parsed_uri.params
+        or parsed_uri.query
+        or parsed_uri.fragment
+    ):
+        raise M8ManifestError(f"{label} is not the exact official daily archive URI")
+
+
+def _verify_official_checksum(
+    *,
+    entry_label: str,
+    root: Path,
+    value: object,
+    symbol: str,
+    day: Date,
+    day_range: tuple[int, int],
+    zip_path: Path,
+    zip_sha256: str,
+    archive_source_uri: str,
+    archive_sidecar_path: Path,
+) -> tuple[Path, str, int, str, Path, str, int]:
+    label = f"{entry_label} official CHECKSUM"
+    checksum = _object(value, label)
+    _exact_keys(checksum, _ARCHIVE_CHECKSUM_KEYS, label)
+    archive_name = f"{symbol}-aggTrades-{day.isoformat()}.zip"
+    checksum_name = f"{archive_name}.CHECKSUM"
+
+    checksum_path = _declared_file(root, checksum["path"], f"{label} raw body")
+    if checksum_path.name != checksum_name:
+        raise M8ManifestError(f"{label} filename does not match the official archive basename")
+    checksum_sha = _digest(checksum["sha256"], f"{label} raw SHA")
+    checksum_bytes = _integer(checksum["bytes"], f"{label} raw bytes", minimum=1)
+    if checksum_bytes > _MAX_ARCHIVE_CHECKSUM_BYTES:
+        raise M8ManifestError(
+            f"{label} exceeds the {_MAX_ARCHIVE_CHECKSUM_BYTES}-byte checksum limit"
+        )
+    _verify_file(checksum_path, checksum_sha, checksum_bytes, f"{label} raw body")
+    try:
+        checksum_body = checksum_path.read_bytes()
+    except OSError as exc:
+        raise M8ManifestError(f"cannot read {label} raw body: {exc}") from exc
+    expected_line = f"{zip_sha256}  {archive_name}".encode("ascii")
+    if checksum_body not in {
+        expected_line,
+        expected_line + b"\n",
+        expected_line + b"\r\n",
+    }:
+        raise M8ManifestError(f"{label} body must be exactly one ZIP SHA-256/basename line")
+
+    source_uri = _text(checksum["source_uri"], f"{label}.source_uri")
+    if source_uri != f"{archive_source_uri}.CHECKSUM":
+        raise M8ManifestError(f"{label} URI is not bound to its ZIP URI")
+    _verify_official_daily_uri(
+        source_uri,
+        symbol=symbol,
+        expected_name=checksum_name,
+        label=f"{label}.source_uri",
+    )
+    sidecar_path = _declared_file(
+        root,
+        checksum["source_manifest_path"],
+        f"{label} source sidecar",
+    )
+    sidecar_sha = _digest(checksum["source_manifest_sha256"], f"{label} source sidecar SHA")
+    sidecar_bytes = _integer(
+        checksum["source_manifest_bytes"],
+        f"{label} source sidecar bytes",
+        minimum=1,
+    )
+    _verify_file(sidecar_path, sidecar_sha, sidecar_bytes, f"{label} source sidecar")
+    if checksum_path in {zip_path, archive_sidecar_path, sidecar_path} or sidecar_path in {
+        zip_path,
+        archive_sidecar_path,
+    }:
+        raise M8ManifestError(f"{label} evidence paths must be distinct")
+
+    sidecar = _read_json_object(sidecar_path, f"{label} source sidecar")
+    _exact_keys(sidecar, _RAW_SIDECAR_KEYS, f"{label} source sidecar")
+    expected_claims: dict[str, object] = {
+        "manifest_version": _STORAGE_MANIFEST_VERSION,
+        "artifact_kind": "raw_source",
+        "source": "binance_spot_daily_aggtrades_archive_checksum",
+        "source_uri": source_uri,
+        "bytes": checksum_bytes,
+        "path": checksum_name,
+    }
+    for key, expected in expected_claims.items():
+        if sidecar[key] != expected:
+            raise M8ManifestError(f"{label} source sidecar {key} claim does not match")
+    if _range(sidecar["requested_range_ns"], f"{label} requested range") != day_range:
+        raise M8ManifestError(f"{label} source sidecar does not claim the full UTC day")
+    sidecar_checksum = _object(sidecar["checksum"], f"{label} source sidecar checksum")
+    _exact_keys(sidecar_checksum, _CHECKSUM_KEYS, f"{label} source sidecar checksum")
+    if (
+        sidecar_checksum["algorithm"] != "sha256"
+        or _digest(sidecar_checksum["value"], f"{label} source sidecar checksum value")
+        != checksum_sha
+    ):
+        raise M8ManifestError(f"{label} source sidecar checksum claim does not match")
+    if sidecar["upstream_checksum_sha256"] is not None:
+        raise M8ManifestError(f"{label} source sidecar must not claim an upstream checksum")
+    if _utc_ns_from_iso(sidecar["downloaded_at_utc"], f"{label} download timestamp") < 1:
+        raise M8ManifestError(f"{label} download timestamp must be after the Unix epoch")
+    response_headers = _object(sidecar["response_headers"], f"{label} response headers")
+    if not all(type(header_value) is str for header_value in response_headers.values()):
+        raise M8ManifestError(f"{label} response headers must be strings")
+    return (
+        checksum_path,
+        checksum_sha,
+        checksum_bytes,
+        source_uri,
+        sidecar_path,
+        sidecar_sha,
+        sidecar_bytes,
+    )
+
+
 def _verify_raw_source_sidecar(
     *,
     config: M8StudyConfig,
@@ -903,16 +1091,12 @@ def _verify_raw_source_sidecar(
     expected_name = f"{symbol}-aggTrades-{day.isoformat()}.zip"
     if zip_path.name != expected_name:
         raise M8ManifestError(f"{entry_label} raw ZIP filename is not the frozen daily archive")
-    parsed_uri = urlparse(source_uri)
-    expected_uri_path = f"/data/spot/daily/aggTrades/{symbol}/{expected_name}"
-    if (
-        parsed_uri.scheme != "https"
-        or parsed_uri.netloc != "data.binance.vision"
-        or parsed_uri.path != expected_uri_path
-        or parsed_uri.query
-        or parsed_uri.fragment
-    ):
-        raise M8ManifestError(f"{entry_label} source URI is not the official full-day archive")
+    _verify_official_daily_uri(
+        source_uri,
+        symbol=symbol,
+        expected_name=expected_name,
+        label=f"{entry_label} source URI",
+    )
 
     sidecar = _read_json_object(sidecar_path, f"{entry_label} raw source sidecar")
     _exact_keys(sidecar, _RAW_SIDECAR_KEYS, f"{entry_label} raw source sidecar")
@@ -925,6 +1109,7 @@ def _verify_raw_source_sidecar(
     if _range(sidecar["requested_range_ns"], f"{entry_label} raw requested range") != day_range:
         raise M8ManifestError(f"{entry_label} raw source sidecar is not a complete UTC day")
     checksum = _object(sidecar["checksum"], f"{entry_label} raw checksum")
+    _exact_keys(checksum, _CHECKSUM_KEYS, f"{entry_label} raw checksum")
     if (
         checksum.get("algorithm") != "sha256"
         or _digest(checksum.get("value"), f"{entry_label} raw checksum value") != zip_sha256
@@ -943,8 +1128,11 @@ def _verify_raw_source_sidecar(
     sidecar_filename = _text(sidecar["path"], f"{entry_label} raw sidecar path")
     if Path(sidecar_filename).name != sidecar_filename or sidecar_filename != expected_name:
         raise M8ManifestError(f"{entry_label} raw source sidecar path does not match")
-    _text(sidecar["downloaded_at_utc"], f"{entry_label} download timestamp")
-    _object(sidecar["response_headers"], f"{entry_label} response headers")
+    if _utc_ns_from_iso(sidecar["downloaded_at_utc"], f"{entry_label} download timestamp") < 1:
+        raise M8ManifestError(f"{entry_label} download timestamp must be after the Unix epoch")
+    response_headers = _object(sidecar["response_headers"], f"{entry_label} response headers")
+    if not all(type(header_value) is str for header_value in response_headers.values()):
+        raise M8ManifestError(f"{entry_label} response headers must be strings")
 
 
 def _verify_zip_archive(
@@ -958,6 +1146,13 @@ def _verify_zip_archive(
 ) -> None:
     expected_member = f"{symbol}-aggTrades-{day.isoformat()}.csv"
     try:
+        _preflight_zip_central_directory(
+            zip_path,
+            entry_label=entry_label,
+            expected_member=expected_member,
+            expected_uncompressed_bytes=uncompressed_bytes,
+            max_uncompressed_bytes=config.study.max_archive_uncompressed_bytes,
+        )
         with ZipFile(zip_path) as archive:
             members = archive.infolist()
             if len(members) != 1:
@@ -986,6 +1181,177 @@ def _verify_zip_archive(
     except (BadZipFile, OSError, ValueError) as exc:
         raise M8ManifestError(
             f"{entry_label} raw archive is not a valid bounded ZIP: {exc}"
+        ) from exc
+
+
+def _zip_extra_field_ids(extra: bytes, *, entry_label: str) -> tuple[int, ...]:
+    """Parse bounded central-directory extra fields without opening a ZIP member."""
+
+    field_ids: list[int] = []
+    offset = 0
+    while offset < len(extra):
+        if len(extra) - offset < 4:
+            raise M8ManifestError(
+                f"{entry_label} archive central-directory extra field is truncated"
+            )
+        field_id, field_bytes = struct.unpack_from("<HH", extra, offset)
+        offset += 4
+        if field_bytes > len(extra) - offset:
+            raise M8ManifestError(
+                f"{entry_label} archive central-directory extra field exceeds its bounds"
+            )
+        field_ids.append(field_id)
+        offset += field_bytes
+    return tuple(field_ids)
+
+
+def _preflight_zip_central_directory(
+    path: Path,
+    *,
+    entry_label: str,
+    expected_member: str,
+    expected_uncompressed_bytes: int,
+    max_uncompressed_bytes: int,
+) -> None:
+    """Bound and authenticate the one-entry ZIP directory before ``ZipFile`` parses it.
+
+    Only the EOCD record and the declared central-directory bytes are read.  In
+    particular, this preflight never seeks to or decompresses the CSV member.
+    ZIP64 is deliberately unsupported because the frozen daily-archive limits
+    fit in the classic ZIP fields and accepting ZIP64 would add an unnecessary
+    parser surface before the economic-data boundary.
+    """
+
+    try:
+        size = path.stat().st_size
+        if size < _ZIP_EOCD_STRUCT.size:
+            raise M8ManifestError(f"{entry_label} archive is too small to contain a ZIP EOCD")
+        tail_bytes = min(size, _MAX_ZIP_TAIL_BYTES)
+        with path.open("rb") as source:
+            source.seek(size - tail_bytes)
+            tail = source.read(tail_bytes)
+        relative_eocd = tail.rfind(_ZIP_EOCD_SIGNATURE)
+        if relative_eocd < 0 or len(tail) - relative_eocd < _ZIP_EOCD_STRUCT.size:
+            raise M8ManifestError(f"{entry_label} archive ZIP EOCD is missing or truncated")
+        (
+            _signature,
+            disk_number,
+            central_disk,
+            entries_on_disk,
+            entries_total,
+            central_bytes,
+            central_offset,
+            comment_bytes,
+        ) = _ZIP_EOCD_STRUCT.unpack_from(tail, relative_eocd)
+        eocd_offset = size - tail_bytes + relative_eocd
+        if eocd_offset + _ZIP_EOCD_STRUCT.size + comment_bytes != size:
+            raise M8ManifestError(
+                f"{entry_label} archive ZIP EOCD has trailing or malformed bounds"
+            )
+        if (
+            disk_number == _ZIP16_SENTINEL
+            or central_disk == _ZIP16_SENTINEL
+            or entries_on_disk == _ZIP16_SENTINEL
+            or entries_total == _ZIP16_SENTINEL
+            or central_bytes == _ZIP32_SENTINEL
+            or central_offset == _ZIP32_SENTINEL
+        ):
+            raise M8ManifestError(f"{entry_label} archive ZIP64 is not permitted")
+        if disk_number != 0 or central_disk != 0:
+            raise M8ManifestError(f"{entry_label} archive must be a single-disk ZIP")
+        if entries_on_disk != 1 or entries_total != 1:
+            raise M8ManifestError(
+                f"{entry_label} archive must contain exactly one central-directory member"
+            )
+        if central_bytes < _ZIP_CENTRAL_STRUCT.size:
+            raise M8ManifestError(
+                f"{entry_label} archive central directory is smaller than one entry"
+            )
+        if central_bytes > _MAX_ZIP_DIRECTORY_BYTES:
+            raise M8ManifestError(
+                f"{entry_label} archive central directory exceeds its metadata byte ceiling"
+            )
+        if central_offset + central_bytes != eocd_offset:
+            raise M8ManifestError(f"{entry_label} archive central-directory bounds are malformed")
+
+        with path.open("rb") as source:
+            source.seek(central_offset)
+            directory = source.read(central_bytes)
+        if len(directory) != central_bytes:
+            raise M8ManifestError(f"{entry_label} archive central directory is truncated")
+        (
+            signature,
+            _version_made,
+            _version_needed,
+            flags,
+            compression,
+            _modified_time,
+            _modified_date,
+            _crc32,
+            compressed_bytes,
+            uncompressed_bytes,
+            filename_bytes,
+            extra_bytes,
+            member_comment_bytes,
+            member_disk,
+            _internal_attributes,
+            _external_attributes,
+            local_header_offset,
+        ) = _ZIP_CENTRAL_STRUCT.unpack_from(directory)
+        if signature != _ZIP_CENTRAL_SIGNATURE:
+            raise M8ManifestError(f"{entry_label} archive central-directory signature is invalid")
+        if (
+            compressed_bytes == _ZIP32_SENTINEL
+            or uncompressed_bytes == _ZIP32_SENTINEL
+            or local_header_offset == _ZIP32_SENTINEL
+            or member_disk == _ZIP16_SENTINEL
+        ):
+            raise M8ManifestError(f"{entry_label} archive ZIP64 entry is not permitted")
+        if member_disk != 0:
+            raise M8ManifestError(f"{entry_label} archive member starts on another disk")
+        declared_entry_bytes = (
+            _ZIP_CENTRAL_STRUCT.size + filename_bytes + extra_bytes + member_comment_bytes
+        )
+        if declared_entry_bytes != central_bytes:
+            raise M8ManifestError(
+                f"{entry_label} archive central directory does not contain exactly one entry"
+            )
+        filename_start = _ZIP_CENTRAL_STRUCT.size
+        filename_end = filename_start + filename_bytes
+        extra_end = filename_end + extra_bytes
+        filename = directory[filename_start:filename_end]
+        extra = directory[filename_end:extra_end]
+        try:
+            decoded_filename = filename.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise M8ManifestError(
+                f"{entry_label} archive central member name is not ASCII"
+            ) from exc
+        if decoded_filename != expected_member:
+            raise M8ManifestError(
+                f"{entry_label} archive central member is not the frozen daily CSV"
+            )
+        if _ZIP64_EXTRA_FIELD_ID in _zip_extra_field_ids(extra, entry_label=entry_label):
+            raise M8ManifestError(f"{entry_label} archive ZIP64 extra field is not permitted")
+        if flags & 0x1:
+            raise M8ManifestError(f"{entry_label} archive member must not be encrypted")
+        if compression not in {0, 8}:
+            raise M8ManifestError(f"{entry_label} archive member uses unsupported compression")
+        if local_header_offset >= central_offset:
+            raise M8ManifestError(
+                f"{entry_label} archive local-header offset is outside the payload region"
+            )
+        if uncompressed_bytes != expected_uncompressed_bytes:
+            raise M8ManifestError(
+                f"{entry_label} expanded-byte claim does not match ZIP central metadata"
+            )
+        if uncompressed_bytes < 1 or uncompressed_bytes > max_uncompressed_bytes:
+            raise M8ManifestError(f"{entry_label} archive exceeds the frozen expanded-byte ceiling")
+    except M8ManifestError:
+        raise
+    except (OSError, struct.error, ValueError) as exc:
+        raise M8ManifestError(
+            f"{entry_label} raw archive has invalid bounded ZIP metadata: {exc}"
         ) from exc
 
 
@@ -1370,6 +1736,26 @@ def _verify_entry(
         source_uri=source_uri,
         sidecar_path=raw_sidecar_path,
     )
+    (
+        raw_checksum_path,
+        raw_checksum_sha,
+        raw_checksum_bytes,
+        raw_checksum_source_uri,
+        raw_checksum_sidecar_path,
+        raw_checksum_sidecar_sha,
+        raw_checksum_sidecar_bytes,
+    ) = _verify_official_checksum(
+        entry_label=label,
+        root=root,
+        value=raw["checksum"],
+        symbol=symbol,
+        day=day,
+        day_range=day_range,
+        zip_path=raw_zip_path,
+        zip_sha256=raw_zip_sha,
+        archive_source_uri=source_uri,
+        archive_sidecar_path=raw_sidecar_path,
+    )
 
     normalized = _object(entry["normalized"], f"{label}.normalized")
     dataset_path, dataset_sha, dataset_bytes, parts = _verify_normalized(
@@ -1417,6 +1803,13 @@ def _verify_entry(
         raw_source_manifest_path=raw_sidecar_path,
         raw_source_manifest_sha256=raw_sidecar_sha,
         raw_source_manifest_bytes=raw_sidecar_bytes,
+        raw_checksum_path=raw_checksum_path,
+        raw_checksum_sha256=raw_checksum_sha,
+        raw_checksum_bytes=raw_checksum_bytes,
+        raw_checksum_source_uri=raw_checksum_source_uri,
+        raw_checksum_source_manifest_path=raw_checksum_sidecar_path,
+        raw_checksum_source_manifest_sha256=raw_checksum_sidecar_sha,
+        raw_checksum_source_manifest_bytes=raw_checksum_sidecar_bytes,
         normalized_dataset_manifest_path=dataset_path,
         normalized_dataset_manifest_sha256=dataset_sha,
         normalized_dataset_manifest_bytes=dataset_bytes,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -94,6 +95,20 @@ def _entry_artifacts(
         requested_end_ns=end_ns,
         upstream_checksum_sha256=zip_sha,
     )
+    checksum_dir = root / "raw" / "checksums" / symbol / day_text
+    checksum_dir.mkdir(parents=True, exist_ok=True)
+    checksum_path = checksum_dir / f"{zip_path.name}.CHECKSUM"
+    checksum_path.write_bytes(f"{zip_sha}  {zip_path.name}\n".encode("ascii"))
+    checksum_sha = sha256_file(checksum_path)
+    checksum_source_uri = f"{source_uri}.CHECKSUM"
+    checksum_sidecar_path, checksum_sidecar_sha = write_source_manifest(
+        checksum_path,
+        source="binance_spot_daily_aggtrades_archive_checksum",
+        source_uri=checksum_source_uri,
+        downloaded_at_utc="2026-08-07T11:59:59.123456789Z",
+        requested_start_ns=start_ns,
+        requested_end_ns=end_ns,
+    )
 
     generated = generate_synthetic_market(
         symbols=(symbol,),
@@ -171,6 +186,13 @@ def _entry_artifacts(
         raw_source_manifest_path=raw_sidecar_path,
         raw_source_manifest_sha256=raw_sidecar_sha,
         raw_source_manifest_bytes=raw_sidecar_path.stat().st_size,
+        raw_checksum_path=checksum_path,
+        raw_checksum_sha256=checksum_sha,
+        raw_checksum_bytes=checksum_path.stat().st_size,
+        raw_checksum_source_uri=checksum_source_uri,
+        raw_checksum_source_manifest_path=checksum_sidecar_path,
+        raw_checksum_source_manifest_sha256=checksum_sidecar_sha,
+        raw_checksum_source_manifest_bytes=checksum_sidecar_path.stat().st_size,
         normalized_dataset_manifest_path=dataset.manifest_path,
         normalized_dataset_manifest_sha256=dataset.manifest_sha256,
         normalized_dataset_manifest_bytes=dataset.manifest_path.stat().st_size,
@@ -356,6 +378,51 @@ def _rebind_symbol_metadata_artifacts(
     return _write_readdressed_manifest(fixture.root, payload)
 
 
+def _rebind_archive_checksum_artifacts(
+    fixture: _Fixture,
+    payload: dict[str, Any],
+    *,
+    index: int = 0,
+    checksum_body: bytes | None = None,
+    sidecar_payload: dict[str, Any] | None = None,
+) -> tuple[Path, str]:
+    checksum = payload["entries"][index]["raw"]["checksum"]
+    checksum_path = fixture.root / checksum["path"]
+    if checksum_body is not None:
+        checksum_path.write_bytes(checksum_body)
+        checksum["sha256"] = sha256_file(checksum_path)
+        checksum["bytes"] = checksum_path.stat().st_size
+
+    sidecar_path = fixture.root / checksum["source_manifest_path"]
+    if sidecar_payload is None:
+        loaded = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        assert isinstance(loaded, dict)
+        sidecar_payload = loaded
+    if checksum_body is not None:
+        sidecar_payload["checksum"]["value"] = checksum["sha256"]
+        sidecar_payload["bytes"] = checksum["bytes"]
+    write_json(sidecar_path, sidecar_payload)
+    checksum["source_manifest_sha256"] = sha256_file(sidecar_path)
+    checksum["source_manifest_bytes"] = sidecar_path.stat().st_size
+    return _write_readdressed_manifest(fixture.root, payload)
+
+
+def _rebind_raw_zip_bytes_for_preflight(
+    fixture: _Fixture,
+    payload: dict[str, Any],
+    content: bytes,
+    *,
+    index: int = 0,
+) -> tuple[Path, str]:
+    raw = payload["entries"][index]["raw"]
+    zip_path = fixture.root / raw["zip_path"]
+    zip_path.write_bytes(content)
+    raw["zip_sha256"] = sha256_file(zip_path)
+    raw["zip_bytes"] = zip_path.stat().st_size
+    payload["total_raw_zip_bytes"] = sum(entry["raw"]["zip_bytes"] for entry in payload["entries"])
+    return _write_readdressed_manifest(fixture.root, payload)
+
+
 def test_manifest_round_trip_is_deterministic_complete_and_ordered(
     manifest_fixture: _Fixture,
 ) -> None:
@@ -379,6 +446,10 @@ def test_manifest_round_trip_is_deterministic_complete_and_ordered(
         for symbol in fixture.config.study.symbols
     ]
     first = manifest.entries[0]
+    assert first.raw_checksum_source_uri == f"{first.raw_source_uri}.CHECKSUM"
+    assert first.raw_checksum_path.read_bytes() == (
+        f"{first.raw_zip_sha256}  {first.raw_zip_path.name}\n".encode("ascii")
+    )
     assert manifest.part_paths_for(first.symbol, first.date) == tuple(
         part.data_path for part in first.normalized_parts
     )
@@ -411,6 +482,66 @@ def test_reader_verifies_only_parquet_footer_not_trade_rows(
     )
 
     assert len(verified.entries) == 8
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "multiple_members",
+        "zip64_eocd",
+        "zip64_entry",
+        "oversized_directory",
+        "malformed_directory_bounds",
+    ],
+)
+def test_reader_rejects_unsafe_zip_directory_before_zipfile_parser(
+    manifest_fixture: _Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    payload = _top_payload(manifest_fixture)
+    entry = manifest_fixture.manifest.entries[0]
+    content = bytearray(entry.raw_zip_path.read_bytes())
+    eocd = content.rfind(b"PK\x05\x06")
+    assert eocd >= 0
+    central_offset = struct.unpack_from("<L", content, eocd + 16)[0]
+    assert content[central_offset : central_offset + 4] == b"PK\x01\x02"
+
+    if case == "multiple_members":
+        struct.pack_into("<H", content, eocd + 8, 2)
+        struct.pack_into("<H", content, eocd + 10, 2)
+    elif case == "zip64_eocd":
+        struct.pack_into("<H", content, eocd + 10, 0xFFFF)
+    elif case == "zip64_entry":
+        struct.pack_into("<L", content, central_offset + 20, 0xFFFFFFFF)
+    elif case == "oversized_directory":
+        struct.pack_into("<L", content, eocd + 12, 256 * 1_024 + 1)
+    else:
+        struct.pack_into("<L", content, eocd + 16, central_offset + 1)
+
+    path, manifest_sha = _rebind_raw_zip_bytes_for_preflight(
+        manifest_fixture,
+        payload,
+        bytes(content),
+    )
+    parser_called = False
+
+    def unexpected_zipfile_parser(*_args: object, **_kwargs: object) -> None:
+        nonlocal parser_called
+        parser_called = True
+        raise AssertionError("unsafe ZIP metadata reached ZipFile")
+
+    import microstructure.m8_manifest as manifest_module
+
+    monkeypatch.setattr(manifest_module, "ZipFile", unexpected_zipfile_parser)
+    with pytest.raises(M8ManifestError, match=r"ZIP64|central|directory"):
+        read_m8_input_manifest(
+            manifest_fixture.config,
+            manifest_fixture.root,
+            path,
+            manifest_sha256=manifest_sha,
+        )
+    assert parser_called is False
 
 
 @pytest.mark.parametrize("case", ["missing", "duplicate", "extra", "misrole"])
@@ -522,6 +653,9 @@ def test_writer_binds_every_entry_scale_to_exchange_info(tmp_path: Path) -> None
         "https://evil.example/api/v3/exchangeInfo?symbol=BTCUSDT",
         ("https://data-api.binance.vision/api/v3/exchangeInfo?symbol=BTCUSDT&symbol=BTCUSDT"),
         ("https://data-api.binance.vision/api/v3/exchangeInfo?symbol=BTCUSDT&limit=1"),
+        "https://\ndata-api.binance.vision/api/v3/exchangeInfo?symbol=BTCUSDT",
+        "https://data-api.binance.vision:/api/v3/exchangeInfo?symbol=BTCUSDT",
+        "https://[data-api.binance.vision/api/v3/exchangeInfo?symbol=BTCUSDT",
     ],
 )
 def test_writer_rejects_nonexact_exchange_info_uri(
@@ -530,7 +664,10 @@ def test_writer_rejects_nonexact_exchange_info_uri(
     symbol_metadata = list(manifest_fixture.symbol_metadata)
     symbol_metadata[0] = replace(symbol_metadata[0], source_uri=source_uri)
 
-    with pytest.raises(M8ManifestError, match="exact official exchangeInfo request"):
+    with pytest.raises(
+        M8ManifestError,
+        match=r"exact official exchangeInfo request|invalid network location",
+    ):
         write_m8_input_manifest(
             manifest_fixture.config,
             manifest_fixture.root,
@@ -544,6 +681,8 @@ def test_writer_rejects_nonexact_exchange_info_uri(
     [
         "raw_zip",
         "raw_sidecar",
+        "raw_checksum",
+        "raw_checksum_sidecar",
         "dataset_manifest",
         "part",
         "part_sidecar",
@@ -556,6 +695,8 @@ def test_reader_rejects_any_artifact_tamper(manifest_fixture: _Fixture, artifact
     paths = {
         "raw_zip": entry.raw_zip_path,
         "raw_sidecar": entry.raw_source_manifest_path,
+        "raw_checksum": entry.raw_checksum_path,
+        "raw_checksum_sidecar": entry.raw_checksum_source_manifest_path,
         "dataset_manifest": entry.normalized_dataset_manifest_path,
         "part": entry.normalized_parts[0].data_path,
         "part_sidecar": entry.normalized_parts[0].sidecar_path,
@@ -571,6 +712,184 @@ def test_reader_rejects_any_artifact_tamper(manifest_fixture: _Fixture, artifact
             manifest_fixture.root,
             manifest_fixture.manifest.path,
             manifest_sha256=manifest_fixture.manifest.sha256,
+        )
+
+
+@pytest.mark.parametrize(
+    "body_kind",
+    [
+        "wrong_digest",
+        "uppercase_digest",
+        "wrong_basename",
+        "carriage_return_only",
+        "extra_line",
+    ],
+)
+def test_reader_rejects_rebound_official_checksum_body_forgery(
+    manifest_fixture: _Fixture, body_kind: str
+) -> None:
+    payload = _top_payload(manifest_fixture)
+    entry = manifest_fixture.manifest.entries[0]
+    digest = entry.raw_zip_sha256
+    basename = entry.raw_zip_path.name
+    if body_kind == "wrong_digest":
+        body = f"{'0' * 64}  {basename}\n".encode("ascii")
+    elif body_kind == "uppercase_digest":
+        body = f"{digest.upper()}  {basename}\n".encode("ascii")
+    elif body_kind == "wrong_basename":
+        body = f"{digest}  ETHUSDT-aggTrades-2024-01-03.zip\n".encode("ascii")
+    elif body_kind == "carriage_return_only":
+        body = f"{digest}  {basename}\r".encode("ascii")
+    else:
+        body = f"{digest}  {basename}\nextra\n".encode("ascii")
+    path, manifest_sha = _rebind_archive_checksum_artifacts(
+        manifest_fixture,
+        payload,
+        checksum_body=body,
+    )
+
+    with pytest.raises(M8ManifestError, match="body must be exactly one ZIP SHA-256"):
+        read_m8_input_manifest(
+            manifest_fixture.config,
+            manifest_fixture.root,
+            path,
+            manifest_sha256=manifest_sha,
+        )
+
+
+@pytest.mark.parametrize("line_ending", [b"", b"\n", b"\r\n"])
+def test_reader_preserves_and_accepts_official_single_line_checksum_endings(
+    manifest_fixture: _Fixture, line_ending: bytes
+) -> None:
+    payload = _top_payload(manifest_fixture)
+    entry = manifest_fixture.manifest.entries[0]
+    checksum_body = (
+        f"{entry.raw_zip_sha256}  {entry.raw_zip_path.name}".encode("ascii") + line_ending
+    )
+    path, manifest_sha = _rebind_archive_checksum_artifacts(
+        manifest_fixture,
+        payload,
+        checksum_body=checksum_body,
+    )
+
+    verified = read_m8_input_manifest(
+        manifest_fixture.config,
+        manifest_fixture.root,
+        path,
+        manifest_sha256=manifest_sha,
+    )
+
+    assert verified.entries[0].raw_checksum_path.read_bytes() == checksum_body
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("source", "source sidecar source claim does not match"),
+        ("uri", "source sidecar source_uri claim does not match"),
+        ("range", "does not claim the full UTC day"),
+        ("checksum", "source sidecar checksum claim does not match"),
+        ("upstream", "must not claim an upstream checksum"),
+        ("path", "source sidecar path claim does not match"),
+    ],
+)
+def test_reader_rejects_rebound_official_checksum_sidecar_forgery(
+    manifest_fixture: _Fixture, case: str, message: str
+) -> None:
+    payload = _top_payload(manifest_fixture)
+    entry = manifest_fixture.manifest.entries[0]
+    sidecar = json.loads(entry.raw_checksum_source_manifest_path.read_text(encoding="utf-8"))
+    if case == "source":
+        sidecar["source"] = "untrusted_source"
+    elif case == "uri":
+        sidecar["source_uri"] = entry.raw_source_uri
+    elif case == "range":
+        sidecar["requested_range_ns"]["end_exclusive"] -= 1
+    elif case == "checksum":
+        sidecar["checksum"]["value"] = "0" * 64
+    elif case == "upstream":
+        sidecar["upstream_checksum_sha256"] = entry.raw_zip_sha256
+    else:
+        sidecar["path"] = entry.raw_zip_path.name
+    path, manifest_sha = _rebind_archive_checksum_artifacts(
+        manifest_fixture,
+        payload,
+        sidecar_payload=sidecar,
+    )
+
+    with pytest.raises(M8ManifestError, match=message):
+        read_m8_input_manifest(
+            manifest_fixture.config,
+            manifest_fixture.root,
+            path,
+            manifest_sha256=manifest_sha,
+        )
+
+
+def test_writer_rejects_checksum_uri_not_bound_to_zip(manifest_fixture: _Fixture) -> None:
+    entries = list(manifest_fixture.entries)
+    entries[0] = replace(
+        entries[0],
+        raw_checksum_source_uri=(
+            "https://data.binance.vision/data/spot/daily/aggTrades/BTCUSDT/"
+            "BTCUSDT-aggTrades-2024-01-04.zip.CHECKSUM"
+        ),
+    )
+
+    with pytest.raises(M8ManifestError, match="URI is not bound to its ZIP URI"):
+        write_m8_input_manifest(
+            manifest_fixture.config,
+            manifest_fixture.root,
+            entries,
+            manifest_fixture.symbol_metadata,
+        )
+
+
+@pytest.mark.parametrize(
+    "source_uri",
+    [
+        (
+            "https://\ndata.binance.vision/data/spot/daily/aggTrades/BTCUSDT/"
+            "BTCUSDT-aggTrades-2024-01-03.zip"
+        ),
+        (
+            "https://data.binance.vision:/data/spot/daily/aggTrades/BTCUSDT/"
+            "BTCUSDT-aggTrades-2024-01-03.zip"
+        ),
+        (
+            "https://[data.binance.vision/data/spot/daily/aggTrades/BTCUSDT/"
+            "BTCUSDT-aggTrades-2024-01-03.zip"
+        ),
+    ],
+)
+def test_writer_rejects_noncanonical_archive_uri(
+    manifest_fixture: _Fixture, source_uri: str
+) -> None:
+    entries = list(manifest_fixture.entries)
+    entries[0] = replace(entries[0], raw_source_uri=source_uri)
+
+    with pytest.raises(
+        M8ManifestError,
+        match=r"exact official daily archive URI|invalid network location",
+    ):
+        write_m8_input_manifest(
+            manifest_fixture.config,
+            manifest_fixture.root,
+            entries,
+            manifest_fixture.symbol_metadata,
+        )
+
+
+def test_writer_enforces_official_checksum_byte_ceiling(manifest_fixture: _Fixture) -> None:
+    entries = list(manifest_fixture.entries)
+    entries[0] = replace(entries[0], raw_checksum_bytes=4_097)
+
+    with pytest.raises(M8ManifestError, match="4096-byte checksum limit"):
+        write_m8_input_manifest(
+            manifest_fixture.config,
+            manifest_fixture.root,
+            entries,
+            manifest_fixture.symbol_metadata,
         )
 
 
@@ -697,6 +1016,61 @@ def test_reader_rejects_exchange_info_path_traversal_even_when_readdressed(
     path, digest = _write_readdressed_manifest(manifest_fixture.root, payload)
 
     with pytest.raises(M8ManifestError, match="escapes the M8 input root"):
+        read_m8_input_manifest(
+            manifest_fixture.config,
+            manifest_fixture.root,
+            path,
+            manifest_sha256=digest,
+        )
+
+
+@pytest.mark.parametrize("field", ["path", "source_manifest_path"])
+def test_reader_rejects_official_checksum_path_traversal_even_when_readdressed(
+    manifest_fixture: _Fixture, tmp_path: Path, field: str
+) -> None:
+    outside = tmp_path / "outside.CHECKSUM"
+    outside.write_text("0" * 64 + "  outside.zip\n", encoding="ascii")
+    payload = _top_payload(manifest_fixture)
+    payload["entries"][0]["raw"]["checksum"][field] = "../outside.CHECKSUM"
+    path, digest = _write_readdressed_manifest(manifest_fixture.root, payload)
+
+    with pytest.raises(M8ManifestError, match="escapes the M8 input root"):
+        read_m8_input_manifest(
+            manifest_fixture.config,
+            manifest_fixture.root,
+            path,
+            manifest_sha256=digest,
+        )
+
+
+@pytest.mark.parametrize("case", ["missing", "extra"])
+def test_reader_requires_exact_official_checksum_descriptor_keys(
+    manifest_fixture: _Fixture, case: str
+) -> None:
+    payload = _top_payload(manifest_fixture)
+    checksum = payload["entries"][0]["raw"]["checksum"]
+    if case == "missing":
+        checksum.pop("source_manifest_sha256")
+    else:
+        checksum["unbound_claim"] = True
+    path, digest = _write_readdressed_manifest(manifest_fixture.root, payload)
+
+    with pytest.raises(M8ManifestError, match="official CHECKSUM keys are invalid"):
+        read_m8_input_manifest(
+            manifest_fixture.config,
+            manifest_fixture.root,
+            path,
+            manifest_sha256=digest,
+        )
+
+
+def test_reader_rejects_pre_checksum_manifest_shape(manifest_fixture: _Fixture) -> None:
+    payload = _top_payload(manifest_fixture)
+    payload["manifest_version"] = "1.1.0"
+    payload["entries"][0]["raw"].pop("checksum")
+    path, digest = _write_readdressed_manifest(manifest_fixture.root, payload)
+
+    with pytest.raises(M8ManifestError, match="unsupported M8 input manifest version"):
         read_m8_input_manifest(
             manifest_fixture.config,
             manifest_fixture.root,

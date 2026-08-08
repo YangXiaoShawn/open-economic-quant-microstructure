@@ -8,7 +8,7 @@ from typing import Any
 
 from microstructure.reporting.bundle import RunBundle
 
-_JOIN_KEYS = ("instrument", "model", "horizon_events", "split")
+_JOIN_KEYS = ("instrument", "model", "horizon_events", "split", "study_date")
 _TEST_SPLITS = frozenset({"test", "final_test", "holdout", "held_out"})
 
 
@@ -30,6 +30,12 @@ def _canonical_row(row: Mapping[str, Any]) -> dict[str, Any]:
     # presentation layer fail-closed so an unsplit metric cannot be promoted to
     # final-test evidence merely by being serialized.
     result["split"] = str(_first(row, ("split", "evaluation_split"), "unknown"))
+    # A multi-date held-out study can legitimately emit the same model/split
+    # combination more than once.  Preserve the declared study date in the
+    # presentation join so a replication period cannot overwrite the primary
+    # test period.  Legacy single-period rows retain one explicit sentinel and
+    # therefore keep their previous join behaviour.
+    result["study_date"] = str(_first(row, ("study_date", "period_date", "date"), "N/A"))
     result["n_obs"] = _first(row, ("n_obs", "observations", "sample_size"))
     result["period_start_utc"] = _first(row, ("period_start_utc", "test_start_utc", "start_utc"))
     result["period_end_utc"] = _first(row, ("period_end_utc", "test_end_utc", "end_utc"))

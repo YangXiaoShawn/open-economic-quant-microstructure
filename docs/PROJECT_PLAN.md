@@ -23,7 +23,7 @@ timing, and execution accounting are tested.
 | M5 Execution research | Complete | M3-M4 | Market/limit fills, latency, partial fills, costs, inventory, liquidation, sensitivity | Deterministic accounting, OOS, volume-conservation, continuity, partial-fill, and liquidation tests pass |
 | M6 Reproducible vertical slice | Complete | M1-M5 | One CLI-driven sample run and machine-readable artifacts | Atomic producer and corruption/idempotence tests pass; canonical smoke requires no network |
 | M7 Research communication | Complete | M6 | Generated technical report/table, IC memo, limitations, dashboard, portfolio material | Render/dashboard tests read only verified artifacts and visibly label evidence tier |
-| M8 Broader empirical study | In progress | M6-M7 | Prospective four-date BTCUSDT/ETHUSDT trade protocol frozen before acquisition; local-L2 study remains separate | Complete all declared daily archives, lock selection before two untouched dates, publish stability/failed hypotheses, then add continuous local-L2 evidence |
+| M8 Broader empirical study | In progress | M6-M7 | Verified eight-archive raw-only authority, bounded evidence ledger, dev-only normalization, durable dual-symbol fitted-state lock, held-out guard, and terminal result producer; local-L2 study remains separate | Verify the clean-commit terminal result and resource evidence, then complete the four-date prospective local-L2 study |
 
 ## First vertical slice
 
@@ -63,7 +63,7 @@ small public-data path without making the test suite depend on network access.
 | Class imbalance/calibration drift | Misleading probabilities | Persist class rates, Brier/log loss, calibration diagnostics by fold/regime |
 | Fee/latency/fill assumptions dominate P&L | Fragile strategy result | Publish assumption grid and sensitivity; never collapse it into model quality |
 | Public endpoint/schema changes | Broken ingestion | Version adapter/schema, capture response metadata/checksum, contract tests |
-| Memory/disk pressure | Local run failure | Byte-bounded response streams, disk-backed incremental DQ, batch Parquet, verified spill-capable scans, explicit eager guards; disclose metadata growth by page/part |
+| Memory/disk pressure | Local run failure | Byte-bounded response streams, hard retained-evidence reservations, disk-backed incremental DQ, batch Parquet, verified spill-capable scans, explicit eager guards; measure peak RSS on the complete M8 run before promotion |
 | Multiple testing | False discoveries | Predeclare core hypotheses, report all tested variants, use adjusted interpretation |
 
 ## Acceptance test matrix
@@ -106,9 +106,13 @@ The objective's ten acceptance criteria have reproducible evidence for M0-M7:
     hypotheses are documented.
 
 Passing M0-M7 completes the portfolio-quality system and first vertical slice.
-M8 remains the next empirical milestone. The prospective calendar, hypotheses,
-selection rule, untouched tests, uncertainty, and failure policy are frozen in
-`docs/M8_MULTIDATE_TRADE_PROTOCOL.md`; its declared full daily archives have not
-yet been acquired or evaluated. The existing downloaded public trade sample
-validates the bounded exploratory path only and remains intentionally
-insufficient for economic claims.
+M8 remains the active empirical milestone. Its prospective calendar,
+hypotheses, selection rule, untouched tests, uncertainty, failure policy, and
+lock-before-open boundary are frozen in
+`docs/M8_MULTIDATE_TRADE_PROTOCOL.md`. The raw-only acquirer and terminal
+producer are implemented and adversarially tested. All eight full daily archives
+and their official evidence are now bound by one verified raw-only manifest,
+without opening a CSV member. Promotion still requires the exact clean-commit
+economic run, a verified terminal bundle, peak-RSS evidence below the local
+resource ceiling, and the separately frozen continuous L2 study for book-based
+claims. The existing single-date public sample remains exploratory only.

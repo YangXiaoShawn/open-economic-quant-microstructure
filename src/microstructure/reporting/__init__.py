@@ -14,6 +14,7 @@ from microstructure.reporting.bundle import (
 from microstructure.reporting.render import (
     ReportPaths,
     render_executive_memo,
+    render_model_comparison_report,
     render_technical_report,
     write_report_set,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "load_run_bundle",
     "render_executive_memo",
     "render_model_comparison",
+    "render_model_comparison_report",
     "render_technical_report",
     "verify_checksums",
     "write_checksum_manifest",
