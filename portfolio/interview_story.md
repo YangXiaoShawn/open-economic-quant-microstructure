@@ -58,21 +58,48 @@ dashboard failures for incomplete runs. Research tests separately target event
 ordering, leakage, purged folds, fee accounting, latency, partial fills, and
 inventory constraints.
 
+## What the empirical work actually produced
+
+The capped public trade sample remained exploratory and explicitly skipped
+execution because it had no contemporaneous book. The predeclared full-archive
+trade study then produced a useful negative operational result: BTCUSDT training
+data passed, while ETHUSDT training data produced 53 long-silence warnings
+against a zero-warning gate. The pipeline published a checksummed
+`INSUFFICIENT_DATA` terminal before selection and before either held-out date was
+opened. I did not relax the rule, substitute a date, or describe the absence of
+a model result as a failed market hypothesis.
+
+For the book extension I froze four simultaneous BTCUSDT/ETHUSDT sessions and a
+field-complete analysis contract before capture. The implementation binds all
+dates to one outcome-blind campaign, clean source/import/runtime identity, and
+canonical storage root; limits features and labels to verified observed
+intervals; locks the Aug 8/9 development state before Aug 10/11; and provides
+no-refit evaluation and market-only scenarios. The final producer recursively
+verifies explicit path and digest authorities, snapshots them into an immutable
+terminal, and renders reports externally without changing the run. Those are
+software controls, not empirical L2 evidence: at the pre-capture source freeze,
+no declared L2 result had been promoted. Tracked source remains unchanged during
+the four-session campaign; immutable session/final bundles carry live status.
+
 ## Evidence boundary
 
-No empirical economic result is claimed until a manifested public research run
-meets the promotion protocol. A synthetic smoke run proves only that the software
-contracts and accounting execute as intended. The current bounded public trade
-ingestion supports a pipeline-quality observation only; generalization requires
-adjacent periods, both instruments, regimes, uncertainty, and failed hypotheses.
+No empirical economic result is claimed merely because a pipeline ran. A
+synthetic smoke run proves only that the software contracts and accounting
+execute as intended. The bounded public trade run supports exploratory,
+interval-specific diagnostics but no execution or broad claim. The canonical
+full-archive result supports only data insufficiency because evaluation never
+began. Generalization still requires valid adjacent periods, both instruments,
+regimes, uncertainty, and transparent failed hypotheses.
 
 ## What I would do next
 
-I would freeze the core OFI and liquidity hypotheses over multiple dates, capture
-continuous BTCUSDT/ETHUSDT depth epochs where book claims are required, inspect
-every quality exception, and run the same specification on an adjacent untouched
-period. Only then would I consider point-process models. The criterion for
-complexity would be stable out-of-time economic evidence, not an improved
+I would operate the completed producer on the already-frozen Aug 8--11 sessions
+without changing their calendar or analysis contract, then complete the
+clean-room and peak-memory audits on the resulting terminal. Aug 8/9 choices
+must be durably locked before Aug 10/11 data is exposed. I would accept a missed
+or invalid session as `INSUFFICIENT_DATA`, not search for a replacement. Only
+after stable no-refit evidence would I consider point-process models; the
+criterion for complexity would be out-of-time economic evidence, not an improved
 in-sample score.
 
 ## Likely follow-up questions

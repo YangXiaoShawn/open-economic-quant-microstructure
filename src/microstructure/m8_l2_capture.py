@@ -11,10 +11,15 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import importlib.metadata as importlib_metadata
 import json
 import os
+import platform
+import secrets
 import shutil
 import stat
+import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
@@ -36,14 +41,17 @@ from microstructure.m8_l2_config import (
     load_m8_l2_config,
 )
 from microstructure.provenance import (
-    git_source_tree_sha256,
-    git_state,
+    ImportOriginError,
+    assert_project_module_origins,
     sha256_file,
     utc_now_iso,
     write_json,
 )
 
-_SESSION_SCHEMA_VERSION = "m8-live-l2-session-v1"
+_SESSION_SCHEMA_VERSION = "m8-live-l2-session-v3"
+_CAMPAIGN_SCHEMA_VERSION = "m8-live-l2-campaign-authority-v2"
+_RUNTIME_SCHEMA_VERSION = "m8-live-l2-runtime-fingerprint-v1"
+_CAMPAIGN_AUTHORITY_NAME = "campaign_authority.json"
 _CHECKSUM_NAME = "CHECKSUMS.sha256"
 _COMPLETE_MARKER = "_SUCCESS"
 _INSUFFICIENT_MARKER = "INSUFFICIENT_DATA"
@@ -51,6 +59,17 @@ _COMPLETE_BYTES = b"complete\n"
 _INSUFFICIENT_BYTES = b"terminal\n"
 _NANOSECONDS_PER_SECOND = 1_000_000_000
 _MAX_JSON_AUTHORITY_BYTES = 8 * 1024 * 1024
+_MAX_CAMPAIGN_AUTHORITY_BYTES = 16 * 1024
+_RUNTIME_DISTRIBUTIONS = (
+    "duckdb",
+    "numpy",
+    "polars",
+    "pyarrow",
+    "requests",
+    "scikit-learn",
+    "streamlit",
+    "websockets",
+)
 _SYMBOL_SUMMARY_SCHEMA_VERSION = "m8-binance-l2-symbol-capture-v1"
 _REQUIRED_CAPTURE_ARTIFACT_KINDS = frozenset(
     {
@@ -112,6 +131,44 @@ class CaptureSourceIdentity:
     commit: str
     source_tree_sha256: str
     dirty: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeFingerprint:
+    """Canonical production interpreter/dependency identity."""
+
+    python_implementation: str
+    python_version: str
+    platform_system: str
+    platform_release: str
+    platform_machine: str
+    dependencies: tuple[tuple[str, str], ...]
+    sha256: str
+
+    def payload(self) -> dict[str, object]:
+        return _runtime_payload(
+            python_implementation=self.python_implementation,
+            python_version=self.python_version,
+            platform_system=self.platform_system,
+            platform_release=self.platform_release,
+            platform_machine=self.platform_machine,
+            dependencies=self.dependencies,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _CampaignAuthority:
+    """Exact durable campaign identity shared by all four frozen sessions."""
+
+    path: Path
+    sha256: str
+    raw: bytes
+    source: CaptureSourceIdentity
+    runtime: _RuntimeFingerprint
+    nonce: str
+    output_root_path: str
+    output_root_device: int
+    output_root_inode: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,12 +299,332 @@ def _stable_sha256(payload: Mapping[str, object]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _run_git_text(project_root: Path, arguments: Sequence[str], *, label: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=project_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        )
+    except (OSError, UnicodeError) as error:
+        raise M8L2CaptureSystemError(f"cannot execute Git {label}") from error
+    if result.returncode != 0:
+        raise M8L2CaptureSystemError(f"Git {label} failed with exit {result.returncode}")
+    return result.stdout
+
+
+def _run_git_bytes(project_root: Path, arguments: Sequence[str], *, label: str) -> bytes:
+    try:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=project_root,
+            check=False,
+            capture_output=True,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        )
+    except OSError as error:
+        raise M8L2CaptureSystemError(f"cannot execute Git {label}") from error
+    if result.returncode != 0:
+        raise M8L2CaptureSystemError(f"Git {label} failed with exit {result.returncode}")
+    return result.stdout
+
+
+def _strict_git_revision(project_root: Path) -> str:
+    output = _run_git_text(project_root, ("rev-parse", "HEAD"), label="revision lookup")
+    lines = output.splitlines()
+    if len(lines) != 1:
+        raise M8L2CaptureSystemError("Git revision lookup returned a noncanonical result")
+    return lines[0]
+
+
+def _strict_git_status(project_root: Path) -> str:
+    return _run_git_text(
+        project_root,
+        ("status", "--porcelain=v1", "--untracked-files=normal"),
+        label="status lookup",
+    )
+
+
+def _hash_regular_nofollow(path: Path, metadata: os.stat_result) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise M8L2CaptureSystemError(f"cannot open Git source file: {path}") from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        ) != (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        ):
+            raise M8L2CaptureSystemError(f"Git source file changed before hashing: {path}")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        named = path.lstat()
+        coordinates = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
+        if coordinates != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) or coordinates != (
+            named.st_dev,
+            named.st_ino,
+            named.st_size,
+            named.st_mtime_ns,
+            named.st_ctime_ns,
+        ):
+            raise M8L2CaptureSystemError(f"Git source file changed while hashing: {path}")
+        return digest.hexdigest()
+    except OSError as error:
+        raise M8L2CaptureSystemError(f"cannot hash Git source file: {path}") from error
+    finally:
+        os.close(descriptor)
+
+
+def _strict_source_tree_sha256(repository_root: Path, listing: bytes) -> str:
+    encoded_paths = [item for item in listing.split(b"\0") if item]
+    if len(encoded_paths) != len(set(encoded_paths)):
+        raise M8L2CaptureSystemError("Git source-tree listing contains duplicate paths")
+    digest = hashlib.sha256()
+    for encoded_relative in sorted(encoded_paths):
+        relative = Path(os.fsdecode(encoded_relative))
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            raise M8L2CaptureSystemError("Git source-tree listing contains an unsafe path")
+        path = repository_root / relative
+        digest.update(len(encoded_relative).to_bytes(8, "big"))
+        digest.update(encoded_relative)
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            digest.update(b"MISSING\0")
+            continue
+        except OSError as error:
+            raise M8L2CaptureSystemError(f"cannot inspect Git source path: {path}") from error
+        digest.update((metadata.st_mode & 0o7777).to_bytes(4, "big"))
+        if stat.S_ISLNK(metadata.st_mode):
+            try:
+                target = os.readlink(path).encode("utf-8", errors="surrogateescape")
+                repeated = path.lstat()
+            except OSError as error:
+                raise M8L2CaptureSystemError(f"cannot hash Git source symlink: {path}") from error
+            if (metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns, metadata.st_ctime_ns) != (
+                repeated.st_dev,
+                repeated.st_ino,
+                repeated.st_mtime_ns,
+                repeated.st_ctime_ns,
+            ):
+                raise M8L2CaptureSystemError(f"Git source symlink changed while hashing: {path}")
+            digest.update(b"SYMLINK\0")
+            digest.update(len(target).to_bytes(8, "big"))
+            digest.update(target)
+        elif stat.S_ISREG(metadata.st_mode):
+            digest.update(b"FILE\0")
+            digest.update(_hash_regular_nofollow(path, metadata).encode())
+        else:
+            digest.update(b"OTHER\0")
+    return digest.hexdigest()
+
+
 def _source_identity(project_root: Path) -> CaptureSourceIdentity:
-    state = git_state(project_root)
+    """Take one fail-closed clean Git snapshot without lenient provenance fallbacks."""
+
+    first_revision = _strict_git_revision(project_root)
+    first_status = _strict_git_status(project_root)
+    if first_status.strip():
+        raise M8L2CaptureSystemError(
+            "prospective live-L2 capture requires a clean runtime source tree"
+        )
+    top_level_raw = _run_git_text(
+        project_root,
+        ("rev-parse", "--show-toplevel"),
+        label="repository-root lookup",
+    )
+    top_level_lines = top_level_raw.splitlines()
+    if len(top_level_lines) != 1 or not top_level_lines[0]:
+        raise M8L2CaptureSystemError("Git repository-root lookup returned a noncanonical result")
+    repository_root = Path(top_level_lines[0]).resolve()
+    try:
+        project_root.resolve().relative_to(repository_root)
+    except ValueError as error:
+        raise M8L2CaptureSystemError("capture project root escapes the Git repository") from error
+    listing = _run_git_bytes(
+        repository_root,
+        ("ls-files", "-z", "--cached", "--others", "--exclude-standard"),
+        label="source-tree listing",
+    )
+    source_tree_sha256 = _strict_source_tree_sha256(repository_root, listing)
+    second_status = _strict_git_status(project_root)
+    second_revision = _strict_git_revision(project_root)
+    if second_status.strip() or first_revision != second_revision:
+        raise M8L2CaptureSystemError("runtime Git identity changed during source snapshot")
     return CaptureSourceIdentity(
-        commit=state.commit,
-        source_tree_sha256=git_source_tree_sha256(project_root),
-        dirty=state.dirty,
+        commit=first_revision,
+        source_tree_sha256=source_tree_sha256,
+        dirty=False,
+    )
+
+
+def _runtime_payload(
+    *,
+    python_implementation: str,
+    python_version: str,
+    platform_system: str,
+    platform_release: str,
+    platform_machine: str,
+    dependencies: tuple[tuple[str, str], ...],
+) -> dict[str, object]:
+    return {
+        "schema_version": _RUNTIME_SCHEMA_VERSION,
+        "python": {
+            "implementation": python_implementation,
+            "version": python_version,
+        },
+        "platform": {
+            "system": platform_system,
+            "release": platform_release,
+            "machine": platform_machine,
+        },
+        "dependencies": dict(dependencies),
+    }
+
+
+def _runtime_fingerprint() -> _RuntimeFingerprint:
+    try:
+        dependencies = tuple(
+            (distribution, importlib_metadata.version(distribution))
+            for distribution in _RUNTIME_DISTRIBUTIONS
+        )
+    except importlib_metadata.PackageNotFoundError as error:
+        raise M8L2CaptureSystemError(
+            f"production runtime dependency is not installed: {error.name}"
+        ) from error
+    implementation = platform.python_implementation()
+    version = platform.python_version()
+    system = platform.system()
+    release = platform.release()
+    machine = platform.machine()
+    payload = _runtime_payload(
+        python_implementation=implementation,
+        python_version=version,
+        platform_system=system,
+        platform_release=release,
+        platform_machine=machine,
+        dependencies=dependencies,
+    )
+    return _RuntimeFingerprint(
+        python_implementation=implementation,
+        python_version=version,
+        platform_system=system,
+        platform_release=release,
+        platform_machine=machine,
+        dependencies=dependencies,
+        sha256=_stable_sha256(payload),
+    )
+
+
+def current_m8_l2_runtime_fingerprint_sha256() -> str:
+    """Return the canonical production runtime digest used by L2 authorities."""
+
+    return _runtime_fingerprint().sha256
+
+
+def _runtime_from_recorded(value: object, sha256: object) -> _RuntimeFingerprint:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema_version",
+        "python",
+        "platform",
+        "dependencies",
+    }:
+        raise M8L2CaptureSystemError("recorded runtime fingerprint payload is not exact")
+    if value.get("schema_version") != _RUNTIME_SCHEMA_VERSION:
+        raise M8L2CaptureSystemError("recorded runtime fingerprint schema is unsupported")
+    python_payload = value.get("python")
+    platform_payload = value.get("platform")
+    dependencies_payload = value.get("dependencies")
+    if not isinstance(python_payload, Mapping) or set(python_payload) != {
+        "implementation",
+        "version",
+    }:
+        raise M8L2CaptureSystemError("recorded Python runtime identity is not exact")
+    if not isinstance(platform_payload, Mapping) or set(platform_payload) != {
+        "system",
+        "release",
+        "machine",
+    }:
+        raise M8L2CaptureSystemError("recorded platform runtime identity is not exact")
+    if not isinstance(dependencies_payload, Mapping) or set(dependencies_payload) != set(
+        _RUNTIME_DISTRIBUTIONS
+    ):
+        raise M8L2CaptureSystemError("recorded production dependency identity is not exact")
+    implementation = python_payload.get("implementation")
+    version = python_payload.get("version")
+    system = platform_payload.get("system")
+    release = platform_payload.get("release")
+    machine = platform_payload.get("machine")
+    if (
+        type(implementation) is not str
+        or not implementation
+        or type(version) is not str
+        or not version
+        or type(system) is not str
+        or not system
+        or type(release) is not str
+        or not release
+        or type(machine) is not str
+        or not machine
+    ):
+        raise M8L2CaptureSystemError("recorded Python runtime identity is malformed")
+    dependencies: list[tuple[str, str]] = []
+    for distribution in _RUNTIME_DISTRIBUTIONS:
+        dependency_version = dependencies_payload.get(distribution)
+        if type(dependency_version) is not str or not dependency_version:
+            raise M8L2CaptureSystemError(
+                f"recorded dependency version is malformed: {distribution}"
+            )
+        dependencies.append((distribution, dependency_version))
+    canonical_payload = _runtime_payload(
+        python_implementation=implementation,
+        python_version=version,
+        platform_system=system,
+        platform_release=release,
+        platform_machine=machine,
+        dependencies=tuple(dependencies),
+    )
+    observed_sha256 = _stable_sha256(canonical_payload)
+    if type(sha256) is not str or not _is_lower_sha256(sha256) or sha256 != observed_sha256:
+        raise M8L2CaptureSystemError("recorded runtime fingerprint digest is invalid")
+    if dict(value) != canonical_payload:
+        raise M8L2CaptureSystemError("recorded runtime fingerprint payload is not canonical")
+    return _RuntimeFingerprint(
+        python_implementation=implementation,
+        python_version=version,
+        platform_system=system,
+        platform_release=release,
+        platform_machine=machine,
+        dependencies=tuple(dependencies),
+        sha256=observed_sha256,
     )
 
 
@@ -264,13 +641,60 @@ def _validate_source_identity(identity: CaptureSourceIdentity) -> None:
         raise M8L2CaptureSystemError("runtime source-tree digest is not a lowercase SHA-256")
 
 
+def _assert_loaded_source_root(project_root: Path) -> None:
+    try:
+        assert_project_module_origins(project_root, "microstructure.m8_l2_capture")
+    except ImportOriginError as error:
+        raise M8L2CaptureSystemError(
+            "loaded microstructure code does not come from the hashed capture project root"
+        ) from error
+
+
+def _assert_production_capture_origin(project_root: Path, capture_one: CaptureOne) -> None:
+    """Bind the real network adapter and every critical dependency to one checkout."""
+
+    capture_type = type(capture_one)
+    module_name = getattr(capture_type, "__module__", None)
+    if (
+        module_name != "microstructure.m8_l2_binance"
+        or capture_type.__name__ != "BinanceM8L2Capture"
+    ):
+        raise M8L2CaptureSystemError(
+            "production CaptureOne must be the exact BinanceM8L2Capture adapter"
+        )
+    adapter_module = sys.modules.get(module_name)
+    if adapter_module is None or getattr(adapter_module, "BinanceM8L2Capture", None) is not (
+        capture_type
+    ):
+        raise M8L2CaptureSystemError(
+            "production BinanceM8L2Capture class lacks its canonical loaded module"
+        )
+    try:
+        assert_project_module_origins(
+            project_root,
+            adapter_module,
+            "microstructure.data.binance",
+            "microstructure.data.book",
+            "microstructure.data.quality",
+            "microstructure.data.schemas",
+            "microstructure.data.storage",
+        )
+    except ImportOriginError as error:
+        raise M8L2CaptureSystemError(
+            "production capture adapter has a foreign or mixed import origin"
+        ) from error
+
+
 def _revalidate_runtime_authority(
     *,
     config: M8L2StudyConfig,
     protocol: Path,
     expected_source: CaptureSourceIdentity,
+    expected_runtime: _RuntimeFingerprint,
     source_identity_was_injected: bool,
 ) -> None:
+    if not source_identity_was_injected:
+        _assert_loaded_source_root(config.path.parent.parent.resolve())
     try:
         reloaded = load_m8_l2_config(config.path)
     except (OSError, ValueError) as error:
@@ -282,6 +706,10 @@ def _revalidate_runtime_authority(
             "in-memory live-L2 config differs from its exact frozen byte authority"
         )
     _assert_protocol(protocol)
+    if _runtime_fingerprint() != expected_runtime:
+        raise M8L2CaptureSystemError(
+            "production runtime fingerprint changed during session orchestration"
+        )
     if source_identity_was_injected:
         return
     observed = _source_identity(config.path.parent.parent.resolve())
@@ -372,7 +800,10 @@ def _session_identity(
     config: M8L2StudyConfig,
     session: M8L2Session,
     source: CaptureSourceIdentity,
+    campaign_authority_sha256: str,
 ) -> str:
+    if not _is_lower_sha256(campaign_authority_sha256):
+        raise M8L2CaptureSystemError("session campaign authority digest is invalid")
     return _stable_sha256(
         {
             "schema_version": _SESSION_SCHEMA_VERSION,
@@ -382,6 +813,7 @@ def _session_identity(
             "protocol_freeze_commit": M8_L2_FREEZE_COMMIT,
             "runtime_commit": source.commit,
             "runtime_source_tree_sha256": source.source_tree_sha256,
+            "campaign_authority_sha256": campaign_authority_sha256,
             "date": session.date.isoformat(),
             "role": session.role,
             "scheduled_start_ns": session.start_ns,
@@ -540,18 +972,12 @@ def _all_regular_files(root: Path) -> tuple[Path, ...]:
     return _walk_regular_evidence(root)[0]
 
 
-def _strict_json(path: Path, *, label: str) -> object:
-    """Read a bounded canonical JSON authority with duplicate/NaN rejection."""
+def _canonical_json_bytes(value: object) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
 
+
+def _decode_canonical_json(raw: bytes, *, label: str) -> object:
     try:
-        mode = path.lstat().st_mode
-        size = path.lstat().st_size
-    except OSError as error:
-        raise M8L2CaptureSystemError(f"cannot inspect {label}: {path}") from error
-    if not stat.S_ISREG(mode) or size > _MAX_JSON_AUTHORITY_BYTES:
-        raise M8L2CaptureSystemError(f"{label} is not a bounded regular JSON file: {path}")
-    try:
-        raw = path.read_bytes()
         text = raw.decode("utf-8")
 
         def reject_duplicate(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -569,12 +995,81 @@ def _strict_json(path: Path, *, label: str) -> object:
                 ValueError(f"invalid JSON number: {token}")
             ),
         )
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
-        raise M8L2CaptureSystemError(f"cannot parse canonical {label}: {path}") from error
-    canonical = (json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
-    if raw != canonical:
-        raise M8L2CaptureSystemError(f"{label} is not canonical stable JSON: {path}")
+    except (UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise M8L2CaptureSystemError(f"cannot parse canonical {label}") from error
+    if raw != _canonical_json_bytes(value):
+        raise M8L2CaptureSystemError(f"{label} is not canonical stable JSON")
     return value
+
+
+def _read_bounded_regular_nofollow(
+    path: Path, *, label: str, maximum_bytes: int = _MAX_JSON_AUTHORITY_BYTES
+) -> bytes:
+    """Read one stable regular file through a no-follow descriptor."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise M8L2CaptureSystemError(
+            f"cannot open {label} without following links: {path}"
+        ) from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size < 1 or before.st_size > maximum_bytes:
+            raise M8L2CaptureSystemError(f"{label} is not a bounded nonempty regular file: {path}")
+        chunks: list[bytes] = []
+        remaining = maximum_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        current = path.lstat()
+        stable_coordinates = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) == (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        path_still_names_descriptor = (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+        ) == (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+        ) and stat.S_ISREG(current.st_mode)
+        if (
+            len(raw) > maximum_bytes
+            or len(raw) != before.st_size
+            or not stable_coordinates
+            or not path_still_names_descriptor
+        ):
+            raise M8L2CaptureSystemError(f"{label} changed during its bounded read: {path}")
+        return raw
+    except OSError as error:
+        raise M8L2CaptureSystemError(f"cannot read {label}: {path}") from error
+    finally:
+        os.close(descriptor)
+
+
+def _strict_json(path: Path, *, label: str) -> object:
+    """Read a bounded canonical JSON authority with duplicate/NaN rejection."""
+
+    raw = _read_bounded_regular_nofollow(path, label=label)
+    return _decode_canonical_json(raw, label=f"{label}: {path}")
 
 
 def _validate_symbol_result(
@@ -1359,6 +1854,284 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _campaign_payload(
+    *,
+    config: M8L2StudyConfig,
+    source: CaptureSourceIdentity,
+    runtime: _RuntimeFingerprint,
+    nonce: str,
+    root: Path,
+    root_identity: tuple[int, int],
+) -> dict[str, object]:
+    _validate_source_identity(source)
+    if not _is_lower_sha256(nonce):
+        raise M8L2CaptureSystemError("live-L2 campaign nonce is not 256-bit lowercase hex")
+    if runtime != _runtime_from_recorded(runtime.payload(), runtime.sha256):
+        raise M8L2CaptureSystemError("live-L2 runtime fingerprint is not canonical")
+    return {
+        "schema_version": _CAMPAIGN_SCHEMA_VERSION,
+        "artifact_kind": "m8_prospective_live_l2_campaign_authority",
+        "campaign_nonce": nonce,
+        "output_root": {
+            "canonical_path": str(root),
+            "device": root_identity[0],
+            "inode": root_identity[1],
+        },
+        "config_sha256": config.hash,
+        "config_source_sha256": config.source_sha256,
+        "protocol_sha256": M8_L2_PROTOCOL_SHA256,
+        "protocol_freeze_commit": M8_L2_FREEZE_COMMIT,
+        "runtime_commit": source.commit,
+        "runtime_source_tree_sha256": source.source_tree_sha256,
+        "runtime_dirty": False,
+        "runtime_fingerprint": runtime.payload(),
+        "runtime_fingerprint_sha256": runtime.sha256,
+    }
+
+
+def _recorded_output_root(value: object) -> tuple[str, int, int]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "canonical_path",
+        "device",
+        "inode",
+    }:
+        raise M8L2CaptureSystemError("campaign output-root identity is not exact")
+    canonical_path = value.get("canonical_path")
+    device = value.get("device")
+    inode = value.get("inode")
+    if (
+        type(canonical_path) is not str
+        or not canonical_path
+        or "\x00" in canonical_path
+        or not PurePosixPath(canonical_path).is_absolute()
+        or ".." in PurePosixPath(canonical_path).parts
+        or PurePosixPath(canonical_path).as_posix() != canonical_path
+    ):
+        raise M8L2CaptureSystemError("campaign output-root path is not canonical")
+    if type(device) is not int or device < 0 or type(inode) is not int or inode < 0:
+        raise M8L2CaptureSystemError("campaign output-root device/inode is malformed")
+    return canonical_path, device, inode
+
+
+def _validate_campaign_bytes(
+    raw: bytes,
+    *,
+    path: Path,
+    config: M8L2StudyConfig,
+    source: CaptureSourceIdentity,
+    expected_runtime: _RuntimeFingerprint | None = None,
+    expected_root: Path | None = None,
+    expected_root_identity: tuple[int, int] | None = None,
+    expected_sha256: str | None = None,
+) -> _CampaignAuthority:
+    value = _decode_canonical_json(raw, label=f"live-L2 campaign authority: {path}")
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema_version",
+        "artifact_kind",
+        "campaign_nonce",
+        "output_root",
+        "config_sha256",
+        "config_source_sha256",
+        "protocol_sha256",
+        "protocol_freeze_commit",
+        "runtime_commit",
+        "runtime_source_tree_sha256",
+        "runtime_dirty",
+        "runtime_fingerprint",
+        "runtime_fingerprint_sha256",
+    }:
+        raise M8L2CaptureSystemError("live-L2 campaign authority schema is not exact")
+    expected_claims = {
+        "schema_version": _CAMPAIGN_SCHEMA_VERSION,
+        "artifact_kind": "m8_prospective_live_l2_campaign_authority",
+        "config_sha256": config.hash,
+        "config_source_sha256": config.source_sha256,
+        "protocol_sha256": M8_L2_PROTOCOL_SHA256,
+        "protocol_freeze_commit": M8_L2_FREEZE_COMMIT,
+        "runtime_commit": source.commit,
+        "runtime_source_tree_sha256": source.source_tree_sha256,
+        "runtime_dirty": False,
+    }
+    if any(value.get(name) != expected for name, expected in expected_claims.items()):
+        raise M8L2CaptureSystemError(
+            "live-L2 campaign authority differs from the frozen configuration/source identity"
+        )
+    nonce = value.get("campaign_nonce")
+    if type(nonce) is not str or not _is_lower_sha256(nonce):
+        raise M8L2CaptureSystemError("live-L2 campaign nonce is malformed")
+    output_path, output_device, output_inode = _recorded_output_root(value.get("output_root"))
+    if (expected_root is None) != (expected_root_identity is None):
+        raise M8L2CaptureSystemError("campaign root validation coordinates are incomplete")
+    if (
+        expected_root is not None
+        and expected_root_identity is not None
+        and (
+            output_path != str(expected_root)
+            or (output_device, output_inode) != expected_root_identity
+        )
+    ):
+        raise M8L2CaptureSystemError(
+            "live-L2 campaign authority differs from the current output-root identity"
+        )
+    runtime = _runtime_from_recorded(
+        value.get("runtime_fingerprint"), value.get("runtime_fingerprint_sha256")
+    )
+    if expected_runtime is not None and runtime != expected_runtime:
+        raise M8L2CaptureSystemError(
+            "live-L2 campaign authority differs from the current production runtime"
+        )
+    digest = hashlib.sha256(raw).hexdigest()
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise M8L2CaptureSystemError("live-L2 campaign authority digest changed")
+    return _CampaignAuthority(
+        path=path,
+        sha256=digest,
+        raw=raw,
+        source=source,
+        runtime=runtime,
+        nonce=nonce,
+        output_root_path=output_path,
+        output_root_device=output_device,
+        output_root_inode=output_inode,
+    )
+
+
+def _verify_campaign_authority(
+    root: Path,
+    *,
+    root_identity: tuple[int, int],
+    config: M8L2StudyConfig,
+    source: CaptureSourceIdentity,
+    runtime: _RuntimeFingerprint,
+    expected_sha256: str | None = None,
+) -> _CampaignAuthority:
+    if _directory_identity(root, label="live-L2 output root") != root_identity:
+        raise M8L2CaptureSystemError("live-L2 output root identity changed")
+    path = root / _CAMPAIGN_AUTHORITY_NAME
+    _assert_no_symlink_components(path, root, "live-L2 campaign authority")
+    raw = _read_bounded_regular_nofollow(
+        path,
+        label="live-L2 campaign authority",
+        maximum_bytes=_MAX_CAMPAIGN_AUTHORITY_BYTES,
+    )
+    if _directory_identity(root, label="live-L2 output root") != root_identity:
+        raise M8L2CaptureSystemError("live-L2 output root changed during campaign verification")
+    return _validate_campaign_bytes(
+        raw,
+        path=path,
+        config=config,
+        source=source,
+        expected_runtime=runtime,
+        expected_root=root,
+        expected_root_identity=root_identity,
+        expected_sha256=expected_sha256,
+    )
+
+
+def _create_campaign_authority_once(
+    root: Path, *, root_identity: tuple[int, int], raw: bytes
+) -> None:
+    """Atomically link one fsynced authority into place without replacement."""
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=root, prefix=".campaign-authority-", suffix=".tmp"
+    )
+    temporary = Path(temporary_name)
+    root_descriptor = -1
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        root_descriptor = os.open(root, directory_flags)
+        root_metadata = os.fstat(root_descriptor)
+        if (root_metadata.st_dev, root_metadata.st_ino) != root_identity:
+            raise M8L2CaptureSystemError(
+                "live-L2 output root changed before campaign authority creation"
+            )
+        with suppress(FileExistsError):
+            os.link(
+                temporary.name,
+                _CAMPAIGN_AUTHORITY_NAME,
+                src_dir_fd=root_descriptor,
+                dst_dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+        # This fsync makes either our new link or a concurrent creator's link
+        # durable before either caller may proceed toward a network connection.
+        os.fsync(root_descriptor)
+        os.unlink(temporary.name, dir_fd=root_descriptor)
+        temporary = Path()
+        os.fsync(root_descriptor)
+    finally:
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+        if temporary != Path():
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
+
+
+def _ensure_campaign_authority(
+    root: Path,
+    *,
+    root_identity: tuple[int, int],
+    config: M8L2StudyConfig,
+    source: CaptureSourceIdentity,
+    runtime: _RuntimeFingerprint,
+) -> _CampaignAuthority:
+    path = root / _CAMPAIGN_AUTHORITY_NAME
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        _create_campaign_authority_once(
+            root,
+            root_identity=root_identity,
+            raw=_canonical_json_bytes(
+                _campaign_payload(
+                    config=config,
+                    source=source,
+                    runtime=runtime,
+                    nonce=secrets.token_hex(32),
+                    root=root,
+                    root_identity=root_identity,
+                )
+            ),
+        )
+    except OSError as error:
+        raise M8L2CaptureSystemError(
+            f"cannot inspect live-L2 campaign authority: {path}"
+        ) from error
+    return _verify_campaign_authority(
+        root,
+        root_identity=root_identity,
+        config=config,
+        source=source,
+        runtime=runtime,
+    )
+
+
+def _verify_bundled_campaign_authority(
+    path: Path,
+    *,
+    config: M8L2StudyConfig,
+    source: CaptureSourceIdentity,
+    expected_sha256: str,
+) -> _CampaignAuthority:
+    raw = _read_bounded_regular_nofollow(
+        path,
+        label="bundled live-L2 campaign authority",
+        maximum_bytes=_MAX_CAMPAIGN_AUTHORITY_BYTES,
+    )
+    return _validate_campaign_bytes(
+        raw,
+        path=path,
+        config=config,
+        source=source,
+        expected_sha256=expected_sha256,
+    )
+
+
 def _fsync_tree(root: Path) -> None:
     files, directories = _walk_regular_evidence(root)
     for path in files:
@@ -1406,9 +2179,13 @@ def _publish_terminal(
     stage: Path,
     target: Path,
     config: M8L2StudyConfig,
+    protocol: Path,
     session: M8L2Session,
     session_id: str,
     source: CaptureSourceIdentity,
+    runtime: _RuntimeFingerprint,
+    source_identity_was_injected: bool,
+    campaign: _CampaignAuthority,
     status: SessionStatus,
     reason_codes: Sequence[str],
     phase_ledger: Sequence[Mapping[str, object]],
@@ -1420,6 +2197,22 @@ def _publish_terminal(
     root_identity: tuple[int, int],
     sessions_identity: tuple[int, int],
 ) -> M8L2SessionBundle:
+    observed_campaign = _verify_campaign_authority(
+        target.parent.parent,
+        root_identity=root_identity,
+        config=config,
+        source=source,
+        runtime=runtime,
+        expected_sha256=campaign.sha256,
+    )
+    if observed_campaign.raw != campaign.raw:
+        raise M8L2CaptureSystemError("live-L2 campaign authority bytes changed")
+    _verify_bundled_campaign_authority(
+        stage / "authority" / _CAMPAIGN_AUTHORITY_NAME,
+        config=config,
+        source=source,
+        expected_sha256=campaign.sha256,
+    )
     authority_inventory = _inventory(stage)
     marker_name = _COMPLETE_MARKER if status == "COMPLETE" else _INSUFFICIENT_MARKER
     manifest_payload: dict[str, object] = {
@@ -1448,6 +2241,7 @@ def _publish_terminal(
             "capture_finished_ns": capture_finished_ns,
         },
         "authority": {
+            "campaign_authority_sha256": campaign.sha256,
             "config_sha256": config.hash,
             "config_source_sha256": config.source_sha256,
             "protocol_sha256": M8_L2_PROTOCOL_SHA256,
@@ -1455,6 +2249,8 @@ def _publish_terminal(
             "runtime_commit": source.commit,
             "runtime_source_tree_sha256": source.source_tree_sha256,
             "runtime_dirty": source.dirty,
+            "runtime_fingerprint": campaign.runtime.payload(),
+            "runtime_fingerprint_sha256": campaign.runtime.sha256,
         },
         "symbols": {
             symbol: _symbol_payload(result, stage_root=stage)
@@ -1478,6 +2274,25 @@ def _publish_terminal(
     write_json(manifest_path, manifest_payload)
     _write_checksums(stage)
     _fsync_tree(stage)
+    _revalidate_runtime_authority(
+        config=config,
+        protocol=protocol,
+        expected_source=source,
+        expected_runtime=runtime,
+        source_identity_was_injected=source_identity_was_injected,
+    )
+    marker_campaign = _verify_campaign_authority(
+        target.parent.parent,
+        root_identity=root_identity,
+        config=config,
+        source=source,
+        runtime=runtime,
+        expected_sha256=campaign.sha256,
+    )
+    if marker_campaign.raw != campaign.raw:
+        raise M8L2CaptureSystemError(
+            "live-L2 campaign authority changed immediately before marker materialization"
+        )
     marker_path = stage / marker_name
     _write_bytes_durable(
         marker_path,
@@ -1507,6 +2322,25 @@ def _publish_terminal(
             os.fstat(target_parent_descriptor).st_ino,
         ) != sessions_identity:
             raise M8L2CaptureSystemError("live-L2 target parent identity changed before rename")
+        _revalidate_runtime_authority(
+            config=config,
+            protocol=protocol,
+            expected_source=source,
+            expected_runtime=runtime,
+            source_identity_was_injected=source_identity_was_injected,
+        )
+        final_campaign = _verify_campaign_authority(
+            target.parent.parent,
+            root_identity=root_identity,
+            config=config,
+            source=source,
+            runtime=runtime,
+            expected_sha256=campaign.sha256,
+        )
+        if final_campaign.raw != campaign.raw:
+            raise M8L2CaptureSystemError(
+                "live-L2 campaign authority changed immediately before terminal publication"
+            )
         os.rename(
             stage.name,
             target.name,
@@ -1559,7 +2393,11 @@ def _retain_system_failure(
         )
         _fsync_tree(stage)
         incomplete_root = output_root / "incomplete"
+        _reject_existing_symlink_components(
+            incomplete_root, label="live-L2 incomplete-evidence directory"
+        )
         incomplete_root.mkdir(parents=True, exist_ok=True)
+        _directory_identity(incomplete_root, label="live-L2 incomplete-evidence directory")
         destination = incomplete_root / f"SYSTEM_FAILURE-{session_id[:20]}-{stage.name[-12:]}"
         if destination.exists():
             raise FileExistsError(destination)
@@ -1581,9 +2419,13 @@ def _publish_or_retain_system_failure(
     target: Path,
     output_root: Path,
     config: M8L2StudyConfig,
+    protocol: Path,
     session: M8L2Session,
     session_id: str,
     source: CaptureSourceIdentity,
+    runtime: _RuntimeFingerprint,
+    source_identity_was_injected: bool,
+    campaign: _CampaignAuthority,
     status: SessionStatus,
     reason_codes: Sequence[str],
     phase_ledger: Sequence[Mapping[str, object]],
@@ -1602,9 +2444,13 @@ def _publish_or_retain_system_failure(
             stage=stage,
             target=target,
             config=config,
+            protocol=protocol,
             session=session,
             session_id=session_id,
             source=source,
+            runtime=runtime,
+            source_identity_was_injected=source_identity_was_injected,
+            campaign=campaign,
             status=status,
             reason_codes=reason_codes,
             phase_ledger=phase_ledger,
@@ -1696,6 +2542,7 @@ async def capture_m8_l2_session(
     protocol_path: str | Path | None = None,
     clock: CaptureClock | None = None,
     _test_source_identity: CaptureSourceIdentity | None = None,
+    _test_allow_injected_capture: bool = False,
 ) -> M8L2SessionBundle:
     """Capture both symbols under one absolute-time, immutable session authority."""
 
@@ -1729,17 +2576,42 @@ async def capture_m8_l2_session(
         raise M8L2CaptureSystemError(
             "test source identity injection requires an explicitly injected test clock"
         )
+    if _test_allow_injected_capture and clock is None:
+        raise M8L2CaptureSystemError(
+            "test capture injection requires an explicitly injected test clock"
+        )
     source_identity_was_injected = _test_source_identity is not None
+    if not source_identity_was_injected:
+        _assert_loaded_source_root(project_root)
+    if not source_identity_was_injected and not _test_allow_injected_capture:
+        # These private keyword-only values are unit-test seams for injected
+        # collectors.  The production CLI supplies neither and therefore
+        # cannot bypass the exact adapter-origin gate.
+        _assert_production_capture_origin(project_root, capture_one)
     source = _test_source_identity or _source_identity(project_root)
     _validate_source_identity(source)
+    runtime = _runtime_fingerprint()
     _revalidate_runtime_authority(
         config=config,
         protocol=protocol,
         expected_source=source,
+        expected_runtime=runtime,
         source_identity_was_injected=source_identity_was_injected,
     )
-    session_id = _session_identity(config=config, session=session, source=source)
     root, root_identity, sessions_identity = _prepare_output_root(output_root)
+    campaign = _ensure_campaign_authority(
+        root,
+        root_identity=root_identity,
+        config=config,
+        source=source,
+        runtime=runtime,
+    )
+    session_id = _session_identity(
+        config=config,
+        session=session,
+        source=source,
+        campaign_authority_sha256=campaign.sha256,
+    )
     target = _terminal_root(root, session, session_id)
     _revalidate_output_layout(
         root,
@@ -1755,6 +2627,10 @@ async def capture_m8_l2_session(
     authority_root.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(config.path, authority_root / "m8_l2_capture_study.toml")
     shutil.copyfile(protocol, authority_root / "M8_L2_PROTOCOL.md")
+    _write_bytes_durable(
+        authority_root / _CAMPAIGN_AUTHORITY_NAME,
+        campaign.raw,
+    )
     capture_clock = clock or _SystemClock()
     now = capture_clock.time_ns()
     phase_ledger: list[dict[str, object]] = [
@@ -1774,9 +2650,13 @@ async def capture_m8_l2_session(
             target=target,
             output_root=root,
             config=config,
+            protocol=protocol,
             session=session,
             session_id=session_id,
             source=source,
+            runtime=runtime,
+            source_identity_was_injected=source_identity_was_injected,
+            campaign=campaign,
             status="INSUFFICIENT_DATA",
             reason_codes=("MISSED_WINDOW",),
             phase_ledger=phase_ledger,
@@ -1801,7 +2681,16 @@ async def capture_m8_l2_session(
                 config=config,
                 protocol=protocol,
                 expected_source=source,
+                expected_runtime=runtime,
                 source_identity_was_injected=source_identity_was_injected,
+            )
+            _verify_campaign_authority(
+                root,
+                root_identity=root_identity,
+                config=config,
+                source=source,
+                runtime=runtime,
+                expected_sha256=campaign.sha256,
             )
         except BaseException as error:
             evidence_root = _retain_system_failure(
@@ -1828,9 +2717,13 @@ async def capture_m8_l2_session(
             target=target,
             output_root=root,
             config=config,
+            protocol=protocol,
             session=session,
             session_id=session_id,
             source=source,
+            runtime=runtime,
+            source_identity_was_injected=source_identity_was_injected,
+            campaign=campaign,
             status="INSUFFICIENT_DATA",
             reason_codes=("MISSED_WINDOW",),
             phase_ledger=phase_ledger,
@@ -1849,7 +2742,16 @@ async def capture_m8_l2_session(
             config=config,
             protocol=protocol,
             expected_source=source,
+            expected_runtime=runtime,
             source_identity_was_injected=source_identity_was_injected,
+        )
+        _verify_campaign_authority(
+            root,
+            root_identity=root_identity,
+            config=config,
+            source=source,
+            runtime=runtime,
+            expected_sha256=campaign.sha256,
         )
     except BaseException as error:
         evidence_root = _retain_system_failure(
@@ -1979,7 +2881,16 @@ async def capture_m8_l2_session(
             config=config,
             protocol=protocol,
             expected_source=source,
+            expected_runtime=runtime,
             source_identity_was_injected=source_identity_was_injected,
+        )
+        _verify_campaign_authority(
+            root,
+            root_identity=root_identity,
+            config=config,
+            source=source,
+            runtime=runtime,
+            expected_sha256=campaign.sha256,
         )
         gates, gate_reasons, overlap_ns = _evaluate_gates(results, config=config)
     except BaseException as error:
@@ -2010,9 +2921,13 @@ async def capture_m8_l2_session(
         target=target,
         output_root=root,
         config=config,
+        protocol=protocol,
         session=session,
         session_id=session_id,
         source=source,
+        runtime=runtime,
+        source_identity_was_injected=source_identity_was_injected,
+        campaign=campaign,
         status=status,
         reason_codes=all_reasons,
         phase_ledger=phase_ledger,
@@ -2293,6 +3208,7 @@ def verify_m8_l2_session_bundle(
         raise M8L2VerificationError("session manifest has an invalid session_id")
     authority = _manifest_object(payload.get("authority"), "session authority")
     if set(authority) != {
+        "campaign_authority_sha256",
         "config_sha256",
         "config_source_sha256",
         "protocol_sha256",
@@ -2300,10 +3216,13 @@ def verify_m8_l2_session_bundle(
         "runtime_commit",
         "runtime_source_tree_sha256",
         "runtime_dirty",
+        "runtime_fingerprint",
+        "runtime_fingerprint_sha256",
     }:
         raise M8L2VerificationError("session authority keys differ from the exact schema")
     config_path = root / "authority" / "m8_l2_capture_study.toml"
     protocol_path = root / "authority" / "M8_L2_PROTOCOL.md"
+    campaign_path = root / "authority" / _CAMPAIGN_AUTHORITY_NAME
     try:
         bundled_config = load_m8_l2_config(config_path)
     except (OSError, ValueError) as error:
@@ -2325,6 +3244,34 @@ def verify_m8_l2_session_bundle(
         _validate_source_identity(source)
     except M8L2CaptureSystemError as error:
         raise M8L2VerificationError(f"invalid runtime source identity: {error}") from error
+    campaign_sha256 = authority.get("campaign_authority_sha256")
+    if type(campaign_sha256) is not str or not _is_lower_sha256(campaign_sha256):
+        raise M8L2VerificationError("session campaign authority digest is invalid")
+    try:
+        bundled_campaign = _verify_bundled_campaign_authority(
+            campaign_path,
+            config=bundled_config,
+            source=source,
+            expected_sha256=campaign_sha256,
+        )
+    except M8L2CaptureSystemError as error:
+        raise M8L2VerificationError(f"invalid bundled campaign authority: {error}") from error
+    try:
+        manifest_runtime = _runtime_from_recorded(
+            authority.get("runtime_fingerprint"),
+            authority.get("runtime_fingerprint_sha256"),
+        )
+    except M8L2CaptureSystemError as error:
+        raise M8L2VerificationError(f"invalid session runtime fingerprint: {error}") from error
+    if manifest_runtime != bundled_campaign.runtime:
+        raise M8L2VerificationError(
+            "session runtime fingerprint differs from bundled campaign authority"
+        )
+    campaign_relative = f"authority/{_CAMPAIGN_AUTHORITY_NAME}"
+    if checksums.get(campaign_relative) != campaign_sha256:
+        raise M8L2VerificationError(
+            "session checksum authority does not bind the campaign authority digest"
+        )
     if sha256_file(config_path) != M8_L2_CONFIG_SOURCE_SHA256:
         raise M8L2VerificationError("bundled live-L2 config bytes are corrupt")
     if sha256_file(protocol_path) != M8_L2_PROTOCOL_SHA256:
@@ -2418,7 +3365,10 @@ def verify_m8_l2_session_bundle(
         raise M8L2VerificationError("session capture_finished_ns is invalid")
 
     recomputed_session_id = _session_identity(
-        config=bundled_config, session=frozen_session, source=source
+        config=bundled_config,
+        session=frozen_session,
+        source=source,
+        campaign_authority_sha256=campaign_sha256,
     )
     if session_id != recomputed_session_id:
         raise M8L2VerificationError("session_id does not derive from the frozen authority")
@@ -2499,6 +3449,7 @@ __all__ = [
     "ObservedInterval",
     "SymbolCaptureResult",
     "capture_m8_l2_session",
+    "current_m8_l2_runtime_fingerprint_sha256",
     "merge_observed_intervals",
     "overlapping_observed_coverage_ns",
     "verify_m8_l2_session_bundle",

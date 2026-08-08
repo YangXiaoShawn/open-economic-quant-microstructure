@@ -5,7 +5,9 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import stat
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,6 +15,7 @@ import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import pytest
 
+import microstructure.m8_l2_binance as binance_module
 import microstructure.m8_l2_capture as l2_module
 from microstructure.data.schemas import SCHEMA_VERSION, get_schema
 from microstructure.m8_l2_capture import (
@@ -25,6 +28,7 @@ from microstructure.m8_l2_capture import (
     ObservedInterval,
     SymbolCaptureResult,
     capture_m8_l2_session,
+    current_m8_l2_runtime_fingerprint_sha256,
     merge_observed_intervals,
     overlapping_observed_coverage_ns,
     verify_m8_l2_session_bundle,
@@ -333,24 +337,24 @@ def _manifest(bundle_root: Path) -> dict[str, object]:
     return value
 
 
-def _refresh_manifest_checksum(bundle_root: Path) -> None:
+def _refresh_manifest_checksum(bundle_root: Path, *other_paths: str) -> None:
     checksum_path = bundle_root / "CHECKSUMS.sha256"
+    refreshed = {"session_manifest.json", *other_paths}
     entries: list[str] = []
     for line in checksum_path.read_text(encoding="ascii").splitlines():
         relative = line[66:]
-        digest = (
-            sha256_file(bundle_root / "session_manifest.json")
-            if relative == "session_manifest.json"
-            else line[:64]
-        )
+        digest = sha256_file(bundle_root / relative) if relative in refreshed else line[:64]
         entries.append(f"{digest}  {relative}\n")
     checksum_path.write_text("".join(entries), encoding="ascii")
 
 
-def _complete_bundle(tmp_path: Path) -> tuple[M8L2SessionBundle, M8L2StudyConfig, M8L2Session]:
-    config = load_m8_l2_config(CONFIG_PATH)
-    session = config.sessions[0]
-
+def _capture_complete_session(
+    output_root: Path,
+    *,
+    config: M8L2StudyConfig,
+    session: M8L2Session,
+    source: CaptureSourceIdentity = SOURCE,
+) -> M8L2SessionBundle:
     async def capture_one(**kwargs: object) -> SymbolCaptureResult:
         return _complete_result(
             symbol=str(kwargs["symbol"]),
@@ -359,18 +363,546 @@ def _complete_bundle(tmp_path: Path) -> tuple[M8L2SessionBundle, M8L2StudyConfig
             end_ns=session.end_ns,
         )
 
-    bundle = asyncio.run(
+    return asyncio.run(
         capture_m8_l2_session(
             config,
             session.date.isoformat(),
-            tmp_path,
+            output_root,
             capture_one,
             protocol_path=PROTOCOL_PATH,
             clock=FakeClock(session.start_ns, finish_ns=session.end_ns),
-            _test_source_identity=SOURCE,
+            _test_source_identity=source,
         )
     )
+
+
+def _complete_bundle(tmp_path: Path) -> tuple[M8L2SessionBundle, M8L2StudyConfig, M8L2Session]:
+    config = load_m8_l2_config(CONFIG_PATH)
+    session = config.sessions[0]
+    bundle = _capture_complete_session(
+        tmp_path,
+        config=config,
+        session=session,
+    )
     return bundle, config, session
+
+
+def test_one_exact_campaign_authority_binds_all_four_frozen_sessions(tmp_path: Path) -> None:
+    config = load_m8_l2_config(CONFIG_PATH)
+    bundles = [
+        _capture_complete_session(
+            tmp_path,
+            config=config,
+            session=session,
+        )
+        for session in config.sessions
+    ]
+
+    campaign_path = tmp_path / "campaign_authority.json"
+    campaign_raw = campaign_path.read_bytes()
+    campaign_sha256 = hashlib.sha256(campaign_raw).hexdigest()
+    campaign = read_json(campaign_path)
+    campaign_nonce = campaign.pop("campaign_nonce")
+    output_root = campaign.pop("output_root")
+    runtime_fingerprint = campaign.pop("runtime_fingerprint")
+    runtime_fingerprint_sha256 = campaign.pop("runtime_fingerprint_sha256")
+    assert campaign == {
+        "schema_version": "m8-live-l2-campaign-authority-v2",
+        "artifact_kind": "m8_prospective_live_l2_campaign_authority",
+        "config_sha256": config.hash,
+        "config_source_sha256": config.source_sha256,
+        "protocol_sha256": l2_module.M8_L2_PROTOCOL_SHA256,
+        "protocol_freeze_commit": l2_module.M8_L2_FREEZE_COMMIT,
+        "runtime_commit": SOURCE.commit,
+        "runtime_source_tree_sha256": SOURCE.source_tree_sha256,
+        "runtime_dirty": False,
+    }
+    assert isinstance(campaign_nonce, str)
+    assert len(campaign_nonce) == 64
+    assert all(character in "0123456789abcdef" for character in campaign_nonce)
+    root_metadata = tmp_path.stat()
+    assert output_root == {
+        "canonical_path": str(tmp_path),
+        "device": root_metadata.st_dev,
+        "inode": root_metadata.st_ino,
+    }
+    runtime = l2_module._runtime_fingerprint()
+    assert runtime_fingerprint == runtime.payload()
+    assert runtime_fingerprint_sha256 == runtime.sha256
+    assert len({bundle.session_id for bundle in bundles}) == 4
+    for bundle in bundles:
+        payload = _manifest(bundle.root)
+        assert payload["schema_version"] == "m8-live-l2-session-v3"
+        authority = payload["authority"]
+        assert isinstance(authority, dict)
+        assert authority["campaign_authority_sha256"] == campaign_sha256
+        bundled_campaign = bundle.root / "authority" / "campaign_authority.json"
+        assert bundled_campaign.read_bytes() == campaign_raw
+        assert verify_m8_l2_session_bundle(bundle.root, expected_config=config) == bundle
+
+
+def test_public_runtime_fingerprint_helper_matches_canonical_campaign_digest() -> None:
+    observed = current_m8_l2_runtime_fingerprint_sha256()
+
+    assert observed == l2_module._runtime_fingerprint().sha256
+    assert len(observed) == 64
+    assert all(character in "0123456789abcdef" for character in observed)
+    assert "current_m8_l2_runtime_fingerprint_sha256" in l2_module.__all__
+
+
+def test_changed_clean_source_cannot_replace_or_extend_campaign_before_capture(
+    tmp_path: Path,
+) -> None:
+    first, config, _ = _complete_bundle(tmp_path)
+    changed = CaptureSourceIdentity(
+        commit="3" * 40,
+        source_tree_sha256="4" * 64,
+        dirty=False,
+    )
+    calls = 0
+
+    async def never(**kwargs: object) -> SymbolCaptureResult:
+        nonlocal calls
+        calls += 1
+        raise AssertionError(kwargs)
+
+    for session in (config.sessions[0], config.sessions[1]):
+        with pytest.raises(M8L2CaptureSystemError, match="campaign authority differs"):
+            asyncio.run(
+                capture_m8_l2_session(
+                    config,
+                    session.date.isoformat(),
+                    tmp_path,
+                    never,
+                    protocol_path=PROTOCOL_PATH,
+                    clock=FakeClock(session.start_ns),
+                    _test_source_identity=changed,
+                )
+            )
+
+    assert calls == 0
+    assert list((tmp_path / "sessions").iterdir()) == [first.root]
+    assert not list(tmp_path.glob(".m8-l2-*"))
+
+
+def test_git_status_failure_with_empty_output_precedes_campaign_and_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_m8_l2_config(CONFIG_PATH)
+    session = config.sessions[0]
+    output_root = tmp_path / "capture-output"
+    calls = 0
+
+    def failed_status(arguments: list[str], **kwargs: object) -> object:
+        if arguments[1:] == ["rev-parse", "HEAD"]:
+            return l2_module.subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout=f"{'1' * 40}\n",
+                stderr="",
+            )
+        if arguments[1:] == ["status", "--porcelain=v1", "--untracked-files=normal"]:
+            return l2_module.subprocess.CompletedProcess(
+                arguments,
+                7,
+                stdout="",
+                stderr="status unavailable",
+            )
+        raise AssertionError((arguments, kwargs))
+
+    async def never(**kwargs: object) -> SymbolCaptureResult:
+        nonlocal calls
+        calls += 1
+        raise AssertionError(kwargs)
+
+    monkeypatch.setattr(l2_module.subprocess, "run", failed_status)
+    with pytest.raises(M8L2CaptureSystemError, match="status lookup failed with exit 7"):
+        asyncio.run(
+            capture_m8_l2_session(
+                config,
+                session.date.isoformat(),
+                output_root,
+                never,
+                protocol_path=PROTOCOL_PATH,
+                clock=FakeClock(session.start_ns),
+                _test_allow_injected_capture=True,
+            )
+        )
+
+    assert calls == 0
+    assert not output_root.exists()
+
+
+def test_wrong_import_origin_precedes_git_campaign_and_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_m8_l2_config(CONFIG_PATH)
+    session = config.sessions[0]
+    foreign_module = tmp_path / "foreign" / "m8_l2_capture.py"
+    foreign_module.parent.mkdir()
+    foreign_module.write_text("# wrong checkout\n", encoding="utf-8")
+    output_root = tmp_path / "capture-output"
+    git_calls = 0
+    adapter_calls = 0
+
+    def no_git(*args: object, **kwargs: object) -> object:
+        nonlocal git_calls
+        git_calls += 1
+        raise AssertionError((args, kwargs))
+
+    async def never(**kwargs: object) -> SymbolCaptureResult:
+        nonlocal adapter_calls
+        adapter_calls += 1
+        raise AssertionError(kwargs)
+
+    monkeypatch.setattr(l2_module, "__file__", str(foreign_module))
+    monkeypatch.setattr(l2_module.subprocess, "run", no_git)
+    with pytest.raises(M8L2CaptureSystemError, match="does not come from the hashed"):
+        asyncio.run(
+            capture_m8_l2_session(
+                config,
+                session.date.isoformat(),
+                output_root,
+                never,
+                protocol_path=PROTOCOL_PATH,
+                clock=FakeClock(session.start_ns),
+                _test_allow_injected_capture=True,
+            )
+        )
+
+    assert git_calls == 0
+    assert adapter_calls == 0
+    assert not output_root.exists()
+
+
+def test_foreign_production_adapter_origin_precedes_git_and_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_m8_l2_config(CONFIG_PATH)
+    session = config.sessions[0]
+    output_root = tmp_path / "capture-output"
+    foreign_module = tmp_path / "foreign" / "m8_l2_binance.py"
+    foreign_module.parent.mkdir()
+    foreign_module.write_text("# mixed editable checkout\n", encoding="utf-8")
+    git_calls = 0
+    capture_calls = 0
+
+    def no_git(*args: object, **kwargs: object) -> object:
+        nonlocal git_calls
+        git_calls += 1
+        raise AssertionError((args, kwargs))
+
+    async def no_capture(*args: object, **kwargs: object) -> SymbolCaptureResult:
+        nonlocal capture_calls
+        capture_calls += 1
+        raise AssertionError((args, kwargs))
+
+    monkeypatch.setattr(binance_module, "__file__", str(foreign_module))
+    monkeypatch.setattr(binance_module.BinanceM8L2Capture, "__call__", no_capture)
+    monkeypatch.setattr(l2_module.subprocess, "run", no_git)
+    with pytest.raises(M8L2CaptureSystemError, match="foreign or mixed import origin"):
+        asyncio.run(
+            capture_m8_l2_session(
+                config,
+                session.date.isoformat(),
+                output_root,
+                binance_module.BinanceM8L2Capture(),
+                protocol_path=PROTOCOL_PATH,
+                clock=FakeClock(session.start_ns),
+            )
+        )
+
+    assert git_calls == 0
+    assert capture_calls == 0
+    assert not output_root.exists()
+
+
+def test_campaign_tamper_and_symlink_fail_before_capture(tmp_path: Path) -> None:
+    tampered_root = tmp_path / "tampered"
+    _, config, _ = _complete_bundle(tampered_root)
+    campaign_path = tampered_root / "campaign_authority.json"
+    campaign = read_json(campaign_path)
+    assert isinstance(campaign, dict)
+    campaign["runtime_source_tree_sha256"] = "5" * 64
+    write_json(campaign_path, campaign)
+    calls = 0
+
+    async def never(**kwargs: object) -> SymbolCaptureResult:
+        nonlocal calls
+        calls += 1
+        raise AssertionError(kwargs)
+
+    validation = config.sessions[1]
+    with pytest.raises(M8L2CaptureSystemError, match="campaign authority differs"):
+        asyncio.run(
+            capture_m8_l2_session(
+                config,
+                validation.date.isoformat(),
+                tampered_root,
+                never,
+                protocol_path=PROTOCOL_PATH,
+                clock=FakeClock(validation.start_ns),
+                _test_source_identity=SOURCE,
+            )
+        )
+
+    symlink_root = tmp_path / "symlinked"
+    _complete_bundle(symlink_root)
+    authority_path = symlink_root / "campaign_authority.json"
+    preserved = tmp_path / "preserved-campaign-authority.json"
+    preserved.write_bytes(authority_path.read_bytes())
+    authority_path.unlink()
+    authority_path.symlink_to(preserved)
+    with pytest.raises(M8L2CaptureSystemError, match="symlink"):
+        asyncio.run(
+            capture_m8_l2_session(
+                config,
+                validation.date.isoformat(),
+                symlink_root,
+                never,
+                protocol_path=PROTOCOL_PATH,
+                clock=FakeClock(validation.start_ns),
+                _test_source_identity=SOURCE,
+            )
+        )
+    assert calls == 0
+
+
+def test_runtime_drift_before_later_session_rejects_without_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, config, _ = _complete_bundle(tmp_path)
+    actual = l2_module._runtime_fingerprint()
+    drifted_payload = actual.payload()
+    python_payload = drifted_payload["python"]
+    assert isinstance(python_payload, dict)
+    python_payload["version"] = f"{python_payload['version']}-drift"
+    drifted = l2_module._runtime_from_recorded(
+        drifted_payload, l2_module._stable_sha256(drifted_payload)
+    )
+    calls = 0
+
+    async def never(**kwargs: object) -> SymbolCaptureResult:
+        nonlocal calls
+        calls += 1
+        raise AssertionError(kwargs)
+
+    monkeypatch.setattr(l2_module, "_runtime_fingerprint", lambda: drifted)
+    validation = config.sessions[1]
+    with pytest.raises(M8L2CaptureSystemError, match="current production runtime"):
+        asyncio.run(
+            capture_m8_l2_session(
+                config,
+                validation.date.isoformat(),
+                tmp_path,
+                never,
+                protocol_path=PROTOCOL_PATH,
+                clock=FakeClock(validation.start_ns),
+                _test_source_identity=SOURCE,
+            )
+        )
+
+    assert calls == 0
+    assert len(list((tmp_path / "sessions").iterdir())) == 1
+
+
+def test_same_source_in_two_roots_has_distinct_campaign_and_session_identity(
+    tmp_path: Path,
+) -> None:
+    config = load_m8_l2_config(CONFIG_PATH)
+    session = config.sessions[0]
+    first = _capture_complete_session(tmp_path / "first", config=config, session=session)
+    second = _capture_complete_session(tmp_path / "second", config=config, session=session)
+
+    first_campaign = sha256_file(tmp_path / "first" / "campaign_authority.json")
+    second_campaign = sha256_file(tmp_path / "second" / "campaign_authority.json")
+    assert first_campaign != second_campaign
+    assert first.session_id != second.session_id
+
+
+def test_copied_campaign_or_root_cannot_be_reused(tmp_path: Path) -> None:
+    first_root = tmp_path / "first"
+    _, config, _ = _complete_bundle(first_root)
+    copied_root = tmp_path / "copied"
+    shutil.copytree(first_root, copied_root)
+    validation = config.sessions[1]
+    calls = 0
+
+    async def never(**kwargs: object) -> SymbolCaptureResult:
+        nonlocal calls
+        calls += 1
+        raise AssertionError(kwargs)
+
+    with pytest.raises(M8L2CaptureSystemError, match="current output-root identity"):
+        asyncio.run(
+            capture_m8_l2_session(
+                config,
+                validation.date.isoformat(),
+                copied_root,
+                never,
+                protocol_path=PROTOCOL_PATH,
+                clock=FakeClock(validation.start_ns),
+                _test_source_identity=SOURCE,
+            )
+        )
+
+    assert calls == 0
+
+
+def test_concurrent_campaign_creation_converges_on_one_exact_authority(tmp_path: Path) -> None:
+    config = load_m8_l2_config(CONFIG_PATH)
+    root, root_identity, _ = l2_module._prepare_output_root(tmp_path)
+    runtime = l2_module._runtime_fingerprint()
+
+    def create() -> l2_module._CampaignAuthority:
+        return l2_module._ensure_campaign_authority(
+            root,
+            root_identity=root_identity,
+            config=config,
+            source=SOURCE,
+            runtime=runtime,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(create) for _ in range(8)]
+        authorities = [future.result() for future in futures]
+
+    campaign = l2_module._verify_campaign_authority(
+        root,
+        root_identity=root_identity,
+        config=config,
+        source=SOURCE,
+        runtime=runtime,
+    )
+    assert {authority.sha256 for authority in authorities} == {campaign.sha256}
+    assert {authority.nonce for authority in authorities} == {campaign.nonce}
+    assert campaign.sha256 == hashlib.sha256(campaign.raw).hexdigest()
+    assert not list(root.glob(".campaign-authority-*"))
+
+
+def test_first_campaign_write_fsyncs_file_before_link_and_directory_after_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_m8_l2_config(CONFIG_PATH)
+    root, root_identity, _ = l2_module._prepare_output_root(tmp_path)
+    real_fsync = l2_module.os.fsync
+    real_link = l2_module.os.link
+    file_fsynced_before_link = False
+    linked = False
+    directory_fsynced_after_link = False
+
+    def observed_fsync(descriptor: int) -> None:
+        nonlocal file_fsynced_before_link, directory_fsynced_after_link
+        metadata = os.fstat(descriptor)
+        if stat.S_ISREG(metadata.st_mode) and not linked:
+            file_fsynced_before_link = True
+        if stat.S_ISDIR(metadata.st_mode) and linked:
+            directory_fsynced_after_link = True
+        real_fsync(descriptor)
+
+    def observed_link(source: object, destination: object, **kwargs: object) -> None:
+        nonlocal linked
+        assert file_fsynced_before_link
+        real_link(source, destination, **kwargs)
+        linked = True
+
+    monkeypatch.setattr(l2_module.os, "fsync", observed_fsync)
+    monkeypatch.setattr(l2_module.os, "link", observed_link)
+    campaign = l2_module._ensure_campaign_authority(
+        root,
+        root_identity=root_identity,
+        config=config,
+        source=SOURCE,
+        runtime=l2_module._runtime_fingerprint(),
+    )
+
+    assert campaign.path == root / "campaign_authority.json"
+    assert linked
+    assert directory_fsynced_after_link
+
+
+def test_bundle_verifier_rejects_rechecksummed_campaign_forgery(tmp_path: Path) -> None:
+    bundle, _, _ = _complete_bundle(tmp_path)
+    campaign_relative = "authority/campaign_authority.json"
+    campaign_path = bundle.root / campaign_relative
+    campaign = read_json(campaign_path)
+    assert isinstance(campaign, dict)
+    campaign["runtime_source_tree_sha256"] = "6" * 64
+    write_json(campaign_path, campaign)
+    forged_sha256 = sha256_file(campaign_path)
+    payload = _manifest(bundle.root)
+    authority = payload["authority"]
+    assert isinstance(authority, dict)
+    authority["campaign_authority_sha256"] = forged_sha256
+    write_json(bundle.manifest_path, payload)
+    _refresh_manifest_checksum(bundle.root, campaign_relative)
+
+    with pytest.raises(M8L2VerificationError, match="bundled campaign authority"):
+        verify_m8_l2_session_bundle(bundle.root)
+
+
+def test_bundle_verifier_rejects_runtime_tamper_and_coherent_rehash(tmp_path: Path) -> None:
+    plain_bundle, _, _ = _complete_bundle(tmp_path / "plain")
+    plain_payload = _manifest(plain_bundle.root)
+    plain_authority = plain_payload["authority"]
+    assert isinstance(plain_authority, dict)
+    plain_runtime = plain_authority["runtime_fingerprint"]
+    assert isinstance(plain_runtime, dict)
+    plain_dependencies = plain_runtime["dependencies"]
+    assert isinstance(plain_dependencies, dict)
+    plain_dependencies["polars"] = "forged"
+    write_json(plain_bundle.manifest_path, plain_payload)
+    _refresh_manifest_checksum(plain_bundle.root)
+    with pytest.raises(M8L2VerificationError, match="runtime fingerprint"):
+        verify_m8_l2_session_bundle(plain_bundle.root)
+
+    forged_bundle, _, _ = _complete_bundle(tmp_path / "coherent")
+    campaign_relative = "authority/campaign_authority.json"
+    campaign_path = forged_bundle.root / campaign_relative
+    campaign = read_json(campaign_path)
+    assert isinstance(campaign, dict)
+    runtime_payload = campaign["runtime_fingerprint"]
+    assert isinstance(runtime_payload, dict)
+    dependencies = runtime_payload["dependencies"]
+    assert isinstance(dependencies, dict)
+    dependencies["polars"] = "forged"
+    runtime_sha256 = l2_module._stable_sha256(runtime_payload)
+    campaign["runtime_fingerprint_sha256"] = runtime_sha256
+    write_json(campaign_path, campaign)
+    campaign_sha256 = sha256_file(campaign_path)
+
+    payload = _manifest(forged_bundle.root)
+    authority = payload["authority"]
+    assert isinstance(authority, dict)
+    authority["runtime_fingerprint"] = runtime_payload
+    authority["runtime_fingerprint_sha256"] = runtime_sha256
+    authority["campaign_authority_sha256"] = campaign_sha256
+    inventory = payload["artifact_inventory"]
+    assert isinstance(inventory, list)
+    campaign_entry = next(
+        item
+        for item in inventory
+        if isinstance(item, dict) and item.get("path") == campaign_relative
+    )
+    campaign_entry["sha256"] = campaign_sha256
+    campaign_entry["bytes"] = campaign_path.stat().st_size
+    write_json(forged_bundle.manifest_path, payload)
+    _refresh_manifest_checksum(forged_bundle.root, campaign_relative)
+
+    with pytest.raises(M8L2VerificationError, match="session_id"):
+        verify_m8_l2_session_bundle(forged_bundle.root)
+
+
+def test_bundle_verifier_does_not_depend_on_current_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle, config, _ = _complete_bundle(tmp_path)
+
+    def forbidden() -> object:
+        raise AssertionError("offline verification must not inspect the current runtime")
+
+    monkeypatch.setattr(l2_module, "_runtime_fingerprint", forbidden)
+    assert verify_m8_l2_session_bundle(bundle.root, expected_config=config) == bundle
 
 
 def test_observed_interval_union_and_cross_symbol_intersection_do_not_bridge_gaps() -> None:
@@ -615,6 +1147,44 @@ def test_system_fault_is_nonterminal_and_preserves_raw_evidence(
     assert not list((tmp_path / "sessions").glob("*"))
 
 
+def test_system_failure_never_follows_preexisting_incomplete_symlink(
+    tmp_path: Path,
+) -> None:
+    config = load_m8_l2_config(CONFIG_PATH)
+    session = config.sessions[0]
+    output_root = tmp_path / "evidence"
+    outside = tmp_path / "outside"
+    output_root.mkdir()
+    outside.mkdir()
+    (output_root / "incomplete").symlink_to(outside, target_is_directory=True)
+
+    async def capture_one(**kwargs: object) -> SymbolCaptureResult:
+        root = Path(str(kwargs["stage_root"]))
+        _artifact(root, "received-before-system-fault.ndjson")
+        raise PermissionError("local storage denied")
+
+    with pytest.raises(M8L2CaptureSystemError) as raised:
+        asyncio.run(
+            capture_m8_l2_session(
+                config,
+                session.date.isoformat(),
+                output_root,
+                capture_one,
+                protocol_path=PROTOCOL_PATH,
+                clock=FakeClock(session.start_ns, finish_ns=session.end_ns),
+                _test_source_identity=SOURCE,
+            )
+        )
+
+    assert not list(outside.iterdir())
+    evidence_root = raised.value.evidence_root
+    assert evidence_root is not None
+    assert evidence_root.parent == output_root
+    assert (evidence_root / "SYSTEM_FAILURE.json").is_file()
+    assert not list(output_root.rglob("_SUCCESS"))
+    assert not list(output_root.rglob("INSUFFICIENT_DATA"))
+
+
 def test_active_cancellation_terminalizes_as_insufficient_and_preserves_partial_raw(
     tmp_path: Path,
 ) -> None:
@@ -833,6 +1403,120 @@ def test_protocol_drift_during_capture_is_system_failure_and_preserves_raw(
     assert len(list(evidence_root.rglob("capture.ndjson"))) == 2
     assert not (evidence_root / "_SUCCESS").exists()
     assert not (evidence_root / "INSUFFICIENT_DATA").exists()
+
+
+@pytest.mark.parametrize("drift_after", ["checksums", "marker"])
+def test_full_authority_drift_during_terminal_materialization_is_nonterminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift_after: str,
+) -> None:
+    project = tmp_path / "relocated-project"
+    config_path = project / "configs" / "m8_l2_capture_study.toml"
+    protocol_path = project / "docs" / "M8_L2_PROTOCOL.md"
+    config_path.parent.mkdir(parents=True)
+    protocol_path.parent.mkdir(parents=True)
+    config_path.write_bytes(CONFIG_PATH.read_bytes())
+    protocol_path.write_bytes(PROTOCOL_PATH.read_bytes())
+    config = load_m8_l2_config(config_path)
+    session = config.sessions[0]
+    output_root = tmp_path / "evidence"
+    drifted = False
+
+    async def capture_one(**kwargs: object) -> SymbolCaptureResult:
+        return _complete_result(
+            symbol=str(kwargs["symbol"]),
+            root=Path(str(kwargs["stage_root"])),
+            start_ns=session.start_ns,
+            end_ns=session.end_ns,
+        )
+
+    def drift_protocol() -> None:
+        nonlocal drifted
+        if not drifted:
+            protocol_path.write_bytes(b"terminal materialization drift\n")
+            drifted = True
+
+    if drift_after == "checksums":
+        real_write_checksums = l2_module._write_checksums
+
+        def write_checksums_then_drift(stage: Path) -> Path:
+            result = real_write_checksums(stage)
+            drift_protocol()
+            return result
+
+        monkeypatch.setattr(l2_module, "_write_checksums", write_checksums_then_drift)
+    else:
+        real_write_bytes = l2_module._write_bytes_durable
+
+        def write_marker_then_drift(path: Path, payload: bytes) -> None:
+            real_write_bytes(path, payload)
+            if path.name in {"_SUCCESS", "INSUFFICIENT_DATA"}:
+                drift_protocol()
+
+        monkeypatch.setattr(l2_module, "_write_bytes_durable", write_marker_then_drift)
+
+    with pytest.raises(M8L2CaptureSystemError, match="terminal publication failed") as raised:
+        asyncio.run(
+            capture_m8_l2_session(
+                config,
+                session.date.isoformat(),
+                output_root,
+                capture_one,
+                protocol_path=protocol_path,
+                clock=FakeClock(session.start_ns, finish_ns=session.end_ns),
+                _test_source_identity=SOURCE,
+            )
+        )
+
+    assert drifted
+    evidence_root = raised.value.evidence_root
+    assert evidence_root is not None
+    assert (evidence_root / "SYSTEM_FAILURE.json").is_file()
+    assert len(list(evidence_root.rglob("capture.ndjson"))) == 2
+    assert not list(output_root.rglob("_SUCCESS"))
+    assert not list(output_root.rglob("INSUFFICIENT_DATA"))
+    assert not list((output_root / "sessions").iterdir())
+
+
+def test_success_revalidates_full_authority_before_marker_and_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    real_revalidate = l2_module._revalidate_runtime_authority
+    real_verify_campaign = l2_module._verify_campaign_authority
+    real_write = l2_module._write_bytes_durable
+    real_rename = l2_module.os.rename
+
+    def observed_revalidate(**kwargs: object) -> None:
+        events.append("full")
+        real_revalidate(**kwargs)
+
+    def observed_verify_campaign(*args: object, **kwargs: object) -> object:
+        events.append("campaign")
+        return real_verify_campaign(*args, **kwargs)
+
+    def observed_write(path: Path, payload: bytes) -> None:
+        if path.name in {"_SUCCESS", "INSUFFICIENT_DATA"}:
+            events.append("marker")
+        real_write(path, payload)
+
+    def observed_rename(source: object, target: object, **kwargs: object) -> None:
+        events.append("rename")
+        real_rename(source, target, **kwargs)
+
+    monkeypatch.setattr(l2_module, "_revalidate_runtime_authority", observed_revalidate)
+    monkeypatch.setattr(l2_module, "_verify_campaign_authority", observed_verify_campaign)
+    monkeypatch.setattr(l2_module, "_write_bytes_durable", observed_write)
+    monkeypatch.setattr(l2_module.os, "rename", observed_rename)
+
+    bundle, _, _ = _complete_bundle(tmp_path)
+    marker_index = events.index("marker")
+    rename_index = events.index("rename")
+
+    assert bundle.status == "COMPLETE"
+    assert events[marker_index - 2 : marker_index + 1] == ["full", "campaign", "marker"]
+    assert events[rename_index - 2 : rename_index + 1] == ["full", "campaign", "rename"]
 
 
 def test_manifest_is_machine_readable_and_contains_exact_checksum_inventory(tmp_path: Path) -> None:

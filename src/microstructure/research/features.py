@@ -677,9 +677,31 @@ def build_research_frame(
 ) -> pl.DataFrame:
     """Build the complete causal feature/strictly-future-label event frame."""
 
-    features = build_l1_trade_features(book_observations, trades, config)
-    features = _join_cancellation_history(features, depth_deltas, config)
+    features = build_research_features(
+        book_observations,
+        trades,
+        config,
+        depth_deltas=depth_deltas,
+    )
     return add_future_event_labels(features, config.label_horizon_events)
+
+
+def build_research_features(
+    book_observations: pl.DataFrame,
+    trades: pl.DataFrame | None,
+    config: FeatureConfig,
+    *,
+    depth_deltas: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    """Build causal features without opening any future-label horizon.
+
+    Separating this stage lets a caller attach several predeclared event- and
+    clock-time labels to the exact same information set.  Cancellation inputs
+    remain continuity-local and are joined at the current observable update.
+    """
+
+    features = build_l1_trade_features(book_observations, trades, config)
+    return _join_cancellation_history(features, depth_deltas, config)
 
 
 def validate_temporal_contract(frame: pl.DataFrame) -> TemporalAudit:
@@ -795,6 +817,7 @@ __all__ = [
     "add_future_event_labels",
     "build_cancellation_intensity_features",
     "build_l1_trade_features",
+    "build_research_features",
     "build_research_frame",
     "model_feature_columns",
     "validate_temporal_contract",

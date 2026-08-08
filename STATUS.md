@@ -2,6 +2,13 @@
 
 Last updated: 2026-08-08 UTC
 
+> **Pre-capture source-freeze snapshot.** This tracked file records the state
+> immediately before the four-date L2 campaign. It must not be edited between
+> the first Aug 8 capture and the Aug 11 terminal. During that interval, current
+> status is authoritative only in `data/m8_l2/campaign_authority.json` and the
+> immutable per-session bundles; after the campaign, generated final-run
+> provenance is the authority for results.
+
 ## Current evidence
 
 The portfolio-quality software vertical slice is complete. Its model and
@@ -19,22 +26,48 @@ producer uses per-symbol purged folds and paired model-minus-prior uncertainty;
 execution and P&L are explicitly `NOT_RUN` because no contemporaneous book is
 present.
 
-The prospective M8 implementation now has a raw-only acquisition authority,
-strict retained-evidence byte accounting, bounded ZIP-directory verification,
-development-only normalization, durable per-symbol and aggregate analysis
-locks, immediate held-out member-open revalidation, and immutable complete or
-`INSUFFICIENT_DATA` terminal bundles. The frozen raw-only acquisition has now
-completed: its manifest binds two exchange-metadata responses, eight official
-ZIP/CHECKSUM pairs, and 36 retained artifacts totaling 117,897,562 bytes. Every
+The frozen trade-only M8 study has reached its canonical terminal state. The
+raw-only authority binds two exchange-metadata responses, eight official
+ZIP/CHECKSUM pairs, and 36 retained artifacts totaling 117,897,562 bytes; every
 acquisition entry records `csv_member_opened=false` and
-`economic_fields_inspected=false`, proving the raw-only acquisition phase did
-not inspect economic rows. A later clean-source attempt opened development
-training members only and stopped at the frozen DQ gate before selection,
-locks, or held-out access. That source-tagged terminal is retained but not
-promoted because it exposed a raw/derived bundle-layout verification defect.
-The corrected producer requires a fresh clean-source, self-verified terminal;
-its authoritative status and any metrics live only in the generated checksum
-bundle and are not copied back into this source-controlled file.
+`economic_fields_inspected=false`. The corrected clean-source producer at commit
+`88060613abe211cd8e80a3499678fca830f8ba2d` published the checksummed
+`artifacts/runs/binance-m8-multidate` bundle with status
+`INSUFFICIENT_DATA`. BTCUSDT training normalization completed with 2,071,461
+rows, zero errors, and zero warnings. ETHUSDT training normalization completed
+with 987,297 rows, zero errors, and 53 warnings, triggering the predeclared
+quality gate. Selection never started; no development lock or prediction was
+published; no validation or held-out archive member was opened; execution and
+P&L are `NOT_RUN`. No date or policy was replaced. Its report command revalidates
+the terminal/raw authority and writes a fresh external report without modifying
+the canonical bundle.
+
+The live-L2 campaign remains the active evidence milestone, but the Aug 8, 2026
+14:00--15:00 UTC train window passed without a capture attempt, data root, or
+session bundle because the producer had not yet obtained a clean committed
+source authority. That date cannot be backfilled or replaced. The tested
+late-start path may publish only a control-only `MISSED_WINDOW` terminal without
+calling either capture adapter; the Aug 9--11 sessions remain scheduled, and the
+final four-date result can now only be `INSUFFICIENT_DATA`. The capture config,
+protocol, calendar, and downstream analysis contract remain unchanged. The
+campaign-authority mechanism
+requires all four dates to share one outcome-blind nonce, canonical output-root
+filesystem identity, clean commit/source/import origin, and hashed
+Python/platform/production-dependency fingerprint. Strict capture and session
+verification, verified lazy inputs, observed-interval endpoint frames,
+Aug 8/9 `LOCKED | NOT_CREATED` development authority, no-refit Aug 10/11 evaluation, dependency-aware
+diagnostics, market-only scenarios, descriptive analyses, and artifact-driven
+L2 reporting are integrated in a tested end-to-end producer and CLI/Make path.
+Development and final production have explicit 8 GiB and 12 GiB fail-closed
+live-memory envelopes respectively; crossing any admission or post-allocation
+bound is a system failure and cannot publish a research terminal.
+The atomic final bundle is either `COMPLETE` or `INSUFFICIENT_DATA`; it embeds
+exact config/protocol, campaign, session-control, and development authority
+snapshots, while its verifier also revalidates every external authority. Reports
+are regenerated only into an external directory, leaving the immutable run
+untouched. The software path was complete at this remaining-campaign source
+freeze; the real session-control evidence was not. No declared L2 session bundle
+or L2 empirical metric existed when these tracked bytes were frozen.
 
 ## Milestones
 
@@ -48,12 +81,20 @@ bundle and are not copied back into this source-controlled file.
 | M5 Execution research | Complete | OOS-only costs, two-stage latency, market/limit partial fills, queue proxy, inventory, liquidation and sensitivity |
 | M6 Reproducible vertical slice | Complete | Atomic CLI producer, immutable checksum bundle, deterministic run key, idempotent verification |
 | M7 Research communication | Complete | Code-generated report/memo/table, read-only six-tab dashboard, limitations and portfolio material |
-| M8 Broader empirical study | In progress | Raw-only authority acquired and verified; canonical trade terminal/resource evidence is generated post-commit, while four prospective local-L2 sessions remain required |
+| M8 Broader empirical study | In progress | Trade-only branch closed with a canonical `INSUFFICIENT_DATA` terminal; complete frozen L2 software path verified offline; four prospective local-L2 session terminals and the resulting empirical terminal remain required |
 
 ## Verification ledger
 
+- 2026-08-08: the final L2 session, input, development-lock, total-producer,
+  recursive-verifier, CLI/Make, and external-report paths passed their focused
+  offline suites. A consolidated repository gate is run separately before source
+  freeze; its volatile test count is not hardcoded in this market-evidence file.
+- 2026-08-08: every path listed by the canonical trade M8
+  `checksums.sha256` reverified. Its manifest/failure/provenance agree on
+  `INSUFFICIENT_DATA`, the clean source identity above, zero selection, zero
+  held-out access, and `NOT_RUN` execution.
 - 2026-08-07: `make lint` passed across source, tests, and dashboard.
-- 2026-08-08: final `make check` passed Ruff, strict mypy across 40 package
+- 2026-08-08: the pre-L2 baseline `make check` passed Ruff, strict mypy across 40 package
   modules, all 574 offline tests on Python 3.12.13, and a fresh current-source
   synthetic bundle. `ruff format --check` also passed across all 92 Python files.
 - 2026-08-07: `make check` passed Ruff, strict mypy, all tests, and a fresh
@@ -95,17 +136,30 @@ bundle and are not copied back into this source-controlled file.
   significance, effect half-life, cross-date/instrument stability, economic
   profitability, live fill probability, or deployable capacity. Execution is
   `NOT_RUN` for the public trade-only input.
-- Failed/unsupported hypothesis disclosure is generated per symbol. The single
-  capped date cannot test persistence or book/liquidity hypotheses, and
-  synthetic output cannot evaluate a market hypothesis.
+- Inconclusive by design: the full-archive trade M8 hypothesis was not evaluated
+  because ETHUSDT training data failed the frozen warning gate. The terminal is
+  evidence of data insufficiency, not evidence that the hypothesis failed.
+- Failed/unsupported hypothesis disclosure is generated per symbol for runs
+  that reach evaluation. The single capped date cannot test persistence or
+  book/liquidity hypotheses, and synthetic output cannot evaluate a market
+  hypothesis.
 
-## Post-commit evidence sequence
+## Next evidence sequence
 
-From a clean committed source tree, run `make reproduce-m8`,
-`make verify-m8-run`, and `make report-m8` with those exact coordinates. Measure
-peak resident memory on the complete eight-archive run and publish either the
-complete trade-only evidence bundle or the protocol-declared
-`INSUFFICIENT_DATA` result. Retain the current single-date bundle unchanged.
-Use the acquired manifest path and SHA above; do not rediscover a "latest"
-input. Separately collect the frozen simultaneous public L2 sessions required
-for book-dependent claims; they cannot be inferred from the trade archives.
+Retain the canonical trade-only `INSUFFICIENT_DATA` bundle and its source-tagged
+predecessor unchanged; do not relax the warning gate, replace a date, or rerun
+until a favorable outcome appears. Use the completed L2 producer and explicit
+authority interfaces with ignored targets
+`artifacts/runs/binance-m8-l2-development-lock` and
+`artifacts/runs/binance-m8-live-l2` for the development authority and final run,
+respectively. Then capture the exact simultaneous Aug 8--11 BTCUSDT/ETHUSDT
+sessions under one clean campaign authority. After Aug 9, durably publish either
+the fitted `LOCKED` authority or the control-only `NOT_CREATED` authority before
+Aug 10. A valid `NOT_CREATED` result exits 1 but does not cancel the Aug 10/11
+captures; the final producer uses all four control authorities without opening
+economic frames. After Aug 11, produce and recursively verify the immutable
+final bundle, render reports externally, measure peak RSS, and complete the
+clean-room/resource audit. A failed/missed date terminalizes the declared
+campaign rather than selecting a substitute. The
+frozen facts are in `docs/M8_L2_ANALYSIS_CONTRACT.md`; generated bundles remain
+the only authority for any eventual metrics.

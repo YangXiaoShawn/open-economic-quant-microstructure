@@ -23,7 +23,7 @@ timing, and execution accounting are tested.
 | M5 Execution research | Complete | M3-M4 | Market/limit fills, latency, partial fills, costs, inventory, liquidation, sensitivity | Deterministic accounting, OOS, volume-conservation, continuity, partial-fill, and liquidation tests pass |
 | M6 Reproducible vertical slice | Complete | M1-M5 | One CLI-driven sample run and machine-readable artifacts | Atomic producer and corruption/idempotence tests pass; canonical smoke requires no network |
 | M7 Research communication | Complete | M6 | Generated technical report/table, IC memo, limitations, dashboard, portfolio material | Render/dashboard tests read only verified artifacts and visibly label evidence tier |
-| M8 Broader empirical study | In progress | M6-M7 | Verified eight-archive raw-only authority, bounded evidence ledger, dev-only normalization, durable dual-symbol fitted-state lock, held-out guard, and terminal result producer; local-L2 study remains separate | Verify the clean-commit terminal result and resource evidence, then complete the four-date prospective local-L2 study |
+| M8 Broader empirical study | In progress | M6-M7 | Closed trade-only study plus complete software for the frozen four-date live-L2 capture/analysis campaign | Canonical trade `INSUFFICIENT_DATA` terminal remains immutable; capture all declared session terminals under one campaign authority, publish the Aug 8/9 `LOCKED` or `NOT_CREATED` development authority before Aug 10/11, and publish a recursively verified result or protocol-declared insufficiency |
 
 ## First vertical slice
 
@@ -63,8 +63,11 @@ small public-data path without making the test suite depend on network access.
 | Class imbalance/calibration drift | Misleading probabilities | Persist class rates, Brier/log loss, calibration diagnostics by fold/regime |
 | Fee/latency/fill assumptions dominate P&L | Fragile strategy result | Publish assumption grid and sensitivity; never collapse it into model quality |
 | Public endpoint/schema changes | Broken ingestion | Version adapter/schema, capture response metadata/checksum, contract tests |
-| Memory/disk pressure | Local run failure | Byte-bounded response streams, hard retained-evidence reservations, disk-backed incremental DQ, batch Parquet, verified spill-capable scans, explicit eager guards; measure peak RSS on the complete M8 run before promotion |
+| Memory/disk pressure | Local run failure | Byte-bounded response streams, hard retained-evidence reservations, disk-backed incremental DQ, batch Parquet, verified spill-capable scans, explicit eager guards; measure peak RSS on any successful full L2 production before promotion |
 | Multiple testing | False discoveries | Predeclare core hypotheses, report all tested variants, use adjusted interpretation |
+| Missed or invalid prospective L2 session | Outcome-driven replacement or false continuity | One frozen calendar and campaign identity; atomic `INSUFFICIENT_DATA`; no replacement date; require observed-interval and cross-symbol coverage gates |
+| Source/runtime/root changes across the four captures | Sessions are not one prospective campaign | Root campaign authority binds config/protocol, outcome-blind nonce, canonical output-root filesystem identity, clean source/import origin, and hashed Python/platform/dependency runtime; reject drift before network access |
+| Held-out L2 economic access without a development authority | Selection leakage | Verify Aug 8/9 control authorities and first persist either eight child locks plus one aggregate `LOCKED` authority or a control-only `NOT_CREATED` authority; only the `LOCKED` branch may expose Aug 10/11 frames, and its evaluator has no fit path |
 
 ## Acceptance test matrix
 
@@ -111,8 +114,22 @@ hypotheses, selection rule, untouched tests, uncertainty, failure policy, and
 lock-before-open boundary are frozen in
 `docs/M8_MULTIDATE_TRADE_PROTOCOL.md`. The raw-only acquirer and terminal
 producer are implemented and adversarially tested. All eight full daily archives
-and their official evidence are now bound by one verified raw-only manifest,
-without opening a CSV member. Promotion still requires the exact clean-commit
-economic run, a verified terminal bundle, peak-RSS evidence below the local
-resource ceiling, and the separately frozen continuous L2 study for book-based
-claims. The existing single-date public sample remains exploratory only.
+and their official evidence are bound by one verified raw-only manifest, without
+opening a CSV member during acquisition. The subsequent clean-commit economic
+run reached a verified `INSUFFICIENT_DATA` terminal at the ETHUSDT training DQ
+gate: no selection or held-out member access occurred, so the trade hypothesis
+was not evaluated and the date/policy cannot be replaced.
+
+Book claims now depend on the separately frozen live-L2 campaign. The immutable
+capture rules are in `docs/M8_L2_PROTOCOL.md`; the exhaustive downstream rules
+and their exact source/semantic hashes are in
+`docs/M8_L2_ANALYSIS_CONTRACT.md`. Remaining acceptance evidence is: the four
+exact session terminals sharing one clean campaign authority; a durable
+`LOCKED | NOT_CREATED` development authority before held-out access; unchanged
+no-refit evaluation on the `LOCKED` branch;
+generated descriptive/predictive/execution artifacts or an honest
+`INSUFFICIENT_DATA` terminal; peak-RSS evidence below the local ceiling; and
+clean-room reproduction. The producer, recursive verifier, CLI/Make interfaces,
+self-contained authority snapshots, and external non-mutating report renderer
+are implemented and covered by offline tests. The existing public sample remains
+exploratory only.

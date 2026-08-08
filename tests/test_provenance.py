@@ -3,13 +3,22 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
+import microstructure
+import microstructure.provenance as provenance_module
 from microstructure.provenance import (
+    ImportOriginError,
+    assert_project_module_origins,
     git_source_tree_sha256,
     git_state,
     read_json,
     sha256_file,
+    strict_git_state,
     write_json,
 )
+
+PROJECT_ROOT = Path(__file__).parents[1]
 
 
 def test_sha256_and_atomic_json_round_trip(tmp_path: Path) -> None:
@@ -64,3 +73,44 @@ def test_git_state_handles_unborn_clean_and_dirty_repositories(tmp_path: Path) -
 
     (repository / "untracked.txt").write_text("new source\n", encoding="utf-8")
     assert git_source_tree_sha256(repository) != dirty_source
+
+
+def test_git_state_fails_closed_when_status_cannot_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = 0
+
+    def failed_status(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout="a" * 40 + "\n")
+        return subprocess.CompletedProcess(args=[], returncode=128, stdout="", stderr="fatal\n")
+
+    monkeypatch.setattr(subprocess, "run", failed_status)
+
+    with pytest.raises(RuntimeError, match="strict Git working-tree identity"):
+        strict_git_state(tmp_path)
+
+
+def test_loaded_module_origin_rejects_foreign_file_and_mixed_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert_project_module_origins(PROJECT_ROOT, provenance_module)
+
+    foreign = tmp_path / "checkout" / "src" / "microstructure" / "provenance.py"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("# foreign checkout\n", encoding="utf-8")
+    with monkeypatch.context() as scoped:
+        scoped.setattr(provenance_module, "__file__", str(foreign))
+        with pytest.raises(ImportOriginError, match="foreign source root"):
+            assert_project_module_origins(PROJECT_ROOT, provenance_module)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            microstructure,
+            "__path__",
+            [str(PROJECT_ROOT / "src" / "microstructure"), str(foreign.parent)],
+        )
+        with pytest.raises(ImportOriginError, match="mixed namespace"):
+            assert_project_module_origins(PROJECT_ROOT, provenance_module)

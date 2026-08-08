@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import platform
+import stat
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 
@@ -20,6 +22,144 @@ from typing import Any
 class GitState:
     commit: str
     dirty: bool
+
+
+class ImportOriginError(RuntimeError):
+    """Raised when loaded project code does not belong to one source root."""
+
+
+def _canonical_absolute_path(value: str | Path, label: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute() or path != Path(os.path.abspath(path)):
+        raise ImportOriginError(f"{label} must be a canonical absolute path")
+    return path
+
+
+def _reject_symlink_path(path: Path, label: str) -> None:
+    """Reject a missing path or any symlink component without following it."""
+
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except OSError as error:
+            raise ImportOriginError(f"cannot inspect {label}: {current}") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ImportOriginError(f"{label} contains symlink component: {current}")
+
+
+def _loaded_module(value: str | ModuleType) -> tuple[str, ModuleType]:
+    if isinstance(value, str):
+        name = value
+        module = sys.modules.get(name)
+        if not isinstance(module, ModuleType):
+            raise ImportOriginError(f"required project module is not loaded: {name}")
+    elif isinstance(value, ModuleType):
+        module = value
+        name = module.__name__
+        if not name or sys.modules.get(name) is not module:
+            raise ImportOriginError(
+                "loaded project module object is not its canonical sys.modules entry"
+            )
+    else:
+        raise TypeError("project module authorities must be module names or module objects")
+    if name != "microstructure" and not name.startswith("microstructure."):
+        raise ImportOriginError(f"module is outside the microstructure namespace: {name}")
+    return name, module
+
+
+def assert_project_module_origins(
+    project_root: str | Path,
+    *modules: str | ModuleType,
+) -> None:
+    """Prove that loaded project modules come from one unsymlinked checkout.
+
+    The check is intentionally about the code that Python actually loaded, not
+    merely the checkout whose bytes were hashed for provenance.  Every module
+    and its loaded parent packages must have a canonical ``__file__`` matching
+    its name below ``<project_root>/src/microstructure``.  Package search paths
+    must contain exactly that one directory, closing mixed/editable namespace
+    cases where a clean checkout is hashed while code executes elsewhere.
+    """
+
+    root = _canonical_absolute_path(project_root, "project root")
+    source_root = root / "src" / "microstructure"
+    _reject_symlink_path(source_root, "project source root")
+    try:
+        source_metadata = source_root.lstat()
+    except OSError as error:  # pragma: no cover - covered by path walk above
+        raise ImportOriginError("project source root is unavailable") from error
+    if not stat.S_ISDIR(source_metadata.st_mode):
+        raise ImportOriginError("project source root is not a regular directory")
+    try:
+        resolved_source_root = source_root.resolve(strict=True)
+    except OSError as error:  # pragma: no cover - covered by path walk above
+        raise ImportOriginError("project source root cannot be resolved") from error
+
+    requested: dict[str, ModuleType] = {}
+    for value in ("microstructure", "microstructure.provenance", *modules):
+        name, module = _loaded_module(value)
+        previous = requested.setdefault(name, module)
+        if previous is not module:
+            raise ImportOriginError(f"mixed loaded module objects for {name}")
+        components = name.split(".")
+        for length in range(1, len(components)):
+            parent_name = ".".join(components[:length])
+            parent, parent_module = _loaded_module(parent_name)
+            previous_parent = requested.setdefault(parent, parent_module)
+            if previous_parent is not parent_module:
+                raise ImportOriginError(f"mixed loaded module objects for {parent}")
+
+    for name, module in sorted(requested.items()):
+        raw_file = getattr(module, "__file__", None)
+        if type(raw_file) is not str or not raw_file:
+            raise ImportOriginError(f"loaded project module lacks __file__ authority: {name}")
+        observed = _canonical_absolute_path(raw_file, f"loaded module {name}")
+        _reject_symlink_path(observed, f"loaded module {name}")
+        try:
+            metadata = observed.lstat()
+            resolved = observed.resolve(strict=True)
+        except OSError as error:
+            raise ImportOriginError(f"loaded project module is unavailable: {name}") from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ImportOriginError(f"loaded project module is not a regular source file: {name}")
+        try:
+            resolved.relative_to(resolved_source_root)
+        except ValueError as error:
+            raise ImportOriginError(
+                f"loaded project module comes from a foreign source root: {name}"
+            ) from error
+
+        relative_parts = name.split(".")[1:]
+        package_path = getattr(module, "__path__", None)
+        if package_path is None:
+            expected = source_root.joinpath(*relative_parts).with_suffix(".py")
+        else:
+            expected_directory = source_root.joinpath(*relative_parts)
+            try:
+                search_paths = tuple(package_path)
+            except TypeError as error:
+                raise ImportOriginError(
+                    f"loaded package search path is malformed: {name}"
+                ) from error
+            if len(search_paths) != 1 or type(search_paths[0]) is not str:
+                raise ImportOriginError(f"loaded package has a mixed namespace path: {name}")
+            search_path = _canonical_absolute_path(
+                search_paths[0], f"loaded package search path {name}"
+            )
+            _reject_symlink_path(search_path, f"loaded package search path {name}")
+            try:
+                resolved_search_path = search_path.resolve(strict=True)
+            except OSError as error:
+                raise ImportOriginError(f"loaded package path is unavailable: {name}") from error
+            if resolved_search_path != expected_directory:
+                raise ImportOriginError(f"loaded package has a foreign namespace path: {name}")
+            expected = expected_directory / "__init__.py"
+        if resolved != expected:
+            raise ImportOriginError(
+                f"loaded project module path does not match its module name: {name}"
+            )
 
 
 def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
@@ -54,6 +194,37 @@ def git_state(project_root: str | Path) -> GitState:
         text=True,
     )
     return GitState(commit=commit, dirty=bool(status.stdout.strip()))
+
+
+def strict_git_state(project_root: str | Path) -> GitState:
+    """Return Git identity only when both revision and status commands succeed.
+
+    Generic sample workflows intentionally retain ``git_state``'s historical
+    non-repository fallback.  Prospective producers use this stricter boundary
+    so a failed ``git status`` can never masquerade as a clean worktree.
+    """
+
+    root = Path(project_root)
+    environment = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    if revision.returncode != 0 or status.returncode != 0:
+        raise RuntimeError("unable to determine strict Git working-tree identity")
+    return GitState(commit=revision.stdout.strip(), dirty=bool(status.stdout.strip()))
 
 
 def git_source_tree_sha256(project_root: str | Path) -> str:

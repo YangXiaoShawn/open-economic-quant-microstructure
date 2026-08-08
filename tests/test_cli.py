@@ -4,6 +4,8 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
+import subprocess
 from collections.abc import AsyncIterator
 from datetime import date
 from decimal import Decimal
@@ -18,6 +20,7 @@ from microstructure.data.binance import CapturedDepth, RawDepthFrame
 from microstructure.data.book import BookSnapshot, DepthDelta
 from microstructure.data.storage import write_source_manifest
 from microstructure.m8_acquisition import M8AcquisitionFailureResult
+from microstructure.m8_l2_capture import M8L2VerificationError
 from microstructure.provenance import read_json, sha256_file, utc_now_iso
 
 PROJECT_ROOT = Path(__file__).parents[1]
@@ -453,27 +456,80 @@ def test_verify_m8_accepts_complete_or_insufficient_terminal_evidence(
     assert json.loads(capsys.readouterr().out)["protected_files"] == 17
 
 
-def test_report_m8_exposes_frozen_insufficient_report_without_regeneration(
+def test_report_m8_writes_self_contained_insufficient_report_outside_frozen_bundle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     digest = "9" * 64
     run_dir = tmp_path / "run"
-    report = run_dir / "reports" / "insufficient_data.md"
-    report.parent.mkdir(parents=True)
-    report.write_text("# INSUFFICIENT_DATA\n", encoding="utf-8")
+    output_dir = tmp_path / "external-report"
+    run_dir.mkdir()
+    failure = {
+        "failed_symbol": "ETHUSDT",
+        "failed_date": "2024-01-04",
+        "failed_role": "validation",
+        "failure_stage": "development_normalization",
+        "reason_code": "ARCHIVE_QUALITY_GATE",
+        "reason": "53 temporal.long_silence warnings violated the frozen gate",
+        "replacement_date_selected": False,
+        "reselection_performed": False,
+        "config_sha256": "a" * 64,
+        "config_source_sha256": "b" * 64,
+        "raw_acquisition_manifest_sha256": digest,
+        "bundled_raw_acquisition_manifest_sha256": "c" * 64,
+        "protocol_sha256": "d" * 64,
+        "selection_started": False,
+        "selection_completed_symbols": [],
+        "aggregate_lock_committed": False,
+        "held_out_member_opened": False,
+        "endpoint_evaluation_started": False,
+        "endpoint_evaluation_completed": False,
+        "endpoint_evaluation_completed_symbols": [],
+        "predictions_published": False,
+        "endpoint_artifacts_published": False,
+        "completed_normalizations": [{"symbol": "BTCUSDT", "date": "2024-01-03", "role": "train"}],
+        "stopped_before": [
+            {"symbol": "BTCUSDT", "date": "2024-01-05", "role": "primary_test"},
+            {"symbol": "BTCUSDT", "date": "2024-01-06", "role": "replication_test"},
+        ],
+    }
+    provenance = {
+        "git": {
+            "commit": "e" * 40,
+            "dirty": False,
+            "source_tree_sha256": "f" * 64,
+        }
+    }
+    run_manifest = {
+        "research": {"endpoint_status": "insufficient_data"},
+        "execution_assumptions": {
+            "status": "NOT_RUN",
+            "fills_calculated": False,
+            "pnl_calculated": False,
+            "capacity_calculated": False,
+        },
+    }
+    for name, payload in (
+        ("failure.json", failure),
+        ("provenance.json", provenance),
+        ("run_manifest.json", run_manifest),
+    ):
+        (run_dir / name).write_text(json.dumps(payload), encoding="utf-8")
+    bundled_before = {path.name: path.read_bytes() for path in run_dir.iterdir() if path.is_file()}
     monkeypatch.setattr(cli_module, "load_m8_config", lambda path: _mock_m8_config())
-    monkeypatch.setattr(
-        cli_module,
-        "verify_m8_result",
-        lambda *args, **kwargs: SimpleNamespace(
+    verification_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def fake_verify(*args: object, **kwargs: object) -> object:
+        verification_calls.append((args, kwargs))
+        return SimpleNamespace(
             path=run_dir,
             status="INSUFFICIENT_DATA",
             raw_manifest_sha256=digest,
             normalized_manifest_sha256=None,
-        ),
-    )
+        )
+
+    monkeypatch.setattr(cli_module, "verify_m8_result", fake_verify)
     monkeypatch.setattr(
         cli_module,
         "write_report_set",
@@ -492,13 +548,81 @@ def test_report_m8_exposes_frozen_insufficient_report_without_regeneration(
                 str(tmp_path / "raw.json"),
                 "--raw-manifest-sha256",
                 digest,
+                "--output-dir",
+                str(output_dir),
             ]
         )
         == 0
     )
     payload = json.loads(capsys.readouterr().out)
+    report = output_dir / "insufficient_data.md"
     assert payload["report"] == str(report)
-    assert payload["reports_regenerated"] is False
+    assert payload["reports_regenerated"] is True
+    assert payload["source_bundle_modified"] is False
+    assert payload["report_sha256"] == sha256_file(report)
+    rendered = report.read_text(encoding="utf-8")
+    for expected in (
+        "2024-01-03` through `2024-01-06",
+        "ETHUSDT",
+        "2024-01-04",
+        "validation",
+        "ARCHIVE_QUALITY_GATE",
+        "53 temporal.long_silence warnings",
+        "Config semantic SHA-256",
+        "Raw acquisition manifest SHA-256",
+        "Git commit",
+        "Git dirty: `false`",
+        "Source-tree SHA-256",
+        "Candidate selection started: `false`",
+        "Held-out member opened: `false`",
+        "Endpoint evaluation started: `false`",
+        "Execution status: `NOT_RUN`",
+    ):
+        assert expected in rendered
+    assert {
+        path.name: path.read_bytes() for path in run_dir.iterdir() if path.is_file()
+    } == bundled_before
+    assert len(verification_calls) == 2
+    assert verification_calls[0] == verification_calls[1]
+
+
+def test_report_m8_rejects_output_inside_immutable_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    digest = "8" * 64
+    run_dir = tmp_path / "run"
+    monkeypatch.setattr(cli_module, "load_m8_config", lambda path: _mock_m8_config())
+    monkeypatch.setattr(
+        cli_module,
+        "verify_m8_result",
+        lambda *args, **kwargs: SimpleNamespace(
+            path=run_dir,
+            status="INSUFFICIENT_DATA",
+            raw_manifest_sha256=digest,
+            normalized_manifest_sha256=None,
+        ),
+    )
+
+    exit_code = main(
+        [
+            "report-m8",
+            "--config",
+            str(tmp_path / "study.toml"),
+            "--run-dir",
+            str(run_dir),
+            "--raw-manifest",
+            str(tmp_path / "raw.json"),
+            "--raw-manifest-sha256",
+            digest,
+            "--output-dir",
+            str(run_dir / "reports"),
+        ]
+    )
+
+    assert exit_code == 2
+    assert "outside the immutable run bundle" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -652,21 +776,833 @@ def test_capture_m8_l2_session_system_failure_uses_error_exit_two(
     assert capsys.readouterr().err == "error: injected capture I/O failure\n"
 
 
+@pytest.mark.parametrize("status", ["COMPLETE", "INSUFFICIENT_DATA"])
+def test_verify_m8_l2_session_accepts_both_terminal_states(
+    status: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config_path = tmp_path / "m8-l2.toml"
+    bundle_dir = tmp_path / "sessions" / ("a" * 64)
+    config = object()
+    result = SimpleNamespace(
+        root=bundle_dir.absolute(),
+        status=status,
+        session_id="a" * 64,
+        session_date="2026-08-08",
+        role="train",
+        manifest_path=bundle_dir / "session_manifest.json",
+        manifest_sha256="b" * 64,
+        checksum_path=bundle_dir / "CHECKSUMS.sha256",
+        marker_path=bundle_dir / ("_SUCCESS" if status == "COMPLETE" else "INSUFFICIENT_DATA"),
+        reason_codes=() if status == "COMPLETE" else ("GATE_CROSS_SYMBOL_OVERLAP",),
+    )
+    calls: list[tuple[Path, object]] = []
+
+    def fake_verify(path: Path, *, expected_config: object) -> object:
+        calls.append((path, expected_config))
+        return result
+
+    monkeypatch.setattr(cli_module, "load_m8_l2_config", lambda path: config)
+    monkeypatch.setattr(cli_module, "verify_m8_l2_session_bundle", fake_verify)
+
+    exit_code = main(
+        [
+            "verify-m8-l2-session",
+            "--config",
+            str(config_path),
+            "--bundle-dir",
+            str(bundle_dir),
+        ]
+    )
+
+    assert exit_code == 0
+    assert calls == [(bundle_dir, config)]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == status
+    assert payload["integrity"] == "verified"
+    assert payload["session_id"] == "a" * 64
+    assert payload["reason_codes"] == list(result.reason_codes)
+    assert payload["live_trading"] is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "checksum mismatch for symbols/BTCUSDT/capture_summary.json",
+        "caller config semantics differ from the session authority",
+    ],
+)
+def test_verify_m8_l2_session_rejects_tampering_and_wrong_config(
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = object()
+    bundle_dir = tmp_path / "sessions" / ("a" * 64)
+    monkeypatch.setattr(cli_module, "load_m8_l2_config", lambda path: config)
+
+    def fail(path: Path, *, expected_config: object) -> object:
+        assert path == bundle_dir
+        assert expected_config is config
+        raise M8L2VerificationError(message)
+
+    monkeypatch.setattr(cli_module, "verify_m8_l2_session_bundle", fail)
+
+    exit_code = main(
+        [
+            "verify-m8-l2-session",
+            "--config",
+            str(tmp_path / "m8-l2.toml"),
+            "--bundle-dir",
+            str(bundle_dir),
+        ]
+    )
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"error: {message}\n"
+
+
 def test_m8_l2_make_target_is_explicit_and_check_remains_offline() -> None:
     makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
 
     assert "M8_L2_CONFIG ?= configs/m8_l2_capture_study.toml" in makefile
     assert "M8_L2_DATA_ROOT ?= data/m8_l2" in makefile
     assert "M8_L2_SESSION_DATE ?=" in makefile
-    recipe = makefile.split("capture-m8-l2-session:\n", maxsplit=1)[1].split(
+    assert "M8_L2_BUNDLE_DIR ?=" in makefile
+    capture_recipe = makefile.split("capture-m8-l2-session:\n", maxsplit=1)[1].split(
+        "\nverify-m8-l2-session:", maxsplit=1
+    )[0]
+    assert 'test -n "$(M8_L2_SESSION_DATE)"' in capture_recipe
+    assert '--config "$(M8_L2_CONFIG)"' in capture_recipe
+    assert '--date "$(M8_L2_SESSION_DATE)"' in capture_recipe
+    assert '--output-root "$(M8_L2_DATA_ROOT)"' in capture_recipe
+    verify_recipe = makefile.split("verify-m8-l2-session:\n", maxsplit=1)[1].split(
         "\nvalidate-data:", maxsplit=1
     )[0]
-    assert 'test -n "$(M8_L2_SESSION_DATE)"' in recipe
-    assert '--config "$(M8_L2_CONFIG)"' in recipe
-    assert '--date "$(M8_L2_SESSION_DATE)"' in recipe
-    assert '--output-root "$(M8_L2_DATA_ROOT)"' in recipe
+    assert 'test -n "$(M8_L2_BUNDLE_DIR)"' in verify_recipe
+    assert '--config "$(M8_L2_CONFIG)"' in verify_recipe
+    assert '--bundle-dir "$(M8_L2_BUNDLE_DIR)"' in verify_recipe
     check_dependencies = makefile.split("\ncheck:", maxsplit=1)[1].splitlines()[0]
     assert "capture-m8-l2-session" not in check_dependencies
+    assert "verify-m8-l2-session" not in check_dependencies
+
+
+def test_m8_l2_make_contract_normalizes_only_valid_terminal_exit_one(
+    tmp_path: Path,
+) -> None:
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text(
+        '#!/bin/sh\nprintf \'{"status":"INSUFFICIENT_DATA"}\\n\'\nexit "$FAKE_EXIT"\n',
+        encoding="ascii",
+    )
+    fake_python.chmod(0o755)
+    base_environment = {**os.environ, "FAKE_EXIT": "1"}
+    command = [
+        "make",
+        "--no-print-directory",
+        "capture-m8-l2-session",
+        f"PYTHON={fake_python}",
+        "M8_L2_SESSION_DATE=2026-08-08",
+    ]
+
+    valid_terminal = subprocess.run(
+        command,
+        cwd=PROJECT_ROOT,
+        env=base_environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert valid_terminal.returncode == 0
+    assert json.loads(valid_terminal.stdout)["status"] == "INSUFFICIENT_DATA"
+
+    system_failure = subprocess.run(
+        command,
+        cwd=PROJECT_ROOT,
+        env={**base_environment, "FAKE_EXIT": "2"},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert system_failure.returncode != 0
+
+    makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
+    for command_name in (
+        "capture-m8-l2-session",
+        "lock-m8-l2-development",
+        "verify-m8-l2-development-lock",
+        "reproduce-m8-l2",
+        "verify-m8-l2-run",
+        "report-m8-l2",
+    ):
+        recipe_line = next(
+            line for line in makefile.splitlines() if f"microstructure.cli {command_name} " in line
+        )
+        assert "|| status=$$?" in recipe_line
+        assert 'if [ "$$status" -eq 1 ]; then exit 0; fi' in recipe_line
+        assert 'exit "$$status"' in recipe_line
+
+
+def _m8_l2_development_cli_fixture(
+    tmp_path: Path,
+    *,
+    train_status: str = "COMPLETE",
+    validation_status: str = "COMPLETE",
+) -> tuple[list[str], SimpleNamespace, SimpleNamespace]:
+    train_root = tmp_path / "train"
+    validation_root = tmp_path / "validation"
+    train_root.mkdir()
+    validation_root.mkdir()
+    train_checksums = train_root / "CHECKSUMS.sha256"
+    validation_checksums = validation_root / "CHECKSUMS.sha256"
+    train_checksums.write_bytes(b"train checksums authority\n")
+    validation_checksums.write_bytes(b"validation checksums authority\n")
+    train = SimpleNamespace(
+        root=train_root.absolute(),
+        status=train_status,
+        session_id="1" * 64,
+        session_date="2026-08-08",
+        role="train",
+        manifest_path=train_root / "session_manifest.json",
+        manifest_sha256="a" * 64,
+        checksum_path=train_checksums,
+        marker_path=train_root
+        / ("_SUCCESS" if train_status == "COMPLETE" else "INSUFFICIENT_DATA"),
+        reason_codes=() if train_status == "COMPLETE" else ("GATE_TRAIN",),
+    )
+    validation = SimpleNamespace(
+        root=validation_root.absolute(),
+        status=validation_status,
+        session_id="2" * 64,
+        session_date="2026-08-09",
+        role="validation",
+        manifest_path=validation_root / "session_manifest.json",
+        manifest_sha256="b" * 64,
+        checksum_path=validation_checksums,
+        marker_path=(
+            validation_root
+            / ("_SUCCESS" if validation_status == "COMPLETE" else "INSUFFICIENT_DATA")
+        ),
+        reason_codes=() if validation_status == "COMPLETE" else ("GATE_VALIDATION",),
+    )
+    arguments = [
+        "--capture-config",
+        str(tmp_path / "capture.toml"),
+        "--analysis-config",
+        str(tmp_path / "analysis.toml"),
+        "--train-bundle-dir",
+        str(train_root),
+        "--train-manifest-sha256",
+        train.manifest_sha256,
+        "--train-checksums-sha256",
+        sha256_file(train_checksums),
+        "--validation-bundle-dir",
+        str(validation_root),
+        "--validation-manifest-sha256",
+        validation.manifest_sha256,
+        "--validation-checksums-sha256",
+        sha256_file(validation_checksums),
+        "--lock-dir",
+        str(tmp_path / "development-lock"),
+    ]
+    return arguments, train, validation
+
+
+def test_lock_m8_l2_development_uses_only_explicit_session_authorities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    arguments, train, validation = _m8_l2_development_cli_fixture(tmp_path)
+    capture_config = object()
+    analysis_config = object()
+    strict_input = object()
+    calls: list[tuple[object, ...]] = []
+
+    monkeypatch.setattr(cli_module, "load_m8_l2_config", lambda path: capture_config)
+    monkeypatch.setattr(cli_module, "load_m8_l2_analysis_config", lambda path: analysis_config)
+
+    def fake_verify(path: Path, *, expected_config: object) -> object:
+        assert expected_config is capture_config
+        return train if path == train.root else validation
+
+    def fake_strict_input(
+        path: Path,
+        *,
+        expected_config: object,
+        expected_date: str,
+        expected_role: str,
+        expected_file_authority: object,
+        expected_campaign: object | None,
+    ) -> object:
+        calls.append(
+            (
+                path,
+                expected_config,
+                expected_date,
+                expected_role,
+                expected_file_authority,
+                expected_campaign,
+            )
+        )
+        return strict_input
+
+    def fake_lock(
+        capture: object,
+        analysis: object,
+        train_path: Path,
+        validation_path: Path,
+        lock_path: Path,
+        *,
+        input_loader: object,
+        expected_session_file_authorities: object,
+    ) -> object:
+        assert capture is capture_config
+        assert analysis is analysis_config
+        assert (train_path, validation_path) == (train.root, validation.root)
+        assert callable(input_loader)
+        assert expected_session_file_authorities == {
+            "2026-08-08": cli_module.L2SessionFileAuthority(
+                train.manifest_sha256,
+                hashlib.sha256(train.checksum_path.read_bytes()).hexdigest(),
+            ),
+            "2026-08-09": cli_module.L2SessionFileAuthority(
+                validation.manifest_sha256,
+                hashlib.sha256(validation.checksum_path.read_bytes()).hexdigest(),
+            ),
+        }
+        assert (
+            input_loader(
+                train_path,
+                expected_config=capture_config,
+                expected_date="2026-08-08",
+                expected_role="train",
+            )
+            is strict_input
+        )
+        return SimpleNamespace(
+            root=lock_path,
+            aggregate_path=lock_path / "development_lock.json",
+            aggregate_sha256="d" * 64,
+            marker_path=lock_path / "_LOCKED",
+            created_at_utc="2026-08-09T15:00:00Z",
+            children=(
+                SimpleNamespace(
+                    symbol="BTCUSDT",
+                    endpoint="event_20",
+                    path=lock_path / "BTCUSDT" / "event_20" / "lock.json",
+                    sha256="e" * 64,
+                    selection_lock_sha256="f" * 64,
+                    fitted_state_sha256="0" * 64,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(cli_module, "verify_m8_l2_session_bundle", fake_verify)
+    monkeypatch.setattr(cli_module, "verify_m8_l2_development_input", fake_strict_input)
+    monkeypatch.setattr(cli_module, "lock_m8_l2_development", fake_lock)
+
+    assert main(["lock-m8-l2-development", *arguments]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "LOCKED"
+    assert payload["development_lock_sha256"] == "d" * 64
+    assert payload["heldout_accessed"] is False
+    assert payload["live_trading"] is False
+    assert calls[0][4].manifest_sha256 == "a" * 64
+    assert calls[0][4].checksums_sha256 == sha256_file(train.checksum_path)
+
+
+def test_lock_m8_l2_development_returns_one_for_verified_insufficient_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    arguments, train, validation = _m8_l2_development_cli_fixture(
+        tmp_path,
+        validation_status="INSUFFICIENT_DATA",
+    )
+    monkeypatch.setattr(cli_module, "load_m8_l2_config", lambda path: object())
+    monkeypatch.setattr(cli_module, "load_m8_l2_analysis_config", lambda path: object())
+    monkeypatch.setattr(
+        cli_module,
+        "verify_m8_l2_session_bundle",
+        lambda path, **kwargs: train if path == train.root else validation,
+    )
+    lock_dir = Path(arguments[arguments.index("--lock-dir") + 1]).absolute()
+    monkeypatch.setattr(
+        cli_module,
+        "lock_m8_l2_development",
+        lambda *args, **kwargs: SimpleNamespace(
+            root=lock_dir,
+            aggregate_path=lock_dir / "development_lock.json",
+            aggregate_sha256="d" * 64,
+            marker_path=lock_dir / "_NOT_CREATED",
+            created_at_utc="2026-08-09T15:00:00Z",
+            children=(),
+            status="NOT_CREATED",
+            reason_codes=("DEVELOPMENT_SESSION_INSUFFICIENT::validation::GATE_VALIDATION",),
+        ),
+    )
+
+    assert main(["lock-m8-l2-development", *arguments]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "NOT_CREATED"
+    assert payload["development_lock_sha256"] == "d" * 64
+    assert payload["reason_codes"] == [
+        "DEVELOPMENT_SESSION_INSUFFICIENT::validation::GATE_VALIDATION"
+    ]
+    assert payload["heldout_accessed"] is False
+
+
+def test_verify_m8_l2_development_lock_binds_expected_aggregate_sha(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    arguments, train, validation = _m8_l2_development_cli_fixture(tmp_path)
+    capture_config = object()
+    analysis_config = object()
+    expected_lock_sha = "c" * 64
+    lock_dir = (tmp_path / "development-lock").absolute()
+
+    monkeypatch.setattr(cli_module, "load_m8_l2_config", lambda path: capture_config)
+    monkeypatch.setattr(cli_module, "load_m8_l2_analysis_config", lambda path: analysis_config)
+    monkeypatch.setattr(
+        cli_module,
+        "verify_m8_l2_session_bundle",
+        lambda path, **kwargs: train if path == train.root else validation,
+    )
+
+    def fake_verify_lock(*args: object, **kwargs: object) -> object:
+        assert args == (capture_config, analysis_config, train.root, validation.root, lock_dir)
+        assert kwargs == {"expected_lock_sha256": expected_lock_sha}
+        return SimpleNamespace(
+            root=lock_dir,
+            aggregate_path=lock_dir / "development_lock.json",
+            aggregate_sha256=expected_lock_sha,
+            marker_path=lock_dir / "_LOCKED",
+            created_at_utc="2026-08-09T15:00:00Z",
+            children=(),
+        )
+
+    monkeypatch.setattr(cli_module, "verify_m8_l2_development_lock", fake_verify_lock)
+
+    assert (
+        main(
+            [
+                "verify-m8-l2-development-lock",
+                *arguments,
+                "--development-lock-sha256",
+                expected_lock_sha,
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["integrity"] == "verified"
+    assert payload["development_lock_sha256"] == expected_lock_sha
+
+
+def test_verify_m8_l2_not_created_authority_returns_one_with_verified_integrity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    arguments, train, validation = _m8_l2_development_cli_fixture(
+        tmp_path,
+        validation_status="INSUFFICIENT_DATA",
+    )
+    expected_sha = "c" * 64
+    lock_dir = Path(arguments[arguments.index("--lock-dir") + 1]).absolute()
+    monkeypatch.setattr(cli_module, "load_m8_l2_config", lambda path: object())
+    monkeypatch.setattr(cli_module, "load_m8_l2_analysis_config", lambda path: object())
+    monkeypatch.setattr(
+        cli_module,
+        "verify_m8_l2_session_bundle",
+        lambda path, **kwargs: train if path == train.root else validation,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "verify_m8_l2_development_lock",
+        lambda *args, **kwargs: SimpleNamespace(
+            root=lock_dir,
+            aggregate_path=lock_dir / "development_lock.json",
+            aggregate_sha256=expected_sha,
+            marker_path=lock_dir / "_NOT_CREATED",
+            created_at_utc="2026-08-09T15:00:00Z",
+            children=(),
+            status="NOT_CREATED",
+            reason_codes=("DEVELOPMENT_SESSION_INSUFFICIENT::validation::GATE_VALIDATION",),
+        ),
+    )
+
+    assert (
+        main(
+            [
+                "verify-m8-l2-development-lock",
+                *arguments,
+                "--development-lock-sha256",
+                expected_sha,
+            ]
+        )
+        == 1
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "NOT_CREATED"
+    assert payload["integrity"] == "verified"
+    assert payload["terminal_marker"].endswith("/_NOT_CREATED")
+
+
+def test_m8_l2_development_cli_rejects_noncanonical_authority_sha(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments, _, _ = _m8_l2_development_cli_fixture(tmp_path)
+    digest_index = arguments.index("--train-manifest-sha256") + 1
+    arguments[digest_index] = "A" * 64
+    monkeypatch.setattr(
+        cli_module,
+        "lock_m8_l2_development",
+        lambda *args, **kwargs: pytest.fail("argument failure must precede lock production"),
+    )
+
+    with pytest.raises(SystemExit) as caught:
+        main(["lock-m8-l2-development", *arguments])
+
+    assert caught.value.code == 2
+
+
+def test_m8_l2_development_make_targets_are_explicit_and_not_in_check() -> None:
+    makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
+    gitignore_lines = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "data/m8_l2/**" in gitignore_lines
+    lock_recipe = makefile.split("lock-m8-l2-development:\n", maxsplit=1)[1].split(
+        "\nverify-m8-l2-development-lock:", maxsplit=1
+    )[0]
+    verify_recipe = makefile.split("verify-m8-l2-development-lock:\n", maxsplit=1)[1].split(
+        "\nvalidate-data:", maxsplit=1
+    )[0]
+    for variable in (
+        "M8_L2_TRAIN_BUNDLE_DIR",
+        "M8_L2_TRAIN_MANIFEST_SHA256",
+        "M8_L2_TRAIN_CHECKSUMS_SHA256",
+        "M8_L2_VALIDATION_BUNDLE_DIR",
+        "M8_L2_VALIDATION_MANIFEST_SHA256",
+        "M8_L2_VALIDATION_CHECKSUMS_SHA256",
+        "M8_L2_DEVELOPMENT_LOCK_DIR",
+    ):
+        assert f'test -n "$({variable})"' in lock_recipe
+        assert f'"$({variable})"' in lock_recipe
+        assert f'test -n "$({variable})"' in verify_recipe
+        assert f'"$({variable})"' in verify_recipe
+    assert 'test -n "$(M8_L2_DEVELOPMENT_LOCK_SHA256)"' in verify_recipe
+    assert '--development-lock-sha256 "$(M8_L2_DEVELOPMENT_LOCK_SHA256)"' in verify_recipe
+    for recipe in (lock_recipe, verify_recipe):
+        assert "latest" not in recipe.lower()
+    check_dependencies = makefile.split("\ncheck:", maxsplit=1)[1].splitlines()[0]
+    assert "lock-m8-l2-development" not in check_dependencies
+    assert "verify-m8-l2-development-lock" not in check_dependencies
+
+
+def test_m8_l2_final_make_targets_bind_four_sessions_and_stay_offline() -> None:
+    makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
+    assert "M8_L2_RUN_DIR ?= artifacts/runs/binance-m8-live-l2" in makefile
+    assert "M8_L2_REPORT_DIR ?= artifacts/runs/binance-m8-live-l2-reports" in makefile
+    reproduce_recipe = makefile.split("reproduce-m8-l2:\n", maxsplit=1)[1].split(
+        "\nverify-m8-l2-run:", maxsplit=1
+    )[0]
+    verify_recipe = makefile.split("verify-m8-l2-run:\n", maxsplit=1)[1].split(
+        "\nreport-m8-l2:", maxsplit=1
+    )[0]
+    report_recipe = makefile.split("report-m8-l2:\n", maxsplit=1)[1].split(
+        "\nvalidate-data:", maxsplit=1
+    )[0]
+    authority_variables = (
+        "M8_L2_TRAIN_BUNDLE_DIR",
+        "M8_L2_TRAIN_MANIFEST_SHA256",
+        "M8_L2_TRAIN_CHECKSUMS_SHA256",
+        "M8_L2_VALIDATION_BUNDLE_DIR",
+        "M8_L2_VALIDATION_MANIFEST_SHA256",
+        "M8_L2_VALIDATION_CHECKSUMS_SHA256",
+        "M8_L2_DEVELOPMENT_LOCK_DIR",
+        "M8_L2_DEVELOPMENT_LOCK_SHA256",
+        "M8_L2_PRIMARY_BUNDLE_DIR",
+        "M8_L2_PRIMARY_MANIFEST_SHA256",
+        "M8_L2_PRIMARY_CHECKSUMS_SHA256",
+        "M8_L2_REPLICATION_BUNDLE_DIR",
+        "M8_L2_REPLICATION_MANIFEST_SHA256",
+        "M8_L2_REPLICATION_CHECKSUMS_SHA256",
+    )
+    for recipe in (reproduce_recipe, verify_recipe, report_recipe):
+        for variable in authority_variables:
+            assert f'test -n "$({variable})"' in recipe
+            assert f'"$({variable})"' in recipe
+        for role in ("train", "validation", "primary", "replication"):
+            assert f"--{role}-bundle-dir" in recipe
+            assert f"--{role}-manifest-sha256" in recipe
+            assert f"--{role}-checksums-sha256" in recipe
+        assert "--development-lock-dir" in recipe
+        assert "--development-lock-sha256" in recipe
+        assert ' --run-dir "$(M8_L2_RUN_DIR)"' in recipe
+        assert "latest" not in recipe.lower()
+    for recipe in (verify_recipe, report_recipe):
+        assert 'test -n "$(M8_L2_RUN_MANIFEST_SHA256)"' in recipe
+        assert 'test -n "$(M8_L2_RUN_CHECKSUMS_SHA256)"' in recipe
+        assert '--run-manifest-sha256 "$(M8_L2_RUN_MANIFEST_SHA256)"' in recipe
+        assert '--run-checksums-sha256 "$(M8_L2_RUN_CHECKSUMS_SHA256)"' in recipe
+    assert '--output-dir "$(M8_L2_REPORT_DIR)"' in report_recipe
+    check_dependencies = makefile.split("\ncheck:", maxsplit=1)[1].splitlines()[0]
+    for target in ("reproduce-m8-l2", "verify-m8-l2-run", "report-m8-l2"):
+        assert target not in check_dependencies
+
+
+def _m8_l2_study_cli_arguments(
+    tmp_path: Path,
+    *,
+    include_run_authority: bool,
+) -> list[str]:
+    arguments = [
+        "--capture-config",
+        str(tmp_path / "capture.toml"),
+        "--analysis-config",
+        str(tmp_path / "analysis.toml"),
+    ]
+    for index, role in enumerate(("train", "validation", "primary", "replication"), start=1):
+        arguments.extend(
+            [
+                f"--{role}-bundle-dir",
+                str(tmp_path / role),
+                f"--{role}-manifest-sha256",
+                format(index, "x") * 64,
+                f"--{role}-checksums-sha256",
+                format(index + 4, "x") * 64,
+            ]
+        )
+    arguments.extend(
+        [
+            "--development-lock-dir",
+            str(tmp_path / "development-lock"),
+            "--development-lock-sha256",
+            "9" * 64,
+            "--run-dir",
+            str(tmp_path / "run"),
+        ]
+    )
+    if include_run_authority:
+        arguments.extend(
+            [
+                "--run-manifest-sha256",
+                "a" * 64,
+                "--run-checksums-sha256",
+                "b" * 64,
+            ]
+        )
+    return arguments
+
+
+def _fake_m8_l2_study_result(tmp_path: Path, status: str) -> SimpleNamespace:
+    root = (tmp_path / "run").absolute()
+    return SimpleNamespace(
+        root=root,
+        status=status,
+        manifest_path=root / "run_manifest.json",
+        manifest_sha256="a" * 64,
+        checksum_path=root / "CHECKSUMS.sha256",
+        checksum_sha256="b" * 64,
+        marker_path=root / ("_SUCCESS" if status == "COMPLETE" else "INSUFFICIENT_DATA"),
+        reason_codes=() if status == "COMPLETE" else ("PRIMARY_SESSION_NOT_COMPLETE",),
+    )
+
+
+@pytest.mark.parametrize(("status", "expected_exit"), [("COMPLETE", 0), ("INSUFFICIENT_DATA", 1)])
+def test_reproduce_m8_l2_binds_all_four_explicit_session_authorities(
+    status: str,
+    expected_exit: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    capture_config = object()
+    analysis_config = object()
+    result = _fake_m8_l2_study_result(tmp_path, status)
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(cli_module, "load_m8_l2_config", lambda path: capture_config)
+    monkeypatch.setattr(cli_module, "load_m8_l2_analysis_config", lambda path: analysis_config)
+
+    def fake_reproduce(*args: object) -> object:
+        calls.append(args)
+        return result
+
+    monkeypatch.setattr(cli_module, "reproduce_m8_l2_study", fake_reproduce)
+
+    assert (
+        main(
+            [
+                "reproduce-m8-l2",
+                *_m8_l2_study_cli_arguments(tmp_path, include_run_authority=False),
+            ]
+        )
+        == expected_exit
+    )
+    assert len(calls) == 1
+    call = calls[0]
+    assert call[0:2] == (capture_config, analysis_config)
+    for index, (position, role) in enumerate(
+        zip((2, 3, 6, 7), ("train", "validation", "primary", "replication"), strict=True),
+        start=1,
+    ):
+        authority = call[position]
+        assert isinstance(authority, cli_module.L2StudySessionAuthority)
+        assert authority.bundle_path == (tmp_path / role).absolute()
+        assert authority.manifest_sha256 == format(index, "x") * 64
+        assert authority.checksums_sha256 == format(index + 4, "x") * 64
+    assert call[4] == (tmp_path / "development-lock").absolute()
+    assert call[5] == "9" * 64
+    assert call[8] == (tmp_path / "run").absolute()
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == status
+    assert payload["run_manifest_sha256"] == "a" * 64
+    assert payload["checksums_sha256"] == "b" * 64
+    assert payload["reason_codes"] == list(result.reason_codes)
+    assert payload["live_trading"] is False
+
+
+@pytest.mark.parametrize(("status", "expected_exit"), [("COMPLETE", 0), ("INSUFFICIENT_DATA", 1)])
+def test_verify_m8_l2_run_requires_and_forwards_terminal_run_authority(
+    status: str,
+    expected_exit: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    capture_config = object()
+    analysis_config = object()
+    result = _fake_m8_l2_study_result(tmp_path, status)
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(cli_module, "load_m8_l2_config", lambda path: capture_config)
+    monkeypatch.setattr(cli_module, "load_m8_l2_analysis_config", lambda path: analysis_config)
+
+    def fake_verify(*args: object, **kwargs: object) -> object:
+        calls.append((args, kwargs))
+        return result
+
+    monkeypatch.setattr(cli_module, "verify_m8_l2_study_run", fake_verify)
+
+    assert (
+        main(
+            [
+                "verify-m8-l2-run",
+                *_m8_l2_study_cli_arguments(tmp_path, include_run_authority=True),
+            ]
+        )
+        == expected_exit
+    )
+    assert calls[0][1] == {
+        "expected_manifest_sha256": "a" * 64,
+        "expected_checksums_sha256": "b" * 64,
+    }
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["integrity"] == "verified"
+    assert payload["status"] == status
+
+
+@pytest.mark.parametrize(("status", "expected_exit"), [("COMPLETE", 0), ("INSUFFICIENT_DATA", 1)])
+def test_report_m8_l2_reverifies_then_writes_only_to_external_output(
+    status: str,
+    expected_exit: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    capture_config = object()
+    analysis_config = object()
+    result = _fake_m8_l2_study_result(tmp_path, status)
+    report_data = object()
+    output = (tmp_path / "reports").absolute()
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(cli_module, "load_m8_l2_config", lambda path: capture_config)
+    monkeypatch.setattr(cli_module, "load_m8_l2_analysis_config", lambda path: analysis_config)
+
+    def fake_verify(*args: object, **kwargs: object) -> object:
+        calls.append(("verify", args, kwargs))
+        return result
+
+    def fake_load(*args: object, **kwargs: object) -> object:
+        calls.append(("load", args, kwargs))
+        return report_data
+
+    def fake_write(path: Path, data: object) -> tuple[Path, Path, Path]:
+        assert path == output
+        assert data is report_data
+        return (
+            path / "technical_report.md",
+            path / "executive_memo.md",
+            path / "model_comparison.md",
+        )
+
+    monkeypatch.setattr(cli_module, "verify_m8_l2_study_run", fake_verify)
+    monkeypatch.setattr(cli_module, "load_m8_l2_report_data", fake_load)
+    monkeypatch.setattr(cli_module, "write_l2_report_set", fake_write)
+    monkeypatch.setattr(cli_module, "canonical_report_data_sha256", lambda data: "c" * 64)
+
+    assert (
+        main(
+            [
+                "report-m8-l2",
+                *_m8_l2_study_cli_arguments(tmp_path, include_run_authority=True),
+                "--output-dir",
+                str(output),
+            ]
+        )
+        == expected_exit
+    )
+    assert [call[0] for call in calls] == ["verify", "load"]
+    assert calls[0][1:] == calls[1][1:]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["output_dir"] == str(output)
+    assert payload["technical_report"] == str(output / "technical_report.md")
+    assert payload["executive_memo"] == str(output / "executive_memo.md")
+    assert payload["model_comparison"] == str(output / "model_comparison.md")
+    assert payload["report_inputs_sha256"] == "c" * 64
+    assert payload["source_bundle_modified"] is False
+
+
+@pytest.mark.parametrize(
+    ("command", "include_run_authority"),
+    [
+        ("reproduce-m8-l2", False),
+        ("verify-m8-l2-run", True),
+        ("report-m8-l2", True),
+    ],
+)
+def test_m8_l2_final_commands_reject_noncanonical_session_authority_before_io(
+    command: str,
+    include_run_authority: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments = _m8_l2_study_cli_arguments(
+        tmp_path,
+        include_run_authority=include_run_authority,
+    )
+    arguments[arguments.index("--primary-manifest-sha256") + 1] = "A" * 64
+    if command == "report-m8-l2":
+        arguments.extend(["--output-dir", str(tmp_path / "reports")])
+    monkeypatch.setattr(
+        cli_module,
+        "load_m8_l2_config",
+        lambda path: pytest.fail("argument rejection must precede config I/O"),
+    )
+
+    with pytest.raises(SystemExit) as caught:
+        main([command, *arguments])
+
+    assert caught.value.code == 2
 
 
 def test_live_depth_capture_resnapshots_and_preserves_every_reconnect_epoch(

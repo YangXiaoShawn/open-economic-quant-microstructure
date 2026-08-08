@@ -133,6 +133,19 @@ replacement date or endpoint predictions. A successful bundle remains
 trade-only: execution, P&L, capacity, significance, and cross-instrument pooling
 are unauthorized by the protocol.
 
+That failure branch is the observed outcome of the declared study. The canonical
+bundle at `artifacts/runs/binance-m8-multidate` stopped on the ETHUSDT training
+archive after complete normalization found 53 `temporal.long_silence` warnings.
+BTCUSDT training normalization had already completed with 2,071,461 rows and no
+findings; ETHUSDT contributed 987,297 rows, zero errors, and 53 warnings. The
+producer did not start selection, create a development lock, open either held-out
+date, publish a prediction, or run execution. This is a valid, checksummed
+`INSUFFICIENT_DATA` result, not an incomplete attempt and not evidence against or
+for the economic hypothesis.
+`report-m8` revalidates the terminal and its external raw authority, then renders
+the failure report into a separate report directory. It does not repair, append
+to, or otherwise mutate the canonical failure bundle.
+
 ## Frozen live-L2 sessions
 
 Each declared date is captured by one command that waits for the exact common
@@ -143,10 +156,133 @@ never authenticates or exposes an order-entry path:
 make capture-m8-l2-session M8_L2_SESSION_DATE=2026-08-08
 ```
 
-The other declared dates are 2026-08-09, 2026-08-10, and 2026-08-11. A missed,
-disconnected, gapped, warning-bearing, or otherwise insufficient date is frozen
-as such and is never replaced. Only checksum-verified `COMPLETE` bundles may be
-consumed by later L2 research.
+The Aug 8, 2026 14:00--15:00 UTC train window passed without a capture attempt,
+raw data, or session bundle because no clean committed producer authority had
+been established. It must never be backfilled or replaced. After a clean source
+authority exists, the existing late-start branch may only publish the exact
+control-only `MISSED_WINDOW` terminal; that branch is tested to avoid invoking
+either symbol capture adapter. The other declared dates are 2026-08-09,
+2026-08-10, and 2026-08-11 and remain scheduled. A missed, disconnected, gapped,
+warning-bearing, or otherwise insufficient date is frozen as such and is never
+replaced. Only checksum-verified `COMPLETE` bundles may expose economic frames.
+A verified held-out `INSUFFICIENT_DATA` bundle may be consumed only as control
+evidence for an aggregate insufficiency terminal; its economic frames are never
+opened.
+
+The analysis specification is separately frozen in
+[`docs/M8_L2_ANALYSIS_CONTRACT.md`](docs/M8_L2_ANALYSIS_CONTRACT.md). Its strict
+loader, session input verifier, observed-interval feature/label construction,
+Aug 8/9 development-authority producer, no-refit Aug 10/11 evaluation, market-only
+execution evaluator, descriptive diagnostics, and artifact-driven report
+renderers are integrated behind tested CLI/Make producers and recursive
+verifiers. The software path is complete, but the Aug 8 window was already
+missed when this remaining-campaign source-freeze snapshot was prepared. No
+declared live session bundle existed when these tracked bytes were frozen, and
+the final four-date study can now only terminate honestly as insufficient; no L2
+metric or execution result is claimed here. During the remaining campaign, live
+status belongs only to the immutable campaign/session authorities; this tracked
+README must not be revised between sessions.
+Use the ignored run targets
+`artifacts/runs/binance-m8-l2-development-lock` for the durable development
+authority and `artifacts/runs/binance-m8-live-l2` for the final campaign bundle;
+do not place mutable study state in a source-controlled path.
+
+### Frozen L2 operating sequence
+
+Every later command requires explicit authorities; none scans for a "latest"
+bundle. The Make targets default to the frozen
+`M8_L2_CONFIG=configs/m8_l2_capture_study.toml` and
+`M8_L2_ANALYSIS_CONFIG=configs/m8_l2_analysis.toml`; do not substitute either
+during the campaign. After each capture, retain the emitted JSON. Its
+`output_root`, `session_manifest_sha256`, and `checksums` fields identify the
+bundle, manifest digest, and checksum file. Independently hash that exact
+checksum file:
+
+```bash
+shasum -a 256 /absolute/session/bundle/checksums.sha256
+```
+
+Map those values without abbreviation to the role-specific Make variables:
+
+- `M8_L2_<ROLE>_BUNDLE_DIR`
+- `M8_L2_<ROLE>_MANIFEST_SHA256`
+- `M8_L2_<ROLE>_CHECKSUMS_SHA256`
+
+where `<ROLE>` is `TRAIN`, `VALIDATION`, `PRIMARY`, or `REPLICATION`. Make accepts
+these as command-line assignments or exported environment variables. First
+verify every session. After the Aug 9 validation terminal, create and verify the
+development authority before any held-out analysis. If both development
+sessions are `COMPLETE`, the authority is `LOCKED` and contains the eight fitted
+child states. If either is a valid `INSUFFICIENT_DATA` terminal, the authority is
+`NOT_CREATED`; it contains typed control evidence and deliberately opens no
+economic frame. In either case it is immutable, and the Aug 10/11 captures must
+still proceed on their declared dates:
+
+```bash
+make verify-m8-l2-session M8_L2_BUNDLE_DIR=/absolute/session/bundle
+
+make lock-m8-l2-development \
+  M8_L2_DEVELOPMENT_LOCK_DIR=artifacts/runs/binance-m8-l2-development-lock \
+  M8_L2_TRAIN_BUNDLE_DIR=... M8_L2_TRAIN_MANIFEST_SHA256=... \
+  M8_L2_TRAIN_CHECKSUMS_SHA256=... \
+  M8_L2_VALIDATION_BUNDLE_DIR=... M8_L2_VALIDATION_MANIFEST_SHA256=... \
+  M8_L2_VALIDATION_CHECKSUMS_SHA256=...
+
+make verify-m8-l2-development-lock \
+  M8_L2_DEVELOPMENT_LOCK_DIR=artifacts/runs/binance-m8-l2-development-lock \
+  M8_L2_DEVELOPMENT_LOCK_SHA256=... \
+  M8_L2_TRAIN_BUNDLE_DIR=... M8_L2_TRAIN_MANIFEST_SHA256=... \
+  M8_L2_TRAIN_CHECKSUMS_SHA256=... \
+  M8_L2_VALIDATION_BUNDLE_DIR=... M8_L2_VALIDATION_MANIFEST_SHA256=... \
+  M8_L2_VALIDATION_CHECKSUMS_SHA256=...
+```
+
+Use the `development_lock_sha256` printed by the command for either `LOCKED` or
+`NOT_CREATED`. The direct CLI returns 1 for a valid `NOT_CREATED` command or
+verification; the Make wrapper normalizes that research-terminal code to 0.
+In both cases inspect the JSON status and preserve its `development_lock.json`,
+exact `_NOT_CREATED` marker (`not-created\n`), and printed authority SHA instead
+of retrying or changing dates. After Aug 11, pass
+the same development coordinates plus both held-out authorities to the final
+producer. A `NOT_CREATED` authority forces an aggregate `INSUFFICIENT_DATA`
+result, opens no economic frames from any of the four sessions, and reports the
+union of development and held-out control reasons. The command below explicitly
+lists all four role triplets; none may be omitted or discovered by wildcard:
+
+```bash
+make reproduce-m8-l2 \
+  M8_L2_DEVELOPMENT_LOCK_DIR=artifacts/runs/binance-m8-l2-development-lock \
+  M8_L2_DEVELOPMENT_LOCK_SHA256=... \
+  M8_L2_TRAIN_BUNDLE_DIR=... M8_L2_TRAIN_MANIFEST_SHA256=... \
+  M8_L2_TRAIN_CHECKSUMS_SHA256=... \
+  M8_L2_VALIDATION_BUNDLE_DIR=... M8_L2_VALIDATION_MANIFEST_SHA256=... \
+  M8_L2_VALIDATION_CHECKSUMS_SHA256=... \
+  M8_L2_PRIMARY_BUNDLE_DIR=... M8_L2_PRIMARY_MANIFEST_SHA256=... \
+  M8_L2_PRIMARY_CHECKSUMS_SHA256=... \
+  M8_L2_REPLICATION_BUNDLE_DIR=... M8_L2_REPLICATION_MANIFEST_SHA256=... \
+  M8_L2_REPLICATION_CHECKSUMS_SHA256=...
+```
+
+The producer prints `run_manifest_sha256` and `checksums_sha256`. Reuse the full
+four-session/development authority set and add those two values for
+`verify-m8-l2-run` and `report-m8-l2`. If that full set has been exported under
+the exact Make variable names above, the terminal commands are:
+
+```bash
+make verify-m8-l2-run M8_L2_RUN_MANIFEST_SHA256=... \
+  M8_L2_RUN_CHECKSUMS_SHA256=...
+make report-m8-l2 M8_L2_RUN_MANIFEST_SHA256=... \
+  M8_L2_RUN_CHECKSUMS_SHA256=...
+```
+
+`report-m8-l2` recursively verifies the final run and all external authorities,
+then writes to `artifacts/runs/binance-m8-live-l2-reports`. It never modifies the
+immutable run bundle. At the direct CLI boundary, capture, development, final
+producer, verifier, and report commands use exit 1 for a valid insufficiency
+terminal; Make maps that one code to success because GNU Make otherwise collapses
+it into a generic error. Automation must inspect the emitted JSON status and
+exact marker rather than infer research status from Make's process code or retry
+with changed dates or rules.
 
 ## Commands
 
@@ -156,6 +292,12 @@ consumed by later L2 research.
 | `make download-sample` | Download the bounded credential-free public trade sample |
 | `make download-m8` | Acquire the frozen M8 raw authority without opening archive members |
 | `make capture-m8-l2-session M8_L2_SESSION_DATE=YYYY-MM-DD` | Capture the frozen concurrent BTCUSDT/ETHUSDT L2 session for one declared date |
+| `make verify-m8-l2-session M8_L2_BUNDLE_DIR=<path>` | Verify a complete or `INSUFFICIENT_DATA` frozen L2 session bundle |
+| `make lock-m8-l2-development` | Atomically publish the Aug 8/9 development authority: fitted `LOCKED` state when both sessions pass, or control-only `NOT_CREATED` evidence when either is insufficient |
+| `make verify-m8-l2-development-lock` | Recursively verify either development-authority status against its path, SHA, configs, sessions, campaign, and clean source identity |
+| `make reproduce-m8-l2` | Produce a new immutable four-session L2 terminal bundle; use the explicit-digest verifier for an existing target |
+| `make verify-m8-l2-run` | Verify a complete or `INSUFFICIENT_DATA` L2 run plus all external authorities |
+| `make report-m8-l2` | Re-render verified L2 reports into a separate directory without mutating the run |
 | `make validate-data` | Run offline, non-mutating validation on the synthetic fixture |
 | `make validate-public-data` | Validate configured public normalized partitions incrementally |
 | `make smoke` | Produce or verify the immutable synthetic vertical slice |
@@ -174,7 +316,9 @@ consumed by later L2 research.
 The equivalent CLI is available as `microstructure` after setup. Run
 `microstructure --help` for the `ingest`, `acquire-m8`, `validate`, `reproduce`,
 `reproduce-m8`, `verify-m8`, `report-m8`, generic `verify`/`report`, the frozen
-`capture-m8-l2-session`, and exploratory research-only `collect-l2` commands.
+`capture-m8-l2-session`, `verify-m8-l2-session`, `lock-m8-l2-development`,
+`verify-m8-l2-development-lock`, `reproduce-m8-l2`, `verify-m8-l2-run`, and
+`report-m8-l2` commands, plus exploratory research-only `collect-l2`.
 
 ## What is implemented
 
@@ -199,23 +343,42 @@ The equivalent CLI is available as `microstructure` after setup. Run
   and clock-time labels and explicit censoring.
 - A common-fold model ladder: historical prior, unpenalized logistic regression,
   L2-regularized logistic grid, and shallow tree. Selection uses validation data;
-  the final test is frozen. Calibration and fixed-block bootstrap diagnostics are
-  serialized with their block count, status, and seed; the block scheme is not
-  presented as a complete model of cross-instrument or overlapping-label
-  dependence.
+  the final test is frozen. Calibration and protocol-specific paired bootstrap
+  diagnostics are serialized with their block count, status, and seed: the
+  trade-only study uses fixed dependency blocks, while the prospective L2 study
+  uses interval-local overlapping moving blocks. Neither is presented as a
+  complete model of cross-instrument or overlapping-label dependence.
 - OOS-only market/limit simulation with decision and order latency, maker/taker
   fees, adverse price rounding, top-depth caps, partial fills, a declared queue
   proxy, adverse selection, inventory limits, liquidation, turnover, and size
   sensitivity.
 - Atomic run production. `_SUCCESS` is written last; every other file is covered
-  by `checksums.sha256`. A completed target is read-only and reusable only after
-  verification.
+  by `checksums.sha256`. A completed target is read-only and reusable only when
+  the caller supplies its previously retained manifest and checksum digests to
+  the recursive verifier.
 - Raw-only M8 acquisition with exact official CHECKSUM evidence, bounded ZIP
   central-directory inspection, a hard retained-evidence byte ledger, an exact
   content-addressed inventory, and an atomic self-contained bundle copy. The M8
   producer enforces development-only normalization and final selected/prior
   fitting before a durable analysis lock, restores transparent numeric states
   for prediction, and fails closed at every held-out member-open boundary.
+- Frozen L2 campaign identity and strict session readers that reject changed
+  clean-source identities, tampered or symlinked artifacts, invalid Parquet
+  footers/schemas, row mismatches, and continuity violations before exposing a
+  frame. One outcome-blind nonce binds all dates to the canonical output-root
+  path/filesystem identity, loaded source/import origin, and a hashed fingerprint
+  of Python, platform, and eight production dependency versions. Development-only
+  regime/model locks, no-refit held-out evaluation, paired dependency-block
+  diagnostics, market-only scenarios, descriptive analyses, and generated L2
+  reports feed one atomic final producer. Fail-closed memory admissions reserve
+  at most 8 GiB for development materialization and 12 GiB for final production
+  (raw, causal, evaluation, descriptive, and execution workspaces), leaving at
+  least 4 GiB of the 16 GiB host envelope for the interpreter and libraries;
+  every major allocation is checked before and immediately after materialization.
+  Its verifier streams tabular checks,
+  recursively revalidates the four external sessions and development authority,
+  binds a self-contained authority snapshot, rejects tampering, and enforces
+  `COMPLETE` versus `INSUFFICIENT_DATA` semantics.
 - Generated technical report, two-page IC memo, held-out comparison table, and
   six-tab Streamlit dashboard, all downstream of frozen serialized artifacts.
 
@@ -239,19 +402,34 @@ checksums.sha256
 _SUCCESS
 ```
 
+The final L2 bundle uses the same immutable terminal convention but has its own
+study inventory: self-contained `authority/` snapshots, per-date/symbol/endpoint
+`causal_frames/`, locked `evaluation/`, seven descriptive analyses, partitioned
+market-scenario orders/fills/positions plus assumptions and metrics, a
+checksummed `report_inputs.json`, and three generated reports. An
+`INSUFFICIENT_DATA` terminal retains the exact authorities, any allowable causal
+evidence, report snapshot, and failure reports while omitting promoted
+evaluation, descriptive, and execution artifacts. The recursive verifier checks
+physical inventory, Parquet semantic claims, rendered-report equality, and all
+external authorities. Exactly one final marker closes the bundle: `_SUCCESS`
+contains `complete\n` for `COMPLETE`, while `INSUFFICIENT_DATA` contains
+`terminal\n` for the typed data-availability terminal.
+
 The semantic run key is derived from the configuration, immutable input identity,
 Git commit, the exact tracked/non-ignored source-tree digest, and seed—not
 generation timestamps. Reuse additionally requires the current source identity
-to match; an older clean bundle cannot masquerade as evidence for changed code.
+and caller-retained output manifest/checksum digests to match; an older or
+coordinatedly rewritten bundle cannot masquerade as evidence for changed code.
 
 ## Main findings and current evidence
 
-As of 2026-08-08:
+Pre-capture source-freeze snapshot as of 2026-08-08:
 
-- The integrated offline suite passes 574 tests, Ruff, and strict mypy across 40
-  source modules covering the
-  data, reconstruction, timing, modeling, execution, reporting, dashboard, and
-  pipeline boundaries.
+- The latest settled integration gates passed Ruff, formatting, strict mypy, and
+  the full pytest suite across the data, reconstruction, timing, modeling,
+  execution, reporting, dashboard, and pipeline boundaries. Exact test/module
+  counts belong to the dated verification ledger in `STATUS.md`, not to an
+  empirical claim.
 - A fixed public sample for 2024-01-02 downloaded and normalized 10,000 real
   aggregate trades: 5,000 each for BTCUSDT and ETHUSDT. The configured cap was
   reached for both instruments, so both ranges are explicitly marked incomplete.
@@ -270,13 +448,18 @@ As of 2026-08-08:
   verified raw-only authority
   `data/m8/_manifests/m8-acquisition.manifest-04d5c01f3810b6a300ec.json`
   (SHA-256 `04d5c01f3810b6a300ec0f9317052f254b2bec5d89bc0dfefd18cd71ad6582e6`).
-  The raw-acquisition phase opened no CSV member. A subsequent clean-source
-  attempt opened development training members only and stopped at its frozen DQ
-  gate before selection, locks, or held-out access. Its source-tagged evidence
-  is retained but not promoted because it exposed a raw/derived bundle-layout
-  verifier defect. The corrected producer generates a fresh self-verified
-  terminal under a new clean commit; that bundle, rather than prose here, is the
-  authority for its final status.
+  The raw-acquisition phase opened no CSV member. The corrected clean-source
+  producer then published and verified the canonical
+  `artifacts/runs/binance-m8-multidate` terminal at commit
+  `88060613abe211cd8e80a3499678fca830f8ba2d`. It stopped at the declared ETHUSDT
+  training DQ gate with 53 warnings, before selection, locks, or held-out access;
+  execution is `NOT_RUN`. The bundle, rather than this summary, is the authority
+  for its exact status and evidence inventory.
+- The live-L2 capture protocol and analysis contract are frozen, and strict
+  capture, session-verification, input, development-lock, locked-evaluation,
+  market-scenario, descriptive-analysis, and report components are covered by
+  offline tests. No real Aug 8--11 L2 session had been promoted at source freeze,
+  so these tracked bytes contain no book-based empirical result.
 
 This distinction is the main research conclusion so far: a functioning simulator
 is not evidence that a market effect exists.
@@ -290,16 +473,21 @@ not deployable capacity. A short crypto interval cannot generalize across dates,
 venues, or asset classes; overlapping horizons also reduce effective sample size
 and make multiplicity control necessary.
 
-The post-commit empirical sequence is to execute the frozen M8 multi-date trade
-study from that explicit raw-only authority under a clean commit, measure peak
-resident memory on the complete archives, and publish its complete or
-`INSUFFICIENT_DATA` bundle.
-Book-dependent claims remain a separate milestone requiring the already-frozen
-prospective, simultaneous BTCUSDT/ETHUSDT local-L2 sessions and continuous valid
-epochs. No trade-only result can substitute for that evidence.
+The trade-only study is closed at its predeclared `INSUFFICIENT_DATA` gate and
+must not be rerun with replacement dates or a relaxed warning policy. The next
+empirical milestone is the already-frozen prospective, simultaneous
+BTCUSDT/ETHUSDT local-L2 study. It requires four declared session terminals, a
+single clean campaign source identity, continuous valid observed intervals, an
+Aug 8/9 development authority durably published before either held-out session,
+and unchanged Aug 10/11 evaluation when that authority is `LOCKED`. A
+`NOT_CREATED` authority records why fitting was forbidden, while the declared
+held-out captures still proceed and the final producer opens no economic frame.
+A failed session remains evidence of insufficiency; no trade-only result can
+substitute for book evidence.
 
 See [the research protocol](docs/RESEARCH_PROTOCOL.md), [data contract](docs/DATA_CONTRACT.md),
-[project plan](docs/PROJECT_PLAN.md), [decision log](docs/DECISION_LOG.md), and
+[project plan](docs/PROJECT_PLAN.md), [decision log](docs/DECISION_LOG.md),
+[L2 analysis contract](docs/M8_L2_ANALYSIS_CONTRACT.md), and
 [methodology limitations](reports/methodology_limitations.md) for the exact
 contracts and promotion rules.
 

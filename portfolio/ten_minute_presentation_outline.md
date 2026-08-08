@@ -12,8 +12,12 @@
 - `SYNTHETIC_SMOKE`: software behavior only.
 - `PUBLIC_SAMPLE_PARTIAL`: fixed interval, limited inference.
 - `FULL_DATA`: broader manifested study, still simulated and venue-specific.
-- Current canonical status: synthetic vertical slice completed for software
-  validation; bounded public trade ingestion completed; no performance claim.
+- `INSUFFICIENT_DATA`: a declared gate prevented evaluation; no missing estimate
+  is replaced with zero or a substitute date.
+- Pre-capture source-freeze status: synthetic vertical slice and bounded public trade
+  study completed at their stated tiers; full-archive trade M8 stopped on 53
+  ETHUSDT training warnings before selection or held-out access; no performance
+  claim and no promoted L2 result.
 
 ## 1:50–3:05 — Event-driven data architecture
 
@@ -49,9 +53,13 @@
 
 - One frozen run bundle records resolved config, input hashes, actual UTC period,
   seed, runtime, Git commit or `UNBORN`, and dirty state.
-- Checksums plus `_SUCCESS` prevent dashboards from reading partial output.
+- Checksums plus exact `_SUCCESS` or typed `INSUFFICIENT_DATA` markers prevent
+  readers from treating partial output as a terminal bundle.
 - Technical report, model table, IC memo, and Streamlit app read frozen artifacts;
   they do not retrain or backfill missing metrics.
+- The four-date L2 path adds an outcome-blind campaign/runtime/storage identity,
+  explicit session/lock/run digests, recursive verification, and external report
+  rendering that never mutates the empirical bundle.
 
 ## 8:05–9:10 — What would count as evidence?
 
@@ -59,12 +67,18 @@
 - Calibration and uncertainty, not ROC-AUC alone.
 - Net economics robust to defensible fees, latency, fills, and liquidation.
 - Transparent failures and multiplicity-aware interpretation.
+- For frozen L2: one clean campaign identity, valid simultaneous observed
+  intervals, and an Aug 8/9 `LOCKED | NOT_CREATED` development authority that
+  predates all Aug 10/11 access; only `LOCKED` permits economic-frame access.
 
 ## 9:10–10:00 — Limitations and next experiment
 
 - Public event time, queue visibility, hidden liquidity, and venue generalization
   remain limitations.
-- Next: freeze a multi-date public protocol, capture continuous local book epochs,
-  and test predeclared adjacent periods without changing the specification.
+- Next: use the completed frozen L2 producer to capture only the Aug 8--11
+  simultaneous sessions, then run all four horizons without refit or a
+  replacement date and complete peak-memory/clean-room verification. Market-only
+  scenarios are not realized execution; capacity and profitability claims
+  remain forbidden.
 - Close with the governance boundary: research and simulation only; no live-order
   path.

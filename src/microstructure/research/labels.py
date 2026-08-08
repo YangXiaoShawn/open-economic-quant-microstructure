@@ -117,12 +117,16 @@ def _forward_mid_join(
     book_time_column: str,
     mid_column: str,
     target_column: str,
+    book_identity_column: str | None = None,
 ) -> pl.DataFrame:
-    right = books.select(
+    right_columns: list[pl.Expr | str] = [
         *_GROUP_COLUMNS,
         pl.col(book_time_column).alias("_matched_target_ts_ns"),
         pl.col(mid_column).alias("_matched_target_mid"),
-    ).sort(["_matched_target_ts_ns", *_GROUP_COLUMNS])
+    ]
+    if book_identity_column is not None:
+        right_columns.append(pl.col(book_identity_column).alias("_matched_target_identity"))
+    right = books.select(right_columns).sort(["_matched_target_ts_ns", *_GROUP_COLUMNS])
     return (
         decisions.sort([target_column, *_GROUP_COLUMNS])
         .join_asof(
@@ -147,6 +151,7 @@ def build_clock_time_mid_labels(
     mid_column: str = "mid_price",
     book_time_column: str | None = None,
     book_mid_column: str | None = None,
+    book_identity_column: str | None = None,
 ) -> pl.DataFrame:
     """Build long-form clock-time return/direction labels within book segments."""
 
@@ -163,6 +168,10 @@ def build_clock_time_mid_labels(
     target_time = book_time_column or decision_time_column
     target_mid = book_mid_column or mid_column
     books = _valid_books(target_states, time_column=target_time, mid_column=target_mid)
+    if book_identity_column is not None:
+        _require(books, (book_identity_column,), "clock-time target states")
+        if books.get_column(book_identity_column).null_count():
+            raise AuxiliaryLabelError("clock-time target identity must not contain nulls")
     eligible_decisions = (
         decisions.filter(pl.col("is_valid"))
         if book_states is None and "is_valid" in decisions.columns
@@ -180,6 +189,7 @@ def build_clock_time_mid_labels(
             book_time_column=target_time,
             mid_column=target_mid,
             target_column="clock_target_ts_ns",
+            book_identity_column=book_identity_column,
         ).with_columns(
             (pl.col("_matched_target_ts_ns") - pl.col("clock_target_ts_ns")).alias(
                 "clock_target_staleness_ns"
@@ -190,7 +200,7 @@ def build_clock_time_mid_labels(
             censored = censored | (
                 pl.col("clock_target_staleness_ns") > spec.max_target_staleness_ns
             )
-        outputs.append(
+        labeled = (
             joined.with_columns(
                 censored.alias("clock_right_censored"),
                 pl.lit(horizon_ns, dtype=pl.Int64).alias("clock_horizon_ns"),
@@ -238,9 +248,20 @@ def build_clock_time_mid_labels(
                 .alias("clock_future_mid_direction")
             )
         )
+        if book_identity_column is not None:
+            labeled = labeled.with_columns(
+                pl.when(~pl.col("clock_right_censored"))
+                .then(pl.col("_matched_target_identity"))
+                .otherwise(None)
+                .alias("clock_label_information_end_identity")
+            )
+        outputs.append(labeled)
+    drop_columns = ["_matched_target_ts_ns", "_matched_target_mid"]
+    if book_identity_column is not None:
+        drop_columns.append("_matched_target_identity")
     return (
         pl.concat(outputs, how="diagonal_relaxed")
-        .drop("_matched_target_ts_ns", "_matched_target_mid")
+        .drop(*drop_columns)
         .sort([decision_time_column, "clock_horizon_ns", *_GROUP_COLUMNS])
     )
 

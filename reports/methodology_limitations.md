@@ -9,6 +9,10 @@
 - `FULL_DATA` is reserved for a manifested empirical study meeting its declared
   coverage and acceptance tests. It still represents research and simulation,
   not realized live performance.
+- `INSUFFICIENT_DATA` is a terminal evidence status, not a lower-quality set of
+  model estimates. It means a predeclared input or quality gate prevented the
+  required evaluation; absent predictions and execution fields remain absent
+  rather than being imputed, rerun on replacement dates, or reported as zeros.
 
 Evidence tier is derived from data manifests. A synthetic source cannot be
 promoted by changing a report label.
@@ -45,6 +49,15 @@ Public endpoints can change schema, retention, throttling, or geographic
 availability. Download success does not establish completeness. Exchange
 maintenance, symbol-rule changes, clock behavior, delistings, and missing markets
 can bias a selected sample.
+
+The canonical full-archive trade M8 result illustrates this boundary. BTCUSDT
+training normalization completed on 2,071,461 rows with no findings. ETHUSDT
+training normalization completed on 987,297 rows with zero errors but 53 long-
+silence warnings, violating the frozen zero-warning gate. Selection did not
+start, neither held-out date was opened, and execution was not run. This supports
+the conclusion that the declared trade study was data-insufficient; it neither
+supports nor refutes the economic hypothesis. Relaxing the warning rule or
+choosing another date after seeing that terminal would invalidate the protocol.
 
 ## Market-state and feature measurement
 
@@ -100,6 +113,61 @@ very short runs. Simulated P&L excludes operational failures, exchange outages,
 funding and financing where omitted, taxes, custody, counterparty risk, and live
 model drift. The project contains no order-entry path and is not a deployment
 system.
+
+The frozen live-L2 extension narrows execution further. It permits market-order
+scenarios only, with threshold, reference notional/depth, lot rounding, L1 fill
+cap, inventory, liquidation, fee, and decision/order latency rules fixed before
+held-out access. Latencies in this campaign are event counts, not milliseconds.
+Recorded L1 limits the scenario fill and any residual is cancelled; no deeper
+walk, hidden liquidity, endogenous reaction, or true impact is modeled. The
+frozen zero-extra-slippage setting is one transparent scenario, not evidence
+that slippage is zero. Capacity, realized execution, limit-fill, queue-priority,
+and profitability claims remain forbidden.
+
+## Prospective live-L2 boundary
+
+The Aug 8--11 BTCUSDT/ETHUSDT sessions must share one clean capture runtime
+identity and pass the exact simultaneous observed-interval gates. Raw websocket
+receipt time is available, but it is internet-path receipt time—not a colocated
+clock or matching-engine acknowledgment. A long nominal session cannot conceal
+gaps: features and labels are limited to verified observed intervals, and clock
+targets are censored if no sufficiently fresh same-interval state exists.
+
+The campaign authority also binds an outcome-blind nonce, the one canonical
+output-root path and filesystem identity, the loaded package/module origin, and
+a hashed Python/platform/production-dependency fingerprint. These controls make
+environment and storage substitution visible, but they do not make public-
+internet latency colocated or prove that the exchange feed was complete.
+
+Regime thresholds are fit on Aug 8 only. When both development sessions are
+complete, model selection and calibration use Aug 8/9 only and must be committed
+in eight symbol-by-endpoint child locks plus one aggregate `LOCKED` authority
+before Aug 10/11 frames are exposed. If either development session is
+insufficient, a control-only `NOT_CREATED` authority is committed instead and no
+economic frame from any session is opened. Held-out evaluation restores only a
+`LOCKED` state without refit. Paired moving-block intervals
+partially address serial dependence but do not prove independence, solve all
+overlapping-horizon dependence, correct every model/horizon/regime comparison,
+or authorize a p-value. Directional agreement across two adjacent one-hour
+sessions is still a narrow venue- and period-specific result.
+
+At the pre-capture source freeze, these were software and governance controls,
+not book evidence: no declared L2 session bundle or downstream L2 metric had
+been promoted. This tracked file is intentionally unchanged during the four-day
+campaign. The exact field-level authority is
+`docs/M8_L2_ANALYSIS_CONTRACT.md`; any eventual numbers must come from a verified
+generated bundle rather than this source-controlled limitations file.
+
+The completed final producer takes four explicit session path/manifest/checksum
+authorities plus the development-authority path and SHA. A development or
+held-out session failure
+or no eligible label produces a checksummed `INSUFFICIENT_DATA` terminal with no
+promoted evaluation or execution, rather than an opportunistic retry. A complete
+run copies exact control authorities into a self-contained snapshot but still
+revalidates their external originals. Reports are re-rendered from a checksummed
+report-input snapshot into a separate directory; report generation cannot mutate
+the immutable empirical bundle. These are integrity and governance guarantees,
+not proof that the economic design or market conclusion is correct.
 
 ## Reporting and generalizability
 

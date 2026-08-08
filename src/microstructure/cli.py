@@ -16,7 +16,7 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import pyarrow as pa  # type: ignore[import-untyped]
 
@@ -44,13 +44,45 @@ from microstructure.m8_acquisition import (
     acquire_m8_archives,
 )
 from microstructure.m8_config import load_m8_config
+from microstructure.m8_l2_analysis_config import (
+    M8L2AnalysisConfig,
+    load_m8_l2_analysis_config,
+)
 from microstructure.m8_l2_binance import BinanceM8L2Capture
-from microstructure.m8_l2_capture import M8L2SessionBundle, capture_m8_l2_session
-from microstructure.m8_l2_config import load_m8_l2_config
+from microstructure.m8_l2_capture import (
+    M8L2SessionBundle,
+    capture_m8_l2_session,
+    verify_m8_l2_session_bundle,
+)
+from microstructure.m8_l2_config import M8L2StudyConfig, load_m8_l2_config
+from microstructure.m8_l2_development import (
+    L2DevelopmentInputVerifier,
+    L2DevelopmentLockResult,
+    lock_m8_l2_development,
+    verify_m8_l2_development_lock,
+)
+from microstructure.m8_l2_inputs import (
+    L2CampaignRuntimeIdentity,
+    L2SessionFileAuthority,
+    verify_m8_l2_development_input,
+)
+from microstructure.m8_l2_pipeline import (
+    L2StudySessionAuthority,
+    M8L2StudyRunResult,
+    load_m8_l2_report_data,
+    reproduce_m8_l2_study,
+    verify_m8_l2_study_run,
+)
 from microstructure.m8_pipeline import M8RunResult, reproduce_m8, verify_m8_result
 from microstructure.pipeline import reproduce
 from microstructure.provenance import read_json, sha256_file, utc_now_iso, write_json
-from microstructure.reporting import load_run_bundle, verify_checksums, write_report_set
+from microstructure.reporting import (
+    canonical_report_data_sha256,
+    load_run_bundle,
+    verify_checksums,
+    write_l2_report_set,
+    write_report_set,
+)
 
 
 def _json_default(value: object) -> object:
@@ -281,6 +313,135 @@ def _cmd_verify_m8(args: argparse.Namespace) -> int:
     return 0
 
 
+def _external_report_dir(run_root: Path, requested: Path | None) -> Path:
+    frozen_root = run_root.resolve()
+    output = (
+        requested.resolve()
+        if requested is not None
+        else frozen_root.with_name(f"{frozen_root.name}-reports")
+    )
+    if output == frozen_root or frozen_root in output.parents:
+        raise ValueError("report output directory must be outside the immutable run bundle")
+    return output
+
+
+def _atomic_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        text=True,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _report_mapping(value: object, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"verified M8 {label} is not a JSON object")
+    return cast(Mapping[str, Any], value)
+
+
+def _report_value(value: object) -> str:
+    if isinstance(value, (dict, list, tuple)):
+        rendered = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    elif value is None:
+        rendered = "null"
+    elif value is True:
+        rendered = "true"
+    elif value is False:
+        rendered = "false"
+    else:
+        rendered = str(value)
+    return " ".join(rendered.replace("`", "'").split())
+
+
+def _m8_failure_period(failure: Mapping[str, Any]) -> tuple[str, str]:
+    dates: list[str] = []
+    for key in ("completed_normalizations", "stopped_before"):
+        rows = failure.get(key)
+        if isinstance(rows, list):
+            dates.extend(
+                str(row["date"])
+                for row in rows
+                if isinstance(row, Mapping)
+                and isinstance(row.get("date"), str)
+                and len(str(row["date"])) == 10
+            )
+    failed_date = failure.get("failed_date")
+    if isinstance(failed_date, str) and len(failed_date) == 10:
+        dates.append(failed_date)
+    if not dates:
+        raise ValueError("verified M8 failure does not declare its study period")
+    return min(dates), max(dates)
+
+
+def _render_m8_insufficient_report(run_root: Path) -> str:
+    failure = _report_mapping(read_json(run_root / "failure.json"), "failure record")
+    provenance = _report_mapping(read_json(run_root / "provenance.json"), "provenance")
+    manifest = _report_mapping(read_json(run_root / "run_manifest.json"), "run manifest")
+    research = _report_mapping(manifest.get("research"), "run research section")
+    execution = _report_mapping(
+        manifest.get("execution_assumptions"),
+        "execution-assumptions section",
+    )
+    git = _report_mapping(provenance.get("git"), "Git identity")
+    period_start, period_end = _m8_failure_period(failure)
+    completed_symbols = failure.get("selection_completed_symbols")
+    evaluated_symbols = failure.get("endpoint_evaluation_completed_symbols")
+    heldout_member = failure.get("held_out_member_opened", "not separately recorded")
+    return f"""# M8 study result: INSUFFICIENT_DATA
+
+> VERIFIED TERMINAL TRADE-ONLY RESEARCH RESULT — NO DATE REPLACEMENT, LIVE TRADING, OR PERFORMANCE CLAIM
+
+## Frozen scope and failure
+
+- Observed/attempted archive date span: `{period_start}` through `{period_end}` (UTC daily archives)
+- Failed coordinate: symbol=`{_report_value(failure.get("failed_symbol"))}`, date=`{_report_value(failure.get("failed_date"))}`, role=`{_report_value(failure.get("failed_role"))}`
+- Failure stage: `{_report_value(failure.get("failure_stage"))}`
+- Reason code: `{_report_value(failure.get("reason_code"))}`
+- Diagnostic: `{_report_value(failure.get("reason"))}`
+- Replacement date selected: `{_report_value(failure.get("replacement_date_selected"))}`; reselection performed: `{_report_value(failure.get("reselection_performed"))}`
+
+## Immutable authority
+
+- Config semantic SHA-256: `{_report_value(failure.get("config_sha256"))}`
+- Config source SHA-256: `{_report_value(failure.get("config_source_sha256"))}`
+- Raw acquisition manifest SHA-256: `{_report_value(failure.get("raw_acquisition_manifest_sha256"))}`
+- Bundled raw acquisition manifest SHA-256: `{_report_value(failure.get("bundled_raw_acquisition_manifest_sha256"))}`
+- Protocol SHA-256: `{_report_value(failure.get("protocol_sha256"))}`
+- Git commit: `{_report_value(git.get("commit"))}`
+- Git dirty: `{_report_value(git.get("dirty"))}`
+- Source-tree SHA-256: `{_report_value(git.get("source_tree_sha256"))}`
+
+## Terminal analysis states
+
+- Candidate selection started: `{_report_value(failure.get("selection_started"))}`; completed symbols: `{_report_value(completed_symbols)}`
+- Aggregate analysis lock committed: `{_report_value(failure.get("aggregate_lock_committed"))}`
+- Held-out member opened: `{_report_value(heldout_member)}`
+- Endpoint evaluation started: `{_report_value(failure.get("endpoint_evaluation_started"))}`; completed: `{_report_value(failure.get("endpoint_evaluation_completed"))}`; completed symbols: `{_report_value(evaluated_symbols)}`
+- Predictions published: `{_report_value(failure.get("predictions_published"))}`; endpoint artifacts published: `{_report_value(failure.get("endpoint_artifacts_published"))}`
+- Research endpoint status: `{_report_value(research.get("endpoint_status"))}`
+- Execution status: `{_report_value(execution.get("status"))}`; fills calculated: `{_report_value(execution.get("fills_calculated"))}`; P&L calculated: `{_report_value(execution.get("pnl_calculated"))}`; capacity calculated: `{_report_value(execution.get("capacity_calculated"))}`
+
+This terminal result preserves the frozen calendar and failure evidence. It authorizes no execution, profitability, capacity, statistical-significance, or persistent-alpha claim.
+"""
+
+
 def _cmd_report_m8(args: argparse.Namespace) -> int:
     config = load_m8_config(args.config)
     result = verify_m8_result(
@@ -289,13 +450,9 @@ def _cmd_report_m8(args: argparse.Namespace) -> int:
         raw_manifest_path=args.raw_manifest,
         raw_manifest_sha256=args.raw_manifest_sha256,
     )
+    output = _external_report_dir(result.path, args.output_dir)
     if result.status == "COMPLETE":
         bundle = load_run_bundle(result.path)
-        output = (
-            Path(args.output_dir).resolve()
-            if args.output_dir
-            else bundle.root.with_name(f"{bundle.root.name}-reports")
-        )
         paths = write_report_set(bundle, output)
         _print_json(
             {
@@ -306,14 +463,30 @@ def _cmd_report_m8(args: argparse.Namespace) -> int:
             }
         )
     else:
-        failure_report = result.path / "reports" / "insufficient_data.md"
-        if not failure_report.is_file():
-            raise ValueError("verified INSUFFICIENT_DATA result lacks its failure report")
+        rendered = _render_m8_insufficient_report(result.path)
+        confirmed = verify_m8_result(
+            args.run_dir,
+            config,
+            raw_manifest_path=args.raw_manifest,
+            raw_manifest_sha256=args.raw_manifest_sha256,
+        )
+        if (
+            confirmed.status != "INSUFFICIENT_DATA"
+            or confirmed.path.resolve() != result.path.resolve()
+            or confirmed.raw_manifest_sha256 != result.raw_manifest_sha256
+            or confirmed.normalized_manifest_sha256 is not None
+        ):
+            raise ValueError("M8 failure authority changed while rendering its report")
+        failure_report = output / "insufficient_data.md"
+        _atomic_text(failure_report, rendered)
         _print_json(
             {
                 **_m8_run_result_payload(result),
+                "output_dir": output,
                 "report": failure_report,
-                "reports_regenerated": False,
+                "report_sha256": sha256_file(failure_report),
+                "reports_regenerated": True,
+                "source_bundle_modified": False,
             }
         )
     return 0
@@ -1212,7 +1385,7 @@ def _m8_l2_session_payload(result: M8L2SessionBundle) -> dict[str, object]:
         "session_manifest_sha256": result.manifest_sha256,
         "checksums": result.checksum_path,
         "terminal_marker": result.marker_path,
-        "reason_codes": list(result.reason_codes),
+        "reason_codes": list(getattr(result, "reason_codes", ())),
         "source": "binance_spot_public_live_diff_depth",
         "live_trading": False,
     }
@@ -1230,6 +1403,403 @@ def _cmd_capture_m8_l2_session(args: argparse.Namespace) -> int:
     )
     _print_json(_m8_l2_session_payload(result))
     return 0 if result.status == "COMPLETE" else 1
+
+
+def _cmd_verify_m8_l2_session(args: argparse.Namespace) -> int:
+    config = load_m8_l2_config(args.config)
+    result = verify_m8_l2_session_bundle(args.bundle_dir, expected_config=config)
+    payload = _m8_l2_session_payload(result)
+    payload["integrity"] = "verified"
+    _print_json(payload)
+    return 0
+
+
+def _m8_l2_development_payload(
+    result: L2DevelopmentLockResult,
+    *,
+    integrity: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "status": getattr(result, "status", "LOCKED"),
+        "development_lock_dir": result.root,
+        "development_lock": result.aggregate_path,
+        "development_lock_sha256": result.aggregate_sha256,
+        "terminal_marker": result.marker_path,
+        "created_at_utc": result.created_at_utc,
+        "children": [
+            {
+                "symbol": child.symbol,
+                "endpoint": child.endpoint,
+                "lock": child.path,
+                "lock_sha256": child.sha256,
+                "selection_lock_sha256": child.selection_lock_sha256,
+                "fitted_state_sha256": child.fitted_state_sha256,
+            }
+            for child in result.children
+        ],
+        "reason_codes": list(getattr(result, "reason_codes", ())),
+        "heldout_accessed": False,
+        "source": "binance_spot_public_live_diff_depth",
+        "live_trading": False,
+    }
+    if integrity is not None:
+        payload["integrity"] = integrity
+    return payload
+
+
+def _verify_m8_l2_session_authority(
+    bundle_dir: Path,
+    *,
+    expected_config: M8L2StudyConfig,
+    expected_date: str,
+    expected_role: str,
+    manifest_sha256: str,
+    checksums_sha256: str,
+) -> M8L2SessionBundle:
+    bundle = verify_m8_l2_session_bundle(bundle_dir, expected_config=expected_config)
+    if bundle.session_date != expected_date or bundle.role != expected_role:
+        raise ValueError(
+            f"explicit L2 session coordinate differs from {expected_date} {expected_role}"
+        )
+    if bundle.manifest_sha256 != manifest_sha256:
+        raise ValueError(f"explicit {expected_role} session manifest differs from expected SHA-256")
+    if sha256_file(bundle.checksum_path) != checksums_sha256:
+        raise ValueError(f"explicit {expected_role} session checksums differ from expected SHA-256")
+    return bundle
+
+
+def _m8_l2_insufficient_development_payload(
+    sessions: Sequence[M8L2SessionBundle],
+) -> dict[str, object]:
+    return {
+        "status": "INSUFFICIENT_DATA",
+        "stage": "development_lock",
+        "reason_code": "DEVELOPMENT_SESSION_NOT_COMPLETE",
+        "sessions": [
+            {
+                "session_id": session.session_id,
+                "session_date": session.session_date,
+                "role": session.role,
+                "status": session.status,
+                "session_manifest": session.manifest_path,
+                "session_manifest_sha256": session.manifest_sha256,
+                "checksums": session.checksum_path,
+                "checksums_sha256": sha256_file(session.checksum_path),
+                "reason_codes": list(session.reason_codes),
+            }
+            for session in sessions
+        ],
+        "heldout_accessed": False,
+        "source": "binance_spot_public_live_diff_depth",
+        "live_trading": False,
+    }
+
+
+def _development_session_authorities(
+    args: argparse.Namespace,
+) -> dict[str, L2SessionFileAuthority]:
+    return {
+        "2026-08-08": L2SessionFileAuthority(
+            manifest_sha256=args.train_manifest_sha256,
+            checksums_sha256=args.train_checksums_sha256,
+        ),
+        "2026-08-09": L2SessionFileAuthority(
+            manifest_sha256=args.validation_manifest_sha256,
+            checksums_sha256=args.validation_checksums_sha256,
+        ),
+    }
+
+
+def _explicit_development_input_loader(
+    authorities: Mapping[str, L2SessionFileAuthority],
+) -> L2DevelopmentInputVerifier:
+    def load(
+        bundle_dir: str | Path,
+        *,
+        expected_config: M8L2StudyConfig,
+        expected_date: str,
+        expected_role: str,
+        expected_file_authority: object | None = None,
+        expected_campaign: object | None = None,
+    ) -> Any:
+        authority = authorities.get(expected_date)
+        if authority is None:
+            raise ValueError("development input date is outside the explicit authority set")
+        if expected_role not in ("train", "validation"):
+            raise ValueError("development input role is outside the explicit authority set")
+        if expected_file_authority is not None and expected_file_authority != authority:
+            raise ValueError("development input authority differs from the explicit CLI authority")
+        return verify_m8_l2_development_input(
+            bundle_dir,
+            expected_config=expected_config,
+            expected_date=expected_date,
+            expected_role=cast(Literal["train", "validation"], expected_role),
+            expected_file_authority=authority,
+            expected_campaign=cast(L2CampaignRuntimeIdentity | None, expected_campaign),
+        )
+
+    return load
+
+
+def _load_explicit_development_sessions(
+    args: argparse.Namespace,
+    capture_config: M8L2StudyConfig,
+) -> tuple[M8L2SessionBundle, M8L2SessionBundle]:
+    train = _verify_m8_l2_session_authority(
+        args.train_bundle_dir.absolute(),
+        expected_config=capture_config,
+        expected_date="2026-08-08",
+        expected_role="train",
+        manifest_sha256=args.train_manifest_sha256,
+        checksums_sha256=args.train_checksums_sha256,
+    )
+    validation = _verify_m8_l2_session_authority(
+        args.validation_bundle_dir.absolute(),
+        expected_config=capture_config,
+        expected_date="2026-08-09",
+        expected_role="validation",
+        manifest_sha256=args.validation_manifest_sha256,
+        checksums_sha256=args.validation_checksums_sha256,
+    )
+    return train, validation
+
+
+def _cmd_lock_m8_l2_development(args: argparse.Namespace) -> int:
+    capture_config = load_m8_l2_config(args.capture_config)
+    analysis_config = load_m8_l2_analysis_config(args.analysis_config)
+    _load_explicit_development_sessions(args, capture_config)
+    result = lock_m8_l2_development(
+        capture_config,
+        analysis_config,
+        args.train_bundle_dir.absolute(),
+        args.validation_bundle_dir.absolute(),
+        args.lock_dir.absolute(),
+        input_loader=_explicit_development_input_loader(_development_session_authorities(args)),
+        expected_session_file_authorities=_development_session_authorities(args),
+    )
+    _print_json(_m8_l2_development_payload(result))
+    return 0 if getattr(result, "status", "LOCKED") == "LOCKED" else 1
+
+
+def _cmd_verify_m8_l2_development_lock(args: argparse.Namespace) -> int:
+    capture_config = load_m8_l2_config(args.capture_config)
+    analysis_config = load_m8_l2_analysis_config(args.analysis_config)
+    _load_explicit_development_sessions(args, capture_config)
+    result = verify_m8_l2_development_lock(
+        capture_config,
+        analysis_config,
+        args.train_bundle_dir.absolute(),
+        args.validation_bundle_dir.absolute(),
+        args.lock_dir.absolute(),
+        expected_lock_sha256=args.development_lock_sha256,
+    )
+    _print_json(_m8_l2_development_payload(result, integrity="verified"))
+    return 0 if getattr(result, "status", "LOCKED") == "LOCKED" else 1
+
+
+def _m8_l2_study_authorities(
+    args: argparse.Namespace,
+) -> tuple[
+    L2StudySessionAuthority,
+    L2StudySessionAuthority,
+    L2StudySessionAuthority,
+    L2StudySessionAuthority,
+]:
+    def authority(role: str) -> L2StudySessionAuthority:
+        return L2StudySessionAuthority(
+            bundle_path=getattr(args, f"{role}_bundle_dir").absolute(),
+            manifest_sha256=getattr(args, f"{role}_manifest_sha256"),
+            checksums_sha256=getattr(args, f"{role}_checksums_sha256"),
+        )
+
+    return (
+        authority("train"),
+        authority("validation"),
+        authority("primary"),
+        authority("replication"),
+    )
+
+
+def _m8_l2_study_payload(
+    result: M8L2StudyRunResult,
+    *,
+    integrity: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "status": result.status,
+        "run_dir": result.root,
+        "run_manifest": result.manifest_path,
+        "run_manifest_sha256": result.manifest_sha256,
+        "checksums": result.checksum_path,
+        "checksums_sha256": result.checksum_sha256,
+        "terminal_marker": result.marker_path,
+        "reason_codes": list(result.reason_codes),
+        "source": "binance_spot_public_live_diff_depth",
+        "live_trading": False,
+    }
+    if integrity is not None:
+        payload["integrity"] = integrity
+    return payload
+
+
+def _m8_l2_study_arguments(
+    args: argparse.Namespace,
+    capture_config: M8L2StudyConfig,
+    analysis_config: M8L2AnalysisConfig,
+) -> tuple[
+    M8L2StudyConfig,
+    M8L2AnalysisConfig,
+    L2StudySessionAuthority,
+    L2StudySessionAuthority,
+    Path,
+    str,
+    L2StudySessionAuthority,
+    L2StudySessionAuthority,
+    Path,
+]:
+    train, validation, primary, replication = _m8_l2_study_authorities(args)
+    return (
+        capture_config,
+        analysis_config,
+        train,
+        validation,
+        args.development_lock_dir.absolute(),
+        args.development_lock_sha256,
+        primary,
+        replication,
+        args.run_dir.absolute(),
+    )
+
+
+def _cmd_reproduce_m8_l2(args: argparse.Namespace) -> int:
+    capture_config = load_m8_l2_config(args.capture_config)
+    analysis_config = load_m8_l2_analysis_config(args.analysis_config)
+    result = reproduce_m8_l2_study(*_m8_l2_study_arguments(args, capture_config, analysis_config))
+    _print_json(_m8_l2_study_payload(result))
+    return 0 if result.status == "COMPLETE" else 1
+
+
+def _verify_m8_l2_study_from_args(
+    args: argparse.Namespace,
+    *,
+    capture_config: M8L2StudyConfig,
+    analysis_config: M8L2AnalysisConfig,
+) -> M8L2StudyRunResult:
+    return verify_m8_l2_study_run(
+        *_m8_l2_study_arguments(args, capture_config, analysis_config),
+        expected_manifest_sha256=args.run_manifest_sha256,
+        expected_checksums_sha256=args.run_checksums_sha256,
+    )
+
+
+def _cmd_verify_m8_l2_run(args: argparse.Namespace) -> int:
+    capture_config = load_m8_l2_config(args.capture_config)
+    analysis_config = load_m8_l2_analysis_config(args.analysis_config)
+    result = _verify_m8_l2_study_from_args(
+        args,
+        capture_config=capture_config,
+        analysis_config=analysis_config,
+    )
+    _print_json(_m8_l2_study_payload(result, integrity="verified"))
+    return 0 if result.status == "COMPLETE" else 1
+
+
+def _cmd_report_m8_l2(args: argparse.Namespace) -> int:
+    capture_config = load_m8_l2_config(args.capture_config)
+    analysis_config = load_m8_l2_analysis_config(args.analysis_config)
+    positional = _m8_l2_study_arguments(args, capture_config, analysis_config)
+    result = verify_m8_l2_study_run(
+        *positional,
+        expected_manifest_sha256=args.run_manifest_sha256,
+        expected_checksums_sha256=args.run_checksums_sha256,
+    )
+    output = _external_report_dir(result.root, args.output_dir)
+    report_data = load_m8_l2_report_data(
+        *positional,
+        expected_manifest_sha256=args.run_manifest_sha256,
+        expected_checksums_sha256=args.run_checksums_sha256,
+    )
+    technical, memo, comparison = write_l2_report_set(output, report_data)
+    payload = _m8_l2_study_payload(result, integrity="verified")
+    payload.update(
+        {
+            "output_dir": output,
+            "technical_report": technical,
+            "executive_memo": memo,
+            "model_comparison": comparison,
+            "report_inputs_sha256": canonical_report_data_sha256(report_data),
+            "source_bundle_modified": False,
+        }
+    )
+    _print_json(payload)
+    return 0 if result.status == "COMPLETE" else 1
+
+
+def _add_m8_l2_development_authority_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--capture-config", required=True, type=Path)
+    parser.add_argument("--analysis-config", required=True, type=Path)
+    parser.add_argument("--train-bundle-dir", required=True, type=Path)
+    parser.add_argument(
+        "--train-manifest-sha256",
+        required=True,
+        type=_lowercase_sha256,
+    )
+    parser.add_argument(
+        "--train-checksums-sha256",
+        required=True,
+        type=_lowercase_sha256,
+    )
+    parser.add_argument("--validation-bundle-dir", required=True, type=Path)
+    parser.add_argument(
+        "--validation-manifest-sha256",
+        required=True,
+        type=_lowercase_sha256,
+    )
+    parser.add_argument(
+        "--validation-checksums-sha256",
+        required=True,
+        type=_lowercase_sha256,
+    )
+    parser.add_argument("--lock-dir", required=True, type=Path)
+
+
+def _add_m8_l2_study_authority_args(
+    parser: argparse.ArgumentParser,
+    *,
+    require_run_authority: bool,
+) -> None:
+    parser.add_argument("--capture-config", required=True, type=Path)
+    parser.add_argument("--analysis-config", required=True, type=Path)
+    for role in ("train", "validation", "primary", "replication"):
+        parser.add_argument(f"--{role}-bundle-dir", required=True, type=Path)
+        parser.add_argument(
+            f"--{role}-manifest-sha256",
+            required=True,
+            type=_lowercase_sha256,
+        )
+        parser.add_argument(
+            f"--{role}-checksums-sha256",
+            required=True,
+            type=_lowercase_sha256,
+        )
+    parser.add_argument("--development-lock-dir", required=True, type=Path)
+    parser.add_argument(
+        "--development-lock-sha256",
+        required=True,
+        type=_lowercase_sha256,
+    )
+    parser.add_argument("--run-dir", required=True, type=Path)
+    if require_run_authority:
+        parser.add_argument(
+            "--run-manifest-sha256",
+            required=True,
+            type=_lowercase_sha256,
+        )
+        parser.add_argument(
+            "--run-checksums-sha256",
+            required=True,
+            type=_lowercase_sha256,
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1349,6 +1919,64 @@ def build_parser() -> argparse.ArgumentParser:
     capture_m8_l2.add_argument("--date", required=True)
     capture_m8_l2.add_argument("--output-root", required=True, type=Path)
     capture_m8_l2.set_defaults(handler=_cmd_capture_m8_l2_session)
+
+    verify_m8_l2 = subparsers.add_parser(
+        "verify-m8-l2-session",
+        help="verify a complete or INSUFFICIENT_DATA frozen L2 session bundle",
+    )
+    verify_m8_l2.add_argument("--config", required=True, type=Path)
+    verify_m8_l2.add_argument("--bundle-dir", required=True, type=Path)
+    verify_m8_l2.set_defaults(handler=_cmd_verify_m8_l2_session)
+
+    lock_m8_l2_development_parser = subparsers.add_parser(
+        "lock-m8-l2-development",
+        help="fit and freeze the Aug 8/9 L2 development state before held-out access",
+    )
+    _add_m8_l2_development_authority_args(lock_m8_l2_development_parser)
+    lock_m8_l2_development_parser.set_defaults(handler=_cmd_lock_m8_l2_development)
+
+    verify_m8_l2_development_parser = subparsers.add_parser(
+        "verify-m8-l2-development-lock",
+        help="verify the frozen L2 development lock and its explicit session authorities",
+    )
+    _add_m8_l2_development_authority_args(verify_m8_l2_development_parser)
+    verify_m8_l2_development_parser.add_argument(
+        "--development-lock-sha256",
+        required=True,
+        type=_lowercase_sha256,
+    )
+    verify_m8_l2_development_parser.set_defaults(handler=_cmd_verify_m8_l2_development_lock)
+
+    reproduce_m8_l2_parser = subparsers.add_parser(
+        "reproduce-m8-l2",
+        help="produce the frozen four-session prospective live-L2 study",
+    )
+    _add_m8_l2_study_authority_args(
+        reproduce_m8_l2_parser,
+        require_run_authority=False,
+    )
+    reproduce_m8_l2_parser.set_defaults(handler=_cmd_reproduce_m8_l2)
+
+    verify_m8_l2_run_parser = subparsers.add_parser(
+        "verify-m8-l2-run",
+        help="verify a terminal live-L2 study and all external authorities",
+    )
+    _add_m8_l2_study_authority_args(
+        verify_m8_l2_run_parser,
+        require_run_authority=True,
+    )
+    verify_m8_l2_run_parser.set_defaults(handler=_cmd_verify_m8_l2_run)
+
+    report_m8_l2_parser = subparsers.add_parser(
+        "report-m8-l2",
+        help="render verified live-L2 report inputs outside the immutable run bundle",
+    )
+    _add_m8_l2_study_authority_args(
+        report_m8_l2_parser,
+        require_run_authority=True,
+    )
+    report_m8_l2_parser.add_argument("--output-dir", required=True, type=Path)
+    report_m8_l2_parser.set_defaults(handler=_cmd_report_m8_l2)
     return parser
 
 

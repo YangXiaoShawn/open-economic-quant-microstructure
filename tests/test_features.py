@@ -9,6 +9,7 @@ from microstructure.config import FeatureConfig
 from microstructure.research.features import (
     ResearchDataError,
     TemporalLeakageError,
+    build_research_features,
     build_research_frame,
     model_feature_columns,
     validate_temporal_contract,
@@ -85,6 +86,20 @@ def test_hand_checked_causal_features_and_strict_trade_tie() -> None:
     assert at_one["realized_price_impact_bps_1"] == pytest.approx(0.0)
     assert at_one["spread_recovery_bps_1"] == pytest.approx(0.0)
     assert at_one["depth_recovery_l1_1"] == pytest.approx(0.0)
+
+
+def test_feature_stage_can_be_reused_before_any_label_horizon_is_opened() -> None:
+    features = build_research_features(_books(), _trades(), _feature_config())
+    labeled = build_research_frame(_books(), _trades(), _feature_config())
+
+    assert "future_mid_return" not in features.columns
+    assert features.select("symbol", "continuity_id", "decision_sequence").equals(
+        labeled.select("symbol", "continuity_id", "decision_sequence")
+    )
+    assert (
+        features.get_column("max_feature_source_ts_ns").to_list()
+        == labeled.get_column("max_feature_source_ts_ns").to_list()
+    )
 
 
 def test_optional_multilevel_depth_and_cancellation_enter_canonical_frame() -> None:

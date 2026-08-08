@@ -55,6 +55,22 @@ def test_clock_time_labels_use_first_later_state_and_do_not_cross_gaps() -> None
     assert at_six["clock_label_information_end_ts_ns"] is None
 
 
+def test_clock_time_labels_preserve_exact_future_book_identity_when_requested() -> None:
+    labels = build_clock_time_mid_labels(
+        _clock_books(),
+        ClockTimeLabelSpec(horizons_ns=(2 * SECOND,), max_target_staleness_ns=SECOND),
+        book_identity_column="decision_sequence",
+    )
+
+    at_zero = labels.filter(pl.col("sample_id") == "a0").row(0, named=True)
+    assert at_zero["clock_label_information_end_ts_ns"] == 3 * SECOND
+    assert at_zero["clock_label_information_end_identity"] == 3
+
+    at_six = labels.filter(pl.col("sample_id") == "a6").row(0, named=True)
+    assert at_six["clock_right_censored"] is True
+    assert at_six["clock_label_information_end_identity"] is None
+
+
 def test_clock_price_impact_is_side_signed() -> None:
     decisions = _clock_books().filter(pl.col("sample_id").is_in(["a0", "a1"]))
     labels = build_clock_time_price_impact_labels(

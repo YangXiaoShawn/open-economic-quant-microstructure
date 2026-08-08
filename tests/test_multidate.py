@@ -477,6 +477,54 @@ def test_tied_millisecond_cross_date_endpoint_and_changed_start_fail() -> None:
         build_multidate_walk_forward_plan(changed_start)
 
 
+def test_later_clock_boundary_may_reuse_the_last_observed_sequence() -> None:
+    """Exact clock labels can carry a state forward to t+h without a new update."""
+
+    development, tests = _study_frames()
+    frames = [*development, *tests]
+    carried = [
+        frame.with_columns(
+            pl.when(pl.col("right_censored"))
+            .then(None)
+            .otherwise(pl.col("decision_trade_id"))
+            .cast(pl.Int64)
+            .alias("label_information_end_trade_id")
+        )
+        for frame in frames
+    ]
+
+    plan = build_multidate_walk_forward_plan(pl.concat(carried, how="vertical"))
+
+    assert plan.final_train_indices.size == 240
+    assert plan.test_indices.size == 240
+
+
+def test_custom_bootstrap_contract_is_persisted_and_used() -> None:
+    development, tests = _study_frames()
+    selection = select_multidate_model(
+        development,
+        _model_config(),
+        feature_columns=("signal", "slow_feature"),
+        declared_test_dates=("2024-01-05", "2024-01-06"),
+        seed=17,
+        calibration_bins=5,
+        bootstrap_draws=37,
+        block_width_events=7,
+    )
+
+    bootstrap = selection.lock.payload()["bootstrap"]
+    assert bootstrap == {
+        "block_width_events": 7,
+        "date_weighting": "equal",
+        "draws": 37,
+        "metric": "selected_minus_historical_prior_log_loss",
+    }
+    result = evaluate_locked_multidate_tests(development, tests, selection)
+    assert result.paired_log_loss.aggregate.n_bootstrap == 37
+    assert result.paired_log_loss.per_date.get_column("n_blocks").to_list() == [18, 18]
+    assert result.predictions.get_column("date_block_width_events").unique().to_list() == [7]
+
+
 def _paired_prediction_fixture() -> pl.DataFrame:
     rows: list[dict[str, object]] = []
     for date_index, (study_date, count) in enumerate((("2024-01-05", 85), ("2024-01-06", 125))):

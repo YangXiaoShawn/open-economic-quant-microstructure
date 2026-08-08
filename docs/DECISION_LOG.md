@@ -1,5 +1,118 @@
 # Decision log
 
+## 2026-08-08 — Preserve the missed first L2 window as control evidence only
+
+- **Observed fact:** The declared Aug 8 14:00--15:00 UTC train window ended
+  before a clean committed producer authority was available. No capture command
+  ran, `data/m8_l2` remained absent, and no raw or economic field was opened.
+- **Decision:** Never backfill, replace, or infer that session. Once the release
+  candidate has a clean source authority, invoke the already-tested late-start
+  path solely to publish `INSUFFICIENT_DATA / MISSED_WINDOW`; it must not call a
+  symbol capture adapter or network endpoint. Verify and retain that terminal,
+  then continue Aug 9--11 on their declared windows under the same campaign
+  authority.
+- **Consequence:** The four-date study cannot promote a fitted development lock,
+  predictive metric, descriptive result, or execution scenario. Its honest final
+  outcome is necessarily aggregate `INSUFFICIENT_DATA`, backed by one missed
+  control terminal plus the remaining declared session authorities.
+
+## 2026-08-08 — Make development insufficiency a positive authority
+
+- **Problem:** A valid `INSUFFICIENT_DATA` terminal on Aug 8 or Aug 9 forbids
+  fitting, but a missing development lock cannot authorize the final four-date
+  terminal and is indistinguishable from an interrupted workflow.
+- **Decision:** The Aug 9 command always atomically publishes exactly one
+  development authority. `LOCKED` contains the eight fitted child states and
+  uses `_LOCKED` bytes `locked\n`. `NOT_CREATED` contains only typed,
+  recursively verified session-control reasons, uses `_NOT_CREATED` bytes
+  `not-created\n`, and must not load any economic frame. Both statuses expose the
+  same canonical authority path and SHA fields; a valid `NOT_CREATED` command
+  or verification exits 1 rather than masquerading as a system error.
+- **Consequence:** Aug 10/11 are still captured on schedule. After Aug 11 the
+  one final producer verifies all four session controls and the development
+  authority. A `NOT_CREATED` branch publishes aggregate `INSUFFICIENT_DATA`,
+  reports the union of development and held-out reasons, and contains no
+  Parquet, model, prediction, descriptive, or execution artifact.
+
+## 2026-08-08 — Complete the explicit-authority L2 terminal producer
+
+- **Decision:** Expose one operational path through
+  `lock-m8-l2-development`, `verify-m8-l2-development-lock`,
+  `reproduce-m8-l2`, `verify-m8-l2-run`, and `report-m8-l2`. Every stage takes
+  explicit bundle paths and independently supplied manifest/checksum SHA-256
+  authorities; development and final verification additionally require the
+  exact lock and run-control digests. No command discovers a "latest" input.
+- **Terminal semantics:** After both held-out bundles' base authorities are
+  verified, any non-`COMPLETE` held-out session publishes aggregate
+  `INSUFFICIENT_DATA` without opening either held-out economic frame. If all
+  sessions are complete but an endpoint has no eligible held-out labels, the
+  same typed terminal is published without predictive, descriptive, or execution
+  promotion. Otherwise the producer restores the eight locked states without
+  refit, writes all declared evaluation/descriptive/market-scenario artifacts,
+  snapshots its external authorities, checksums the exact inventory, writes
+  `_SUCCESS` last, and immediately performs recursive verification. The exact
+  final marker bytes are `complete\n` for `_SUCCESS` and `terminal\n` for
+  `INSUFFICIENT_DATA`.
+- **Reporting:** Both the canonical trade-M8 failure report and live-L2 reports
+  are rendered only after verification into a directory outside the immutable
+  run. The generated report-input snapshot is checksummed and re-rendered for
+  equality; report commands state that the source bundle was not modified.
+
+## 2026-08-08 — Bind one outcome-blind L2 campaign to its runtime and storage root
+
+- **Decision:** The first predeclared capture creates one random 256-bit,
+  outcome-blind campaign nonce and binds all four sessions to one canonical
+  output-root path plus its filesystem device/inode identity. Moving to a
+  different root or replacing that directory is rejected before capture rather
+  than treated as a continuation of the campaign.
+- **Runtime authority:** Bind the clean commit/source-tree identity, loaded
+  package/module origin, Python/platform identity, and the exact versions of the
+  eight production dependencies. Persist the canonical runtime payload and its
+  SHA-256 and revalidate it throughout orchestration and later input/final-run
+  verification.
+- **Reason:** A commit hash alone does not prove that all dates used the same
+  interpreter, dependency environment, imported source tree, physical evidence
+  root, or prospectively chosen campaign instance.
+
+## 2026-08-08 — Accept the frozen trade-only M8 data-insufficiency terminal
+
+- **Observed evidence:** The corrected clean-source run at commit
+  `88060613abe211cd8e80a3499678fca830f8ba2d` normalized 2,071,461 BTCUSDT
+  training rows with no findings, then normalized 987,297 ETHUSDT training rows
+  with zero errors and 53 `temporal.long_silence` warnings. That violated the
+  predeclared zero-warning gate.
+- **Decision:** Treat `artifacts/runs/binance-m8-multidate` as the canonical
+  `INSUFFICIENT_DATA` terminal. Preserve its complete failed-normalization
+  evidence and the earlier noncanonical layout-defect terminal unchanged. Do not
+  replace the date, relax the warning rule, or reinterpret insufficiency as a
+  failed economic hypothesis.
+- **Boundary proved by the terminal:** Selection did not start; no analysis lock,
+  fitted state, prediction, endpoint, held-out member, execution, P&L, capacity,
+  or significance result was produced. The trade-only study is closed; live-L2
+  evidence remains a separate prospective campaign.
+
+## 2026-08-08 — Freeze the complete live-L2 analysis contract before capture
+
+- **Authority:** The exact analysis TOML has source SHA-256
+  `71edf7eeb9d5e935a18b0d8e354dc29b5b1132ace8eccd577730572d2caa8617`
+  and semantic SHA-256
+  `eeb9ac23ff275f26de57533a317d8165a89e99a14e86404a667cc69f6477bdac`.
+  It binds capture-config SHA-256
+  `491b14727a3e8bad907d1ad64072f6ebc14e407f98a5c31fca7b0a9e6801e758`
+  and capture-protocol SHA-256
+  `fe6d4aea5af3e9c529486b7e108afefeba623bf5ad3cc0743c0426a5e62e1fa7`.
+  Every declared TOML field is rendered without amendment in
+  `docs/M8_L2_ANALYSIS_CONTRACT.md` and enforced by a fail-closed loader.
+- **Development boundary:** Fit volatility regimes on Aug 8 only; select each of
+  the two-symbol by four-endpoint candidates on Aug 9; persist final fitted model,
+  prior, preprocessing, calibration, regimes, and execution reference in eight
+  child locks plus one aggregate lock before either held-out session is exposed.
+- **Held-out and claims boundary:** Aug 10/11 restore locked state without fit,
+  refit, recalibration, threshold change, or regime update. Evaluation uses the
+  four declared horizons and 2,000-draw paired moving blocks. Execution is a
+  market-order scenario only. Capacity, realized execution, and profitability
+  claims remain forbidden irrespective of the result.
+
 ## 2026-08-08 — Keep raw authority separate from derived M8 failure evidence
 
 - **Discovery:** The first clean-source development attempt stopped at its

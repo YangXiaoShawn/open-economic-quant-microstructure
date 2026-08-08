@@ -11,16 +11,20 @@ allocation, live trading, or connection to an account capable of placing orders.
 and liquidity state forecast short-horizon price movements and, separately,
 whether any measured effect can survive realistic implementation frictions. The
 decision today is not whether to trade a strategy. It is whether the research
-design is sufficiently falsifiable, reproducible, and execution-aware to justify
-collecting and evaluating public sample data.
+design is sufficiently falsifiable, reproducible, and execution-aware to finish
+the frozen four-session live-L2 campaign without changing its specification.
 
 **Current evidence.** The completed synthetic vertical slice supports a software
 reproducibility claim only. The bounded public acquisition supports a data-
-pipeline observation only: both symbol ranges reached their declared row cap.
-There is no supported market model comparison, simulated return, confidence
-interval, or statistical-significance claim. This source document therefore
-contains no substituted performance figures; run-specific memos are rendered
-from frozen artifacts.
+pipeline observation plus exploratory per-symbol diagnostics only: both symbol
+ranges reached their declared row cap, and execution was `NOT_RUN`. The complete-
+archive trade study reached a valid `INSUFFICIENT_DATA` terminal when ETHUSDT
+training normalization produced 53 warnings against a zero-warning gate.
+Selection never started and neither held-out date was opened. This is a supported
+data-insufficiency conclusion, not an economic-model result. There is no
+supported simulated return, capacity, profitability, or statistical-significance
+claim. This source document therefore contains no substituted performance
+figures; run-specific memos are rendered from frozen artifacts.
 
 **Required analytical separation.** The work will preserve three distinct layers.
 First, predictive quality asks whether features observable at decision time
@@ -58,7 +62,11 @@ against simple baselines; calibrate probabilities; report bootstrap intervals;
 and show results by regime and instrument. Execution assumptions must be
 configuration-controlled and shown alongside gross-to-net attribution. The
 dashboard must read frozen, bounded artifacts and cannot trigger trading or
-recompute a preferred result.
+recompute a preferred result. The four L2 sessions must share one clean
+campaign, runtime/import fingerprint, and canonical storage-root identity. Every
+development/final command consumes explicit path plus manifest/checksum/lock
+authorities. Reports are re-rendered outside the immutable run only after
+recursive verification.
 
 **Kill criteria.** Do not escalate the research if a result depends on future
 information, fails sequence or checksum validation, disappears on the untouched
@@ -67,9 +75,16 @@ explanation, requires implausibly favorable latency or fills, or fails to remain
 competitive with the declared baseline after recorded costs. A high predictive
 score without calibration or executable economics is also insufficient.
 
-**Next evidence requested.** Freeze and run a multi-date BTCUSDT/ETHUSDT protocol
-with source manifests, contiguous local book epochs where depth is claimed, and
-no hidden “latest” date. Publish data-quality exceptions, actual coverage,
-held-out model metrics, sensitivity grids, failed hypotheses, and the limitations
-that remain. Only after those checks should the committee consider broader
-research. Live deployment remains outside scope regardless of the outcome.
+**Next evidence requested.** Preserve the trade insufficiency terminal without a
+replacement date or relaxed quality rule. Use the completed frozen
+BTCUSDT/ETHUSDT live-L2 software path to collect only the declared Aug 8--11 UTC
+sessions under one clean campaign identity. Publish every session gate and
+quality exception; lock Aug 8/9 model, regime, calibration, and execution-
+reference state before either Aug 10/11 frame is opened; then publish all
+predeclared horizons, dependency-block uncertainty, equal-session stability,
+market-only sensitivity scenarios, failed hypotheses, and remaining
+limitations—or publish `INSUFFICIENT_DATA` if a declared gate fails. At this
+pre-capture source freeze, no L2 data or metric had been promoted; the tracked
+memo remains unchanged during the campaign. Only after those checks should the
+committee consider broader research. Live deployment remains outside scope
+regardless of the outcome.

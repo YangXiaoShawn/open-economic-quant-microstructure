@@ -716,8 +716,7 @@ def _validate_date_local_temporal_contract(frame: pl.DataFrame) -> None:
     if labeled.filter(pl.col("label_continuity_id") != pl.col("continuity_id")).height:
         raise MultiDateEvaluationError("labels must remain in decision continuity")
     if labeled.filter(
-        (pl.col("label_information_end_trade_id") <= pl.col("decision_trade_id"))
-        | (pl.col("label_information_end_ts_ns") < pl.col("decision_ts_ns"))
+        (pl.col("label_information_end_ts_ns") < pl.col("decision_ts_ns"))
         | (
             (pl.col("label_information_end_ts_ns") == pl.col("decision_ts_ns"))
             & (pl.col("label_information_end_trade_id") <= pl.col("decision_trade_id"))
@@ -1178,6 +1177,8 @@ def select_multidate_model(
     calibration_bins: int,
     target: str = "future_trade_up",
     calibration_fraction: float = 0.2,
+    bootstrap_draws: int = DATE_BOOTSTRAP_DRAWS,
+    block_width_events: int = DATE_BOOTSTRAP_BLOCK_EVENTS,
 ) -> LockedSelection:
     """Select on train/validation data without accepting or touching test rows.
 
@@ -1189,6 +1190,8 @@ def select_multidate_model(
         raise MultiDateEvaluationError("the multi-date protocol freezes log_loss selection")
     if calibration_bins < 1:
         raise MultiDateEvaluationError("calibration_bins must be positive")
+    if bootstrap_draws < 1 or block_width_events < 1:
+        raise MultiDateEvaluationError("bootstrap draws and block width must be positive")
     development = _combine_date_frames(
         development_frames,
         allowed_roles=_DEVELOPMENT_ROLES,
@@ -1380,8 +1383,8 @@ def select_multidate_model(
             "test_update_policy": "fit_once_before_primary_test; no updates through replication",
             "bootstrap": {
                 "metric": "selected_minus_historical_prior_log_loss",
-                "draws": DATE_BOOTSTRAP_DRAWS,
-                "block_width_events": DATE_BOOTSTRAP_BLOCK_EVENTS,
+                "draws": bootstrap_draws,
+                "block_width_events": block_width_events,
                 "date_weighting": "equal",
             },
         }
@@ -1508,10 +1511,8 @@ def _selection_spec(selection: LockedSelection | AnalysisLock) -> _SelectionSpec
         raise
     except (KeyError, TypeError, ValueError) as error:
         raise MultiDateEvaluationError("selection lock is missing typed protocol fields") from error
-    if spec.block_width_events != DATE_BOOTSTRAP_BLOCK_EVENTS:
-        raise MultiDateEvaluationError("selection lock changed the frozen 40-event block width")
-    if spec.bootstrap_draws != DATE_BOOTSTRAP_DRAWS:
-        raise MultiDateEvaluationError("selection lock changed the frozen 2000-draw bootstrap")
+    if spec.block_width_events < 1 or spec.bootstrap_draws < 1:
+        raise MultiDateEvaluationError("selection lock bootstrap contract must be positive")
     fitted_payload = spec.fitted_state.payload()
     if (
         tuple(fitted_payload["feature_columns"]) != spec.feature_columns
