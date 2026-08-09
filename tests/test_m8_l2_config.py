@@ -33,7 +33,7 @@ def test_frozen_live_l2_config_is_typed_and_bound_to_exact_bytes(tmp_path: Path)
     assert config.source_sha256 == M8_L2_CONFIG_SOURCE_SHA256
     assert hashlib.sha256(CONFIG_PATH.read_bytes()).hexdigest() == M8_L2_CONFIG_SOURCE_SHA256
     assert hashlib.sha256(PROTOCOL_PATH.read_bytes()).hexdigest() == M8_L2_PROTOCOL_SHA256
-    assert M8_L2_FREEZE_COMMIT == "56f329bbeff7526fe9f9d023d598d060cea3464a"
+    assert M8_L2_FREEZE_COMMIT == "6db6c8cf81b726069d1833672864e0554976b985"
     assert config.study.symbols == ("BTCUSDT", "ETHUSDT")
     assert config.study.stream_interval_ms == 100
     assert config.capture.duration_seconds == 3600

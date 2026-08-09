@@ -14,7 +14,7 @@ from typing import Any, Literal, cast
 
 M8L2SessionRole = Literal["train", "validation", "primary_test", "replication_test"]
 
-M8_L2_FREEZE_COMMIT = "56f329bbeff7526fe9f9d023d598d060cea3464a"
+M8_L2_FREEZE_COMMIT = "6db6c8cf81b726069d1833672864e0554976b985"
 M8_L2_CONFIG_SOURCE_SHA256 = "b1bf3b4e2820e24e4555bfeb9cb0957f9a0bcdef62039f7d92360e0a97d0dd39"
 M8_L2_PROTOCOL_SHA256 = "4c77a2099a4cabd049d10e0f8264d3b4c66704d8e87cbaf0c817fd085f4bbd83"
 
