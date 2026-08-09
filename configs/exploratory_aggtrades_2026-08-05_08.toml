@@ -1,0 +1,58 @@
+[study]
+name = "binance-aggtrades-2026-08-05-08-exploratory"
+protocol_version = "1.0.0"
+evidence_tier = "PUBLIC_ARCHIVE_EXPLORATORY"
+seed = 20260809
+source = "binance_spot_daily_aggtrades_archive"
+symbols = ["BTCUSDT", "ETHUSDT"]
+selection_metric = "log_loss"
+target = "future_trade_up"
+label_horizon_events = 20
+calibration_fraction = 0.20
+bootstrap_samples = 2000
+bootstrap_block_events = 40
+feature_stability_bins = 10
+max_archive_compressed_bytes = 268435456
+max_archive_uncompressed_bytes = 2147483648
+max_total_download_bytes = 8589934592
+
+[[periods]]
+date = "2026-08-05"
+role = "train"
+
+[[periods]]
+date = "2026-08-06"
+role = "validation"
+
+[[periods]]
+date = "2026-08-07"
+role = "primary_test"
+
+[[periods]]
+date = "2026-08-08"
+role = "replication_test"
+
+[features]
+trade_windows = [5, 20, 100]
+volatility_window = 100
+intensity_window = 50
+large_trade_quantile = 0.95
+
+[models]
+logistic_c_values = [0.1, 1.0, 10.0]
+tree_max_depth_values = [2, 4, 6]
+tree_min_samples_leaf = 40
+
+[quality]
+fail_on_error = true
+require_complete_daily_archive = true
+require_contiguous_trade_ids_within_symbol_date = true
+require_nondecreasing_event_time = true
+allow_quality_warnings = true
+
+[claims]
+allow_p_values = false
+allow_significance_claim = false
+allow_cross_instrument_pooling = false
+allow_execution_claim = false
+allow_profitability_claim = false
