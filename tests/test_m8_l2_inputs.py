@@ -176,7 +176,7 @@ def test_development_input_binds_authority_and_loads_only_requested_symbol(
     verified = verify_m8_l2_development_input(
         bundle.root,
         expected_config=config,
-        expected_date="2026-08-08",
+        expected_date="2026-08-10",
         expected_role="train",
     )
 
@@ -222,7 +222,7 @@ def test_development_input_binds_authority_and_loads_only_requested_symbol(
     rebound = verify_m8_l2_development_input(
         bundle.root,
         expected_config=config,
-        expected_date="2026-08-08",
+        expected_date="2026-08-10",
         expected_role="train",
         expected_file_authority=verified.file_authority,
         expected_campaign=verified.campaign_identity,
@@ -247,7 +247,7 @@ def test_development_coordinates_are_hard_separated_before_bundle_open(
         verify_m8_l2_development_input(
             tmp_path,
             expected_config=config,
-            expected_date="2026-08-10",
+            expected_date="2026-08-12",
             expected_role=cast(input_module.DevelopmentRole, "primary_test"),
         )
     assert called is False
@@ -262,7 +262,7 @@ def test_heldout_input_requires_and_binds_development_lock(
         verify_m8_l2_heldout_input(
             tmp_path,
             expected_config=config,
-            expected_date="2026-08-10",
+            expected_date="2026-08-12",
             expected_role="primary_test",
             development_lock_sha256="not-a-digest",
         )
@@ -273,7 +273,7 @@ def test_heldout_input_requires_and_binds_development_lock(
     verified = verify_m8_l2_heldout_input(
         bundle.root,
         expected_config=config,
-        expected_date="2026-08-10",
+        expected_date="2026-08-12",
         expected_role="primary_test",
         development_lock_sha256=lock_sha256,
     )
@@ -292,14 +292,14 @@ def test_cross_session_campaign_identity_must_match(
     train_input = verify_m8_l2_development_input(
         train.root,
         expected_config=config,
-        expected_date="2026-08-08",
+        expected_date="2026-08-10",
         expected_role="train",
     )
     validation = factory.capture(tmp_path, 1)
     matching = verify_m8_l2_development_input(
         validation.root,
         expected_config=config,
-        expected_date="2026-08-09",
+        expected_date="2026-08-11",
         expected_role="validation",
         expected_campaign=train_input.campaign_identity,
     )
@@ -313,7 +313,7 @@ def test_cross_session_campaign_identity_must_match(
         verify_m8_l2_development_input(
             validation.root,
             expected_config=config,
-            expected_date="2026-08-09",
+            expected_date="2026-08-11",
             expected_role="validation",
             expected_campaign=wrong,
         )
@@ -331,7 +331,7 @@ def test_external_file_authority_mismatch_fails_closed(
         verify_m8_l2_development_input(
             bundle.root,
             expected_config=config,
-            expected_date="2026-08-08",
+            expected_date="2026-08-10",
             expected_role="train",
             expected_file_authority=wrong,
         )
@@ -357,7 +357,7 @@ def test_insufficient_extra_file_and_symlink_roots_are_rejected(
         verify_m8_l2_development_input(
             bundle.root,
             expected_config=config,
-            expected_date="2026-08-08",
+            expected_date="2026-08-10",
             expected_role="train",
         )
     monkeypatch.setattr(input_module, "verify_m8_l2_session_bundle", original_verifier)
@@ -368,7 +368,7 @@ def test_insufficient_extra_file_and_symlink_roots_are_rejected(
         verify_m8_l2_development_input(
             bundle.root,
             expected_config=config,
-            expected_date="2026-08-08",
+            expected_date="2026-08-10",
             expected_role="train",
         )
     extra.unlink()
@@ -379,7 +379,7 @@ def test_insufficient_extra_file_and_symlink_roots_are_rejected(
         verify_m8_l2_development_input(
             alias,
             expected_config=config,
-            expected_date="2026-08-08",
+            expected_date="2026-08-10",
             expected_role="train",
         )
 
@@ -394,7 +394,7 @@ def test_payload_tamper_after_verification_is_detected_before_rows_return(
     verified = verify_m8_l2_development_input(
         bundle.root,
         expected_config=config,
-        expected_date="2026-08-08",
+        expected_date="2026-08-10",
         expected_role="train",
     )
     target = bundle.root / verified.symbols["BTCUSDT"].book_observations.relative_path
@@ -413,7 +413,7 @@ def test_loader_rejects_an_object_not_created_by_verifier(
     verified = verify_m8_l2_development_input(
         bundle.root,
         expected_config=config,
-        expected_date="2026-08-08",
+        expected_date="2026-08-10",
         expected_role="train",
     )
     forged = replace(verified, _verification_token=object())
@@ -431,7 +431,7 @@ def test_descriptor_snapshot_detects_atomic_path_replacement_toctou(
     verified = verify_m8_l2_development_input(
         bundle.root,
         expected_config=config,
-        expected_date="2026-08-08",
+        expected_date="2026-08-10",
         expected_role="train",
     )
     target = bundle.root / verified.symbols["BTCUSDT"].book_observations.relative_path
@@ -466,7 +466,7 @@ def test_loaded_row_continuity_must_reconcile_to_verified_intervals(
     verified = verify_m8_l2_development_input(
         bundle.root,
         expected_config=config,
-        expected_date="2026-08-08",
+        expected_date="2026-08-10",
         expected_role="train",
     )
     with pytest.raises(M8L2InputError, match=r"reconcile|OBSERVED interval"):

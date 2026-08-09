@@ -23,10 +23,10 @@ M8L2EndpointDomain = Literal["event", "clock"]
 M8L2EndpointUnit = Literal["events", "milliseconds"]
 
 M8_L2_ANALYSIS_CONFIG_SOURCE_SHA256 = (
-    "71edf7eeb9d5e935a18b0d8e354dc29b5b1132ace8eccd577730572d2caa8617"
+    "0d786d5f4109bb5bf773a6197df3fa861c9b7eb61c16c957bd49fb56147fd7d8"
 )
 M8_L2_ANALYSIS_CONFIG_SEMANTIC_SHA256 = (
-    "eeb9ac23ff275f26de57533a317d8165a89e99a14e86404a667cc69f6477bdac"
+    "17c91f64765f35195ab03a4caac93d8ff9c5f009c16e785fd84ebd9569d6f84b"
 )
 
 _TOP_LEVEL_KEYS = frozenset(
@@ -113,8 +113,8 @@ _CLAIM_KEYS = frozenset(
     }
 )
 
-_CAPTURE_CONFIG_SOURCE_SHA256 = "491b14727a3e8bad907d1ad64072f6ebc14e407f98a5c31fca7b0a9e6801e758"
-_CAPTURE_PROTOCOL_SHA256 = "fe6d4aea5af3e9c529486b7e108afefeba623bf5ad3cc0743c0426a5e62e1fa7"
+_CAPTURE_CONFIG_SOURCE_SHA256 = "b1bf3b4e2820e24e4555bfeb9cb0957f9a0bcdef62039f7d92360e0a97d0dd39"
+_CAPTURE_PROTOCOL_SHA256 = "4c77a2099a4cabd049d10e0f8264d3b4c66704d8e87cbaf0c817fd085f4bbd83"
 _MODEL_FEATURE_COLUMNS = (
     "spread_bps",
     "depth_total_l1",
@@ -410,8 +410,8 @@ def _parse_study(raw: object) -> M8L2AnalysisStudy:
         ),
     )
     expected = M8L2AnalysisStudy(
-        name="binance-m8-live-l2-analysis",
-        protocol_version="1.0.0",
+        name="binance-m8-live-l2-analysis-v2",
+        protocol_version="2.0.0",
         seed=20260807,
         source="verified_m8_l2_session_bundles",
         capture_config_source_sha256=_CAPTURE_CONFIG_SOURCE_SHA256,

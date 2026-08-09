@@ -125,8 +125,8 @@ def test_report_snapshot_round_trip_and_tamper_detection(tmp_path: Path) -> None
         "live_trading": False,
         "research": {
             "question": "Does the frozen model improve direction log loss?",
-            "period_start_utc": "2026-08-08T14:00:00Z",
-            "period_end_utc": "2026-08-11T15:00:00Z",
+            "period_start_utc": "2026-08-10T14:00:00Z",
+            "period_end_utc": "2026-08-13T15:00:00Z",
         },
     }
     provenance = {
@@ -440,30 +440,30 @@ def test_not_created_development_publishes_and_verifies_four_session_terminal_wi
 
     train = session_bundle(
         environment.train_path,
-        date="2026-08-08",
+        date="2026-08-10",
         role="train",
         status="INSUFFICIENT_DATA",
         reasons=("GATE_COVERAGE",),
     )
     validation = session_bundle(
         environment.validation_path,
-        date="2026-08-09",
+        date="2026-08-11",
         role="validation",
         status="COMPLETE",
     )
-    primary_path = train.root.parent / "2026-08-10-primary"
-    replication_path = train.root.parent / "2026-08-11-replication"
+    primary_path = train.root.parent / "2026-08-12-primary"
+    replication_path = train.root.parent / "2026-08-13-replication"
     primary_path.mkdir()
     replication_path.mkdir()
     primary = session_bundle(
         primary_path,
-        date="2026-08-10",
+        date="2026-08-12",
         role="primary_test",
         status="COMPLETE",
     )
     replication = session_bundle(
         replication_path,
-        date="2026-08-11",
+        date="2026-08-13",
         role="replication_test",
         status="COMPLETE",
     )
@@ -658,8 +658,8 @@ def test_complete_producer_verifier_reuse_and_report_round_trip(
     symbols = MappingProxyType({symbol: object() for symbol in environment.capture.study.symbols})
     primary_input = development_fixture._FakeInput(
         root=authorities[2].bundle_path,
-        session_id=_sha("2026-08-10"),
-        session_date="2026-08-10",
+        session_id=_sha("2026-08-12"),
+        session_date="2026-08-12",
         role="primary_test",
         config_sha256=environment.capture.hash,
         config_source_sha256=environment.capture.source_sha256,
@@ -667,7 +667,7 @@ def test_complete_producer_verifier_reuse_and_report_round_trip(
         campaign_identity=campaign,
         symbols=symbols,
         frames={
-            symbol: development_fixture._frames(symbol, "2026-08-10")
+            symbol: development_fixture._frames(symbol, "2026-08-12")
             for symbol in environment.capture.study.symbols
         },
         events=environment.events,
@@ -676,8 +676,8 @@ def test_complete_producer_verifier_reuse_and_report_round_trip(
     )
     replication_input = development_fixture._FakeInput(
         root=authorities[3].bundle_path,
-        session_id=_sha("2026-08-11"),
-        session_date="2026-08-11",
+        session_id=_sha("2026-08-13"),
+        session_date="2026-08-13",
         role="replication_test",
         config_sha256=environment.capture.hash,
         config_source_sha256=environment.capture.source_sha256,
@@ -685,7 +685,7 @@ def test_complete_producer_verifier_reuse_and_report_round_trip(
         campaign_identity=campaign,
         symbols=symbols,
         frames={
-            symbol: development_fixture._frames(symbol, "2026-08-11")
+            symbol: development_fixture._frames(symbol, "2026-08-13")
             for symbol in environment.capture.study.symbols
         },
         events=environment.events,
@@ -938,7 +938,7 @@ def test_complete_producer_verifier_reuse_and_report_round_trip(
             authorities[2],
             _bundle(
                 authorities[2],
-                date="2026-08-10",
+                date="2026-08-12",
                 role="primary_test",
                 status="INSUFFICIENT_DATA",
                 reasons=("COVERAGE_GATE",),

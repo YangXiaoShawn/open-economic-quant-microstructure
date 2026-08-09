@@ -24,8 +24,8 @@ def _data() -> L2ReportData:
         "live_trading": False,
         "research": {
             "question": "Do causal L2 states improve future-mid direction log loss?",
-            "period_start_utc": "2026-08-08T14:00:00Z",
-            "period_end_utc": "2026-08-11T15:00:00Z",
+            "period_start_utc": "2026-08-10T14:00:00Z",
+            "period_end_utc": "2026-08-13T15:00:00Z",
         },
     }
     provenance = {
@@ -57,7 +57,7 @@ def _data() -> L2ReportData:
         {
             "symbol": "BTCUSDT",
             "endpoint_name": "event_20",
-            "study_date": "2026-08-10",
+            "study_date": "2026-08-12",
             "selected_model": "logistic_l2_c_1",
             "n_obs": 400,
             "selected_log_loss": 0.65,
@@ -71,7 +71,7 @@ def _data() -> L2ReportData:
         {
             "symbol": "BTCUSDT",
             "endpoint_name": "event_20",
-            "study_date": "2026-08-10",
+            "study_date": "2026-08-12",
             "n_obs": 400,
             "n_blocks": 10,
             "point_delta": -0.04,
@@ -91,7 +91,7 @@ def _data() -> L2ReportData:
         {
             "symbol": "BTCUSDT",
             "endpoint_name": "event_20",
-            "study_date": "2026-08-10",
+            "study_date": "2026-08-12",
             "decision_latency_events": 0,
             "order_latency_events": 1,
             "strategy_orders": 20,
@@ -129,7 +129,7 @@ def test_l2_reports_are_artifact_driven_and_keep_claim_boundaries() -> None:
     assert "not realized execution" in technical.lower()
     assert "no capacity or profitability claim" in technical.lower()
     assert "Directionally replicated symbol/endpoint pairs: **1**" in memo
-    assert "2026-08-10 / ALL" in technical
+    assert "2026-08-12 / ALL" in technical
     assert "equal-session / ALL" in comparison
     assert "0.650000" in comparison
     assert len(canonical_report_data_sha256(data)) == 64

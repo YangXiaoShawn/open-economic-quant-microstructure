@@ -23,7 +23,7 @@ timing, and execution accounting are tested.
 | M5 Execution research | Complete | M3-M4 | Market/limit fills, latency, partial fills, costs, inventory, liquidation, sensitivity | Deterministic accounting, OOS, volume-conservation, continuity, partial-fill, and liquidation tests pass |
 | M6 Reproducible vertical slice | Complete | M1-M5 | One CLI-driven sample run and machine-readable artifacts | Atomic producer and corruption/idempotence tests pass; canonical smoke requires no network |
 | M7 Research communication | Complete | M6 | Generated technical report/table, IC memo, limitations, dashboard, portfolio material | Render/dashboard tests read only verified artifacts and visibly label evidence tier |
-| M8 Broader empirical study | In progress | M6-M7 | Closed trade-only study plus complete software for the frozen four-date live-L2 capture/analysis campaign | Canonical trade `INSUFFICIENT_DATA` terminal remains immutable; capture all declared session terminals under one campaign authority, publish the Aug 8/9 `LOCKED` or `NOT_CREATED` development authority before Aug 10/11, and publish a recursively verified result or protocol-declared insufficiency |
+| M8 Broader empirical study | In progress | M6-M7 | Closed trade-only study plus complete software for the replacement four-date live-L2 capture/analysis campaign | Canonical trade and superseded L2-v1 authorities remain immutable; capture Aug 10--13 under one new campaign authority, publish the Aug 10/11 `LOCKED` or `NOT_CREATED` development authority before Aug 12, and publish a recursively verified result or protocol-declared insufficiency |
 
 ## First vertical slice
 
@@ -67,7 +67,7 @@ small public-data path without making the test suite depend on network access.
 | Multiple testing | False discoveries | Predeclare core hypotheses, report all tested variants, use adjusted interpretation |
 | Missed or invalid prospective L2 session | Outcome-driven replacement or false continuity | One frozen calendar and campaign identity; atomic `INSUFFICIENT_DATA`; no replacement date; require observed-interval and cross-symbol coverage gates |
 | Source/runtime/root changes across the four captures | Sessions are not one prospective campaign | Root campaign authority binds config/protocol, outcome-blind nonce, canonical output-root filesystem identity, clean source/import origin, and hashed Python/platform/dependency runtime; reject drift before network access |
-| Held-out L2 economic access without a development authority | Selection leakage | Verify Aug 8/9 control authorities and first persist either eight child locks plus one aggregate `LOCKED` authority or a control-only `NOT_CREATED` authority; only the `LOCKED` branch may expose Aug 10/11 frames, and its evaluator has no fit path |
+| Held-out L2 economic access without a development authority | Selection leakage | Verify Aug 10/11 control authorities and first persist either eight child locks plus one aggregate `LOCKED` authority or a control-only `NOT_CREATED` authority; only the `LOCKED` branch may expose Aug 12/13 frames, and its evaluator has no fit path |
 
 ## Acceptance test matrix
 

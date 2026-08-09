@@ -1,5 +1,21 @@
 # Decision log
 
+## 2026-08-09 — Supersede the incomplete Aug 8–11 campaign with a new prospective v2 calendar
+
+- **Observed boundary:** The v1 Aug 8 session is an immutable `MISSED_WINDOW`,
+  the Aug 9 validation session is immutable and complete, and the v1 development
+  authority is `NOT_CREATED`. Those facts and files remain preserved.
+- **User decision:** Abandon v1 as the active empirical study and, before any of
+  the new dates is observed, freeze Aug 10 train, Aug 11 validation, Aug 12
+  primary test, and Aug 13 replication test at 14:00–15:00 UTC.
+- **Integrity rule:** This is a new campaign/version and storage/source
+  authority, not a replacement bundle inside v1. V1 observations are not used
+  for v2 training, selection, evaluation, or reporting. Once Aug 10 begins, no
+  v2 date, threshold, feature, model, or interpretation rule may be changed.
+- **Consequence:** A complete v2 train and validation may create the eight-state
+  `LOCKED` development authority before Aug 12; otherwise v2 terminates through
+  its existing `NOT_CREATED`/`INSUFFICIENT_DATA` branches without substitution.
+
 ## 2026-08-08 — Preserve the missed first L2 window as control evidence only
 
 - **Observed fact:** The declared Aug 8 14:00--15:00 UTC train window ended

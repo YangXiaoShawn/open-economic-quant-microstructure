@@ -1,10 +1,10 @@
 # Status
 
-Last updated: 2026-08-08 UTC
+Last updated: 2026-08-09 UTC
 
-> **Pre-capture source-freeze snapshot.** This tracked file records the state
-> immediately before the four-date L2 campaign. It must not be edited between
-> the first Aug 8 capture and the Aug 11 terminal. During that interval, current
+> **Replacement-campaign source-freeze snapshot.** This tracked file records the
+> state before the v2 four-date L2 campaign. It must not be edited between the
+> first Aug 10 capture and the Aug 13 terminal. During that interval, current
 > status is authoritative only in `data/m8_l2/campaign_authority.json` and the
 > immutable per-session bundles; after the campaign, generated final-run
 > provenance is the authority for results.
@@ -42,20 +42,18 @@ P&L are `NOT_RUN`. No date or policy was replaced. Its report command revalidate
 the terminal/raw authority and writes a fresh external report without modifying
 the canonical bundle.
 
-The live-L2 campaign remains the active evidence milestone, but the Aug 8, 2026
-14:00--15:00 UTC train window passed without a capture attempt, data root, or
-session bundle because the producer had not yet obtained a clean committed
-source authority. That date cannot be backfilled or replaced. The tested
-late-start path may publish only a control-only `MISSED_WINDOW` terminal without
-calling either capture adapter; the Aug 9--11 sessions remain scheduled, and the
-final four-date result can now only be `INSUFFICIENT_DATA`. The capture config,
-protocol, calendar, and downstream analysis contract remain unchanged. The
-campaign-authority mechanism
+The live-L2 campaign remains the active evidence milestone. The superseded v1
+campaign is preserved, not repaired: Aug 8 is `MISSED_WINDOW`, Aug 9 is a
+verified complete session, and its development authority is `NOT_CREATED`.
+Before observing any v2 session, the user reset the active prospective calendar
+to Aug 10 train, Aug 11 validation, Aug 12 primary test, and Aug 13 replication
+test. V1 evidence is not an input to v2. The v2 capture config, protocol, and
+analysis authority are separately hash-bound. The campaign-authority mechanism
 requires all four dates to share one outcome-blind nonce, canonical output-root
 filesystem identity, clean commit/source/import origin, and hashed
 Python/platform/production-dependency fingerprint. Strict capture and session
 verification, verified lazy inputs, observed-interval endpoint frames,
-Aug 8/9 `LOCKED | NOT_CREATED` development authority, no-refit Aug 10/11 evaluation, dependency-aware
+Aug 10/11 `LOCKED | NOT_CREATED` development authority, no-refit Aug 12/13 evaluation, dependency-aware
 diagnostics, market-only scenarios, descriptive analyses, and artifact-driven
 L2 reporting are integrated in a tested end-to-end producer and CLI/Make path.
 Development and final production have explicit 8 GiB and 12 GiB fail-closed
@@ -66,8 +64,8 @@ exact config/protocol, campaign, session-control, and development authority
 snapshots, while its verifier also revalidates every external authority. Reports
 are regenerated only into an external directory, leaving the immutable run
 untouched. The software path was complete at this remaining-campaign source
-freeze; the real session-control evidence was not. No declared L2 session bundle
-or L2 empirical metric existed when these tracked bytes were frozen.
+freeze; the real v2 session-control evidence was not. No v2 session bundle or
+L2 empirical metric existed when these tracked bytes were frozen.
 
 ## Milestones
 
@@ -152,12 +150,12 @@ until a favorable outcome appears. Use the completed L2 producer and explicit
 authority interfaces with ignored targets
 `artifacts/runs/binance-m8-l2-development-lock` and
 `artifacts/runs/binance-m8-live-l2` for the development authority and final run,
-respectively. Then capture the exact simultaneous Aug 8--11 BTCUSDT/ETHUSDT
-sessions under one clean campaign authority. After Aug 9, durably publish either
-the fitted `LOCKED` authority or the control-only `NOT_CREATED` authority before
-Aug 10. A valid `NOT_CREATED` result exits 1 but does not cancel the Aug 10/11
-captures; the final producer uses all four control authorities without opening
-economic frames. After Aug 11, produce and recursively verify the immutable
+respectively. Then capture the exact simultaneous Aug 10--13 BTCUSDT/ETHUSDT
+sessions under one new clean v2 campaign authority. After Aug 11, durably publish
+either the fitted `LOCKED` authority or the control-only `NOT_CREATED` authority
+before Aug 12. A valid `NOT_CREATED` result exits 1 but does not cancel the Aug
+12/13 captures; the final producer uses all four control authorities without
+opening economic frames. After Aug 13, produce and recursively verify the immutable
 final bundle, render reports externally, measure peak RSS, and complete the
 clean-room/resource audit. A failed/missed date terminalizes the declared
 campaign rather than selecting a substitute. The

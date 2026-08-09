@@ -96,13 +96,13 @@ _MAX_DEVELOPMENT_CAUSAL_BYTES = 4 * _GIB
 _MAX_SELECTION_WORKSPACE_BYTES = 2 * _GIB
 _CAUSAL_ENDPOINT_ROW_UPPER_BYTES = 4 * 1024
 _SELECTION_NUMPY_VECTOR_COUNT = 12
-_EXPECTED_DEVELOPMENT = (("2026-08-08", "train"), ("2026-08-09", "validation"))
+_EXPECTED_DEVELOPMENT = (("2026-08-10", "train"), ("2026-08-11", "validation"))
 _EXPECTED_HELDOUT = (
-    ("2026-08-10", "primary_test"),
-    ("2026-08-11", "replication_test"),
+    ("2026-08-12", "primary_test"),
+    ("2026-08-13", "replication_test"),
 )
-_EARLIEST_LOCK_TIME = datetime(2026, 8, 9, 15, 0, tzinfo=UTC)
-_LOCK_DEADLINE = datetime(2026, 8, 10, 14, 0, tzinfo=UTC)
+_EARLIEST_LOCK_TIME = datetime(2026, 8, 11, 15, 0, tzinfo=UTC)
+_LOCK_DEADLINE = datetime(2026, 8, 12, 14, 0, tzinfo=UTC)
 
 
 class M8L2DevelopmentError(RuntimeError):
@@ -794,7 +794,7 @@ def _execution_reference(
         "schema_version": _EXECUTION_REFERENCE_SCHEMA_VERSION,
         "artifact_kind": "train_only_execution_reference",
         "symbol": symbol,
-        "fit_date": "2026-08-08",
+        "fit_date": "2026-08-10",
         "fit_role": "train",
         "reference_price_statistic": analysis.execution.reference_price_statistic,
         "reference_depth_statistic": analysis.execution.reference_depth_statistic,
@@ -1270,13 +1270,13 @@ def lock_m8_l2_development(
         train_input = verifier(
             train_bundle.root,
             expected_config=capture,
-            expected_date="2026-08-08",
+            expected_date="2026-08-10",
             expected_role="train",
         )
         validation_input = verifier(
             validation_bundle.root,
             expected_config=capture,
-            expected_date="2026-08-09",
+            expected_date="2026-08-11",
             expected_role="validation",
             expected_campaign=train_input.campaign_identity,
         )
@@ -1286,14 +1286,14 @@ def lock_m8_l2_development(
         train_input,
         train_bundle,
         capture=capture,
-        expected_date="2026-08-08",
+        expected_date="2026-08-10",
         expected_role="train",
     )
     _verify_input_descriptor(
         validation_input,
         validation_bundle,
         capture=capture,
-        expected_date="2026-08-09",
+        expected_date="2026-08-11",
         expected_role="validation",
     )
     _validate_runtime_campaign(producer, train_input, validation_input)
@@ -1356,7 +1356,7 @@ def lock_m8_l2_development(
                 train_loaded.book_observations,
                 train_loaded.depth_deltas,
                 train_loaded.intervals,
-                study_date="2026-08-08",
+                study_date="2026-08-10",
                 study_role="train",
                 feature_windows=analysis.features.rolling_windows,
                 volatility_window=analysis.features.volatility_window,
@@ -1372,7 +1372,7 @@ def lock_m8_l2_development(
                 validation_loaded.book_observations,
                 validation_loaded.depth_deltas,
                 validation_loaded.intervals,
-                study_date="2026-08-09",
+                study_date="2026-08-11",
                 study_role="validation",
                 feature_windows=analysis.features.rolling_windows,
                 volatility_window=analysis.features.volatility_window,

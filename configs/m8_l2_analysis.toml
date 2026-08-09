@@ -1,10 +1,10 @@
 [study]
-name = "binance-m8-live-l2-analysis"
-protocol_version = "1.0.0"
+name = "binance-m8-live-l2-analysis-v2"
+protocol_version = "2.0.0"
 seed = 20260807
 source = "verified_m8_l2_session_bundles"
-capture_config_source_sha256 = "491b14727a3e8bad907d1ad64072f6ebc14e407f98a5c31fca7b0a9e6801e758"
-capture_protocol_sha256 = "fe6d4aea5af3e9c529486b7e108afefeba623bf5ad3cc0743c0426a5e62e1fa7"
+capture_config_source_sha256 = "b1bf3b4e2820e24e4555bfeb9cb0957f9a0bcdef62039f7d92360e0a97d0dd39"
+capture_protocol_sha256 = "4c77a2099a4cabd049d10e0f8264d3b4c66704d8e87cbaf0c817fd085f4bbd83"
 symbols = ["BTCUSDT", "ETHUSDT"]
 training_role = "train"
 selection_role = "validation"

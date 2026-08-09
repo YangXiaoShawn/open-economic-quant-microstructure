@@ -702,7 +702,7 @@ def test_capture_m8_l2_session_command_uses_frozen_runner_without_source_overrid
         root=target,
         status=status,
         session_id="a" * 64,
-        session_date="2026-08-08",
+        session_date="2026-08-10",
         role="train",
         manifest_path=target / "session_manifest.json",
         manifest_sha256="b" * 64,
@@ -733,17 +733,17 @@ def test_capture_m8_l2_session_command_uses_frozen_runner_without_source_overrid
             "--config",
             str(config_path),
             "--date",
-            "2026-08-08",
+            "2026-08-10",
             "--output-root",
             str(output_root),
         ]
     )
 
     assert exit_code == expected_exit
-    assert calls == [(config, "2026-08-08", output_root.resolve(), adapter)]
+    assert calls == [(config, "2026-08-10", output_root.resolve(), adapter)]
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == status
-    assert payload["session_date"] == "2026-08-08"
+    assert payload["session_date"] == "2026-08-10"
     assert payload["session_manifest_sha256"] == "b" * 64
     assert payload["live_trading"] is False
 
@@ -766,7 +766,7 @@ def test_capture_m8_l2_session_system_failure_uses_error_exit_two(
             "--config",
             str(tmp_path / "m8-l2.toml"),
             "--date",
-            "2026-08-08",
+            "2026-08-10",
             "--output-root",
             str(tmp_path / "l2"),
         ]
@@ -790,7 +790,7 @@ def test_verify_m8_l2_session_accepts_both_terminal_states(
         root=bundle_dir.absolute(),
         status=status,
         session_id="a" * 64,
-        session_date="2026-08-08",
+        session_date="2026-08-10",
         role="train",
         manifest_path=bundle_dir / "session_manifest.json",
         manifest_sha256="b" * 64,
@@ -907,7 +907,7 @@ def test_m8_l2_make_contract_normalizes_only_valid_terminal_exit_one(
         "--no-print-directory",
         "capture-m8-l2-session",
         f"PYTHON={fake_python}",
-        "M8_L2_SESSION_DATE=2026-08-08",
+        "M8_L2_SESSION_DATE=2026-08-10",
     ]
 
     valid_terminal = subprocess.run(
@@ -966,7 +966,7 @@ def _m8_l2_development_cli_fixture(
         root=train_root.absolute(),
         status=train_status,
         session_id="1" * 64,
-        session_date="2026-08-08",
+        session_date="2026-08-10",
         role="train",
         manifest_path=train_root / "session_manifest.json",
         manifest_sha256="a" * 64,
@@ -979,7 +979,7 @@ def _m8_l2_development_cli_fixture(
         root=validation_root.absolute(),
         status=validation_status,
         session_id="2" * 64,
-        session_date="2026-08-09",
+        session_date="2026-08-11",
         role="validation",
         manifest_path=validation_root / "session_manifest.json",
         manifest_sha256="b" * 64,
@@ -1067,11 +1067,11 @@ def test_lock_m8_l2_development_uses_only_explicit_session_authorities(
         assert (train_path, validation_path) == (train.root, validation.root)
         assert callable(input_loader)
         assert expected_session_file_authorities == {
-            "2026-08-08": cli_module.L2SessionFileAuthority(
+            "2026-08-10": cli_module.L2SessionFileAuthority(
                 train.manifest_sha256,
                 hashlib.sha256(train.checksum_path.read_bytes()).hexdigest(),
             ),
-            "2026-08-09": cli_module.L2SessionFileAuthority(
+            "2026-08-11": cli_module.L2SessionFileAuthority(
                 validation.manifest_sha256,
                 hashlib.sha256(validation.checksum_path.read_bytes()).hexdigest(),
             ),
@@ -1080,7 +1080,7 @@ def test_lock_m8_l2_development_uses_only_explicit_session_authorities(
             input_loader(
                 train_path,
                 expected_config=capture_config,
-                expected_date="2026-08-08",
+                expected_date="2026-08-10",
                 expected_role="train",
             )
             is strict_input
@@ -1090,7 +1090,7 @@ def test_lock_m8_l2_development_uses_only_explicit_session_authorities(
             aggregate_path=lock_path / "development_lock.json",
             aggregate_sha256="d" * 64,
             marker_path=lock_path / "_LOCKED",
-            created_at_utc="2026-08-09T15:00:00Z",
+            created_at_utc="2026-08-11T15:00:00Z",
             children=(
                 SimpleNamespace(
                     symbol="BTCUSDT",
@@ -1142,7 +1142,7 @@ def test_lock_m8_l2_development_returns_one_for_verified_insufficient_session(
             aggregate_path=lock_dir / "development_lock.json",
             aggregate_sha256="d" * 64,
             marker_path=lock_dir / "_NOT_CREATED",
-            created_at_utc="2026-08-09T15:00:00Z",
+            created_at_utc="2026-08-11T15:00:00Z",
             children=(),
             status="NOT_CREATED",
             reason_codes=("DEVELOPMENT_SESSION_INSUFFICIENT::validation::GATE_VALIDATION",),
@@ -1186,7 +1186,7 @@ def test_verify_m8_l2_development_lock_binds_expected_aggregate_sha(
             aggregate_path=lock_dir / "development_lock.json",
             aggregate_sha256=expected_lock_sha,
             marker_path=lock_dir / "_LOCKED",
-            created_at_utc="2026-08-09T15:00:00Z",
+            created_at_utc="2026-08-11T15:00:00Z",
             children=(),
         )
 
@@ -1234,7 +1234,7 @@ def test_verify_m8_l2_not_created_authority_returns_one_with_verified_integrity(
             aggregate_path=lock_dir / "development_lock.json",
             aggregate_sha256=expected_sha,
             marker_path=lock_dir / "_NOT_CREATED",
-            created_at_utc="2026-08-09T15:00:00Z",
+            created_at_utc="2026-08-11T15:00:00Z",
             children=(),
             status="NOT_CREATED",
             reason_codes=("DEVELOPMENT_SESSION_INSUFFICIENT::validation::GATE_VALIDATION",),

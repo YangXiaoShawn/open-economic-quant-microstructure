@@ -263,9 +263,9 @@ class L2ExecutionReference:
             raise L2LockedEvaluationError(
                 "execution-reference training date must use YYYY-MM-DD"
             ) from None
-        if self.training_date != "2026-08-08":
+        if self.training_date != "2026-08-10":
             raise L2LockedEvaluationError(
-                "M8 L2 execution reference must come from the Aug 8 train session"
+                "M8 L2 execution reference must come from the Aug 10 train session"
             )
         _sha256(self.aggregate_lock_sha256, "execution-reference aggregate-lock SHA-256")
         if self.reference_price_statistic != _REFERENCE_PRICE_STATISTIC:

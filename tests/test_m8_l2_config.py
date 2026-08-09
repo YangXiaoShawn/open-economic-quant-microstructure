@@ -38,7 +38,7 @@ def test_frozen_live_l2_config_is_typed_and_bound_to_exact_bytes(tmp_path: Path)
     assert config.study.stream_interval_ms == 100
     assert config.capture.duration_seconds == 3600
     assert config.capture.max_messages_per_symbol == 60_000
-    assert config.sessions[0].start_ns == 1_786_197_600_000_000_000
+    assert config.sessions[0].start_ns == 1_786_370_400_000_000_000
     assert config.sessions[0].end_ns - config.sessions[0].start_ns == 3_600_000_000_000
     assert [item.role for item in config.sessions] == [
         "train",
@@ -70,7 +70,7 @@ def test_live_l2_config_objects_are_immutable() -> None:
             r"study\.symbols is frozen",
         ),
         ("stream_interval_ms = 100", "stream_interval_ms = 1000", "stream_interval_ms is frozen"),
-        ('date = "2026-08-08"', 'date = "2026-08-12"', "session calendar/order is frozen"),
+        ('date = "2026-08-10"', 'date = "2026-08-14"', "session calendar/order is frozen"),
         ('start_utc = "14:00:00"', 'start_utc = "14:00:01"', "session calendar/order is frozen"),
         ("duration_seconds = 3600", "duration_seconds = 3599", "capture contract is frozen"),
         (
@@ -105,8 +105,8 @@ def test_formatting_only_byte_drift_is_rejected(tmp_path: Path) -> None:
 def test_unknown_key_and_bool_as_integer_fail_before_byte_authority(tmp_path: Path) -> None:
     unknown = _mutated(
         tmp_path,
-        'name = "binance-m8-live-l2-study"',
-        'name = "binance-m8-live-l2-study"\nunreviewed = true',
+        'name = "binance-m8-live-l2-study-v2"',
+        'name = "binance-m8-live-l2-study-v2"\nunreviewed = true',
     )
     with pytest.raises(M8L2ConfigError, match=r"unknown=.*unreviewed"):
         load_m8_l2_config(unknown)
@@ -119,6 +119,6 @@ def test_unknown_key_and_bool_as_integer_fail_before_byte_authority(tmp_path: Pa
 def test_only_frozen_dates_can_be_resolved() -> None:
     config = load_m8_l2_config(CONFIG_PATH)
 
-    assert config.session_for_date("2026-08-10").role == "primary_test"
+    assert config.session_for_date("2026-08-12").role == "primary_test"
     with pytest.raises(M8L2ConfigError, match="not a frozen"):
-        config.session_for_date("2026-08-12")
+        config.session_for_date("2026-08-14")

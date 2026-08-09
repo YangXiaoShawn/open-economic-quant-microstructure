@@ -1,6 +1,6 @@
 [study]
-name = "binance-m8-live-l2-study"
-protocol_version = "1.0.0"
+name = "binance-m8-live-l2-study-v2"
+protocol_version = "2.0.0"
 evidence_tier = "FULL_DATA"
 seed = 20260807
 source = "binance_spot_live_diff_depth_100ms"
@@ -8,25 +8,25 @@ symbols = ["BTCUSDT", "ETHUSDT"]
 stream_interval_ms = 100
 
 [[sessions]]
-date = "2026-08-08"
+date = "2026-08-10"
 start_utc = "14:00:00"
 end_utc = "15:00:00"
 role = "train"
 
 [[sessions]]
-date = "2026-08-09"
+date = "2026-08-11"
 start_utc = "14:00:00"
 end_utc = "15:00:00"
 role = "validation"
 
 [[sessions]]
-date = "2026-08-10"
+date = "2026-08-12"
 start_utc = "14:00:00"
 end_utc = "15:00:00"
 role = "primary_test"
 
 [[sessions]]
-date = "2026-08-11"
+date = "2026-08-13"
 start_utc = "14:00:00"
 end_utc = "15:00:00"
 role = "replication_test"
@@ -79,4 +79,3 @@ allow_p_values = false
 allow_significance_claim = false
 allow_realized_execution_claim = false
 allow_profitability_claim = false
-

@@ -15,8 +15,8 @@ from typing import Any, Literal, cast
 M8L2SessionRole = Literal["train", "validation", "primary_test", "replication_test"]
 
 M8_L2_FREEZE_COMMIT = "56f329bbeff7526fe9f9d023d598d060cea3464a"
-M8_L2_CONFIG_SOURCE_SHA256 = "491b14727a3e8bad907d1ad64072f6ebc14e407f98a5c31fca7b0a9e6801e758"
-M8_L2_PROTOCOL_SHA256 = "fe6d4aea5af3e9c529486b7e108afefeba623bf5ad3cc0743c0426a5e62e1fa7"
+M8_L2_CONFIG_SOURCE_SHA256 = "b1bf3b4e2820e24e4555bfeb9cb0957f9a0bcdef62039f7d92360e0a97d0dd39"
+M8_L2_PROTOCOL_SHA256 = "4c77a2099a4cabd049d10e0f8264d3b4c66704d8e87cbaf0c817fd085f4bbd83"
 
 _TOP_LEVEL_KEYS = frozenset(
     {"study", "sessions", "capture", "features", "models", "execution", "claims"}
@@ -94,10 +94,10 @@ _CLAIM_KEYS = frozenset(
 )
 
 _FROZEN_SESSIONS: tuple[tuple[str, str, str, M8L2SessionRole], ...] = (
-    ("2026-08-08", "14:00:00", "15:00:00", "train"),
-    ("2026-08-09", "14:00:00", "15:00:00", "validation"),
-    ("2026-08-10", "14:00:00", "15:00:00", "primary_test"),
-    ("2026-08-11", "14:00:00", "15:00:00", "replication_test"),
+    ("2026-08-10", "14:00:00", "15:00:00", "train"),
+    ("2026-08-11", "14:00:00", "15:00:00", "validation"),
+    ("2026-08-12", "14:00:00", "15:00:00", "primary_test"),
+    ("2026-08-13", "14:00:00", "15:00:00", "replication_test"),
 )
 
 
@@ -382,8 +382,8 @@ def _parse_study(raw: object) -> M8L2Study:
         stream_interval_ms=_integer(table["stream_interval_ms"], "study.stream_interval_ms"),
     )
     expected: dict[str, object] = {
-        "name": "binance-m8-live-l2-study",
-        "protocol_version": "1.0.0",
+        "name": "binance-m8-live-l2-study-v2",
+        "protocol_version": "2.0.0",
         "evidence_tier": "FULL_DATA",
         "seed": 20260807,
         "source": "binance_spot_live_diff_depth_100ms",

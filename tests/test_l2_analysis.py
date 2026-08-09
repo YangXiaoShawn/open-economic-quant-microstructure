@@ -8,10 +8,10 @@ from microstructure.research.l2_analysis import build_l2_descriptive_analysis
 
 SECOND = 1_000_000_000
 DATES = (
-    ("2026-08-08", "train"),
-    ("2026-08-09", "validation"),
-    ("2026-08-10", "primary_test"),
-    ("2026-08-11", "replication_test"),
+    ("2026-08-10", "train"),
+    ("2026-08-11", "validation"),
+    ("2026-08-12", "primary_test"),
+    ("2026-08-13", "replication_test"),
 )
 ENDPOINTS = (
     ("event_20", "event", 20, "events"),

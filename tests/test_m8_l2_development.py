@@ -201,8 +201,8 @@ def _environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Environmen
     capture = load_m8_l2_config("configs/m8_l2_capture_study.toml")
     analysis = load_m8_l2_analysis_config("configs/m8_l2_analysis.toml")
     sessions = tmp_path / "sessions"
-    train_path = sessions / f"2026-08-08-train-{hashlib_sha('train')[:20]}"
-    validation_path = sessions / f"2026-08-09-validation-{hashlib_sha('validation')[:20]}"
+    train_path = sessions / f"2026-08-10-train-{hashlib_sha('train')[:20]}"
+    validation_path = sessions / f"2026-08-11-validation-{hashlib_sha('validation')[:20]}"
     train_path.mkdir(parents=True)
     validation_path.mkdir()
     train_manifest = "1" * 64
@@ -212,37 +212,37 @@ def _environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Environmen
     symbols = MappingProxyType({symbol: object() for symbol in capture.study.symbols})
     train_input = _FakeInput(
         root=train_path.absolute(),
-        session_id=hashlib_sha("2026-08-08"),
-        session_date="2026-08-08",
+        session_id=hashlib_sha("2026-08-10"),
+        session_date="2026-08-10",
         role="train",
         config_sha256=capture.hash,
         config_source_sha256=capture.source_sha256,
         file_authority=L2SessionFileAuthority(train_manifest, "3" * 64),
         campaign_identity=campaign,
         symbols=symbols,
-        frames={symbol: _frames(symbol, "2026-08-08") for symbol in capture.study.symbols},
+        frames={symbol: _frames(symbol, "2026-08-10") for symbol in capture.study.symbols},
         events=events,
     )
     validation_input = _FakeInput(
         root=validation_path.absolute(),
-        session_id=hashlib_sha("2026-08-09"),
-        session_date="2026-08-09",
+        session_id=hashlib_sha("2026-08-11"),
+        session_date="2026-08-11",
         role="validation",
         config_sha256=capture.hash,
         config_source_sha256=capture.source_sha256,
         file_authority=L2SessionFileAuthority(validation_manifest, "4" * 64),
         campaign_identity=campaign,
         symbols=symbols,
-        frames={symbol: _frames(symbol, "2026-08-09") for symbol in capture.study.symbols},
+        frames={symbol: _frames(symbol, "2026-08-11") for symbol in capture.study.symbols},
         events=events,
     )
     bundles = {
         train_path.absolute(): _bundle(
-            train_path.absolute(), date="2026-08-08", role="train", manifest_sha=train_manifest
+            train_path.absolute(), date="2026-08-10", role="train", manifest_sha=train_manifest
         ),
         validation_path.absolute(): _bundle(
             validation_path.absolute(),
-            date="2026-08-09",
+            date="2026-08-11",
             role="validation",
             manifest_sha=validation_manifest,
         ),
@@ -263,7 +263,7 @@ def _environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Environmen
     ) -> _FakeInput:
         assert expected_config == capture
         events.append(f"authority:{expected_date}")
-        value = train_input if expected_date == "2026-08-08" else validation_input
+        value = train_input if expected_date == "2026-08-10" else validation_input
         assert Path(path).absolute() == value.root
         assert expected_role == value.role
         if expected_file_authority is not None:
@@ -280,7 +280,7 @@ def _environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Environmen
         "current_m8_l2_runtime_fingerprint_sha256",
         lambda: RUNTIME_SHA,
     )
-    monkeypatch.setattr(development, "_utc_now", lambda: datetime(2026, 8, 9, 16, 0, tzinfo=UTC))
+    monkeypatch.setattr(development, "_utc_now", lambda: datetime(2026, 8, 11, 16, 0, tzinfo=UTC))
     return _Environment(
         capture,
         analysis,
@@ -393,14 +393,14 @@ def test_insufficient_development_publishes_verified_not_created_without_economi
     environment = _environment(tmp_path, monkeypatch)
     train = _terminal_bundle(
         environment.train_path,
-        date="2026-08-08",
+        date="2026-08-10",
         role="train",
         status="INSUFFICIENT_DATA",
         reasons=("GATE_COVERAGE",),
     )
     validation = _terminal_bundle(
         environment.validation_path,
-        date="2026-08-09",
+        date="2026-08-11",
         role="validation",
         status="COMPLETE",
         reasons=(),
@@ -453,14 +453,14 @@ def test_not_created_rejects_caller_authority_swap_before_producer_entry(
     environment = _environment(tmp_path, monkeypatch)
     train = _terminal_bundle(
         environment.train_path,
-        date="2026-08-08",
+        date="2026-08-10",
         role="train",
         status="INSUFFICIENT_DATA",
         reasons=("GATE_COVERAGE",),
     )
     validation = _terminal_bundle(
         environment.validation_path,
-        date="2026-08-09",
+        date="2026-08-11",
         role="validation",
         status="COMPLETE",
         reasons=(),
@@ -509,14 +509,14 @@ def test_not_created_rechecks_caller_authority_at_marker_boundary(
     environment = _environment(tmp_path, monkeypatch)
     train = _terminal_bundle(
         environment.train_path,
-        date="2026-08-08",
+        date="2026-08-10",
         role="train",
         status="INSUFFICIENT_DATA",
         reasons=("GATE_COVERAGE",),
     )
     validation = _terminal_bundle(
         environment.validation_path,
-        date="2026-08-09",
+        date="2026-08-11",
         role="validation",
         status="COMPLETE",
         reasons=(),
@@ -644,7 +644,7 @@ def test_development_lock_is_complete_outcome_blind_and_roundtrips(
     assert result is not None
     assert result.marker_path.read_bytes() == b"locked\n"
     assert len(result.children) == 8
-    assert locked_environment.events[:2] == ["authority:2026-08-08", "authority:2026-08-09"]
+    assert locked_environment.events[:2] == ["authority:2026-08-10", "authority:2026-08-11"]
     assert all(event.startswith("authority:") for event in locked_environment.events[:2])
     aggregate = json.loads(result.aggregate_path.read_text(encoding="ascii"))
     assert aggregate["heldout_access"] == {
@@ -655,8 +655,8 @@ def test_development_lock_is_complete_outcome_blind_and_roundtrips(
         "model_fit_or_update_after_lock": False,
     }
     assert aggregate["heldout_declarations"] == [
-        {"date": "2026-08-10", "role": "primary_test"},
-        {"date": "2026-08-11", "role": "replication_test"},
+        {"date": "2026-08-12", "role": "primary_test"},
+        {"date": "2026-08-13", "role": "replication_test"},
     ]
     restored = verify_m8_l2_development_lock(
         locked_environment.capture,
@@ -682,7 +682,7 @@ def test_execution_reference_is_train_only_and_matches_frozen_formula(
     aggregate = json.loads(result.aggregate_path.read_text(encoding="ascii"))
     for claim in aggregate["execution_references"]:
         payload = json.loads((result.root / claim["path"]).read_text(encoding="ascii"))
-        assert payload["fit_date"] == "2026-08-08"
+        assert payload["fit_date"] == "2026-08-10"
         assert payload["reference_price_statistic"] == "train_median_mid_price"
         assert payload["reference_depth_statistic"] == "train_q05_min_bid_ask_l1_depth"
         unrounded = min(
@@ -774,7 +774,7 @@ def test_late_lock_and_dirty_source_fail_before_economic_rows_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     environment = _environment(tmp_path / "late", monkeypatch)
-    monkeypatch.setattr(development, "_utc_now", lambda: datetime(2026, 8, 10, 14, 0, tzinfo=UTC))
+    monkeypatch.setattr(development, "_utc_now", lambda: datetime(2026, 8, 12, 14, 0, tzinfo=UTC))
     target = tmp_path / "late-lock"
     with pytest.raises(M8L2DevelopmentError, match="deadline"):
         lock_m8_l2_development(
@@ -793,7 +793,7 @@ def test_late_lock_and_dirty_source_fail_before_economic_rows_open(
         "_producer_source_identity",
         lambda _root: ProducerSourceIdentity(COMMIT, SOURCE_TREE, True),
     )
-    monkeypatch.setattr(development, "_utc_now", lambda: datetime(2026, 8, 9, 16, 0, tzinfo=UTC))
+    monkeypatch.setattr(development, "_utc_now", lambda: datetime(2026, 8, 11, 16, 0, tzinfo=UTC))
     with pytest.raises(M8L2DevelopmentError, match="clean Git"):
         lock_m8_l2_development(
             environment.capture,
@@ -811,8 +811,8 @@ def test_lock_crossing_deadline_during_fit_is_not_published(
     environment = _environment(tmp_path / "crossing-deadline", monkeypatch)
     observed_times = iter(
         (
-            datetime(2026, 8, 9, 16, 0, tzinfo=UTC),
-            datetime(2026, 8, 10, 14, 0, tzinfo=UTC),
+            datetime(2026, 8, 11, 16, 0, tzinfo=UTC),
+            datetime(2026, 8, 12, 14, 0, tzinfo=UTC),
         )
     )
     monkeypatch.setattr(development, "_utc_now", lambda: next(observed_times))
@@ -837,9 +837,9 @@ def test_lock_crossing_deadline_during_publication_is_not_terminal(
     environment = _environment(tmp_path / "crossing-publication", monkeypatch)
     observed_times = iter(
         (
-            datetime(2026, 8, 9, 16, 0, tzinfo=UTC),
-            datetime(2026, 8, 10, 13, 59, 59, tzinfo=UTC),
-            datetime(2026, 8, 10, 14, 0, tzinfo=UTC),
+            datetime(2026, 8, 11, 16, 0, tzinfo=UTC),
+            datetime(2026, 8, 12, 13, 59, 59, tzinfo=UTC),
+            datetime(2026, 8, 12, 14, 0, tzinfo=UTC),
         )
     )
     monkeypatch.setattr(development, "_utc_now", lambda: next(observed_times))
@@ -864,10 +864,10 @@ def test_lock_crossing_deadline_during_final_authority_recheck_is_not_terminal(
     environment = _environment(tmp_path / "crossing-final-authority", monkeypatch)
     observed_times = iter(
         (
-            datetime(2026, 8, 9, 16, 0, tzinfo=UTC),
-            datetime(2026, 8, 10, 13, 59, 58, tzinfo=UTC),
-            datetime(2026, 8, 10, 13, 59, 59, tzinfo=UTC),
-            datetime(2026, 8, 10, 14, 0, tzinfo=UTC),
+            datetime(2026, 8, 11, 16, 0, tzinfo=UTC),
+            datetime(2026, 8, 12, 13, 59, 58, tzinfo=UTC),
+            datetime(2026, 8, 12, 13, 59, 59, tzinfo=UTC),
+            datetime(2026, 8, 12, 14, 0, tzinfo=UTC),
         )
     )
     monkeypatch.setattr(development, "_utc_now", lambda: next(observed_times))
@@ -977,14 +977,14 @@ def test_system_fault_removes_unlocked_reservation(
             target,
         )
     assert not target.exists()
-    assert all(not event.startswith("load:2026-08-10") for event in environment.events)
+    assert all(not event.startswith("load:2026-08-12") for event in environment.events)
 
 
 def test_wrong_development_coordinates_and_campaign_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     environment = _environment(tmp_path / "wrong", monkeypatch)
-    with pytest.raises(M8L2DevelopmentError, match="COMPLETE 2026-08-08 train"):
+    with pytest.raises(M8L2DevelopmentError, match="COMPLETE 2026-08-10 train"):
         lock_m8_l2_development(
             environment.capture,
             environment.analysis,

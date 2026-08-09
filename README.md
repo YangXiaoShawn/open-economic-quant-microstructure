@@ -146,25 +146,24 @@ for the economic hypothesis.
 the failure report into a separate report directory. It does not repair, append
 to, or otherwise mutate the canonical failure bundle.
 
-## Frozen live-L2 sessions
+## Frozen live-L2 sessions — replacement campaign v2
 
 Each declared date is captured by one command that waits for the exact common
 UTC barrier and starts both public market-data feeds under one authority. It
 never authenticates or exposes an order-entry path:
 
 ```bash
-make capture-m8-l2-session M8_L2_SESSION_DATE=2026-08-08
+make capture-m8-l2-session M8_L2_SESSION_DATE=2026-08-10
 ```
 
-The Aug 8, 2026 14:00--15:00 UTC train window passed without a capture attempt,
-raw data, or session bundle because no clean committed producer authority had
-been established. It must never be backfilled or replaced. After a clean source
-authority exists, the existing late-start branch may only publish the exact
-control-only `MISSED_WINDOW` terminal; that branch is tested to avoid invoking
-either symbol capture adapter. The other declared dates are 2026-08-09,
-2026-08-10, and 2026-08-11 and remain scheduled. A missed, disconnected, gapped,
-warning-bearing, or otherwise insufficient date is frozen as such and is never
-replaced. Only checksum-verified `COMPLETE` bundles may expose economic frames.
+The superseded v1 campaign is retained as historical control evidence: Aug 8
+was a verified `MISSED_WINDOW`, Aug 9 completed, and its development authority
+is permanently `NOT_CREATED`. It is not rewritten or used by v2. Before any v2
+session was observed, the user explicitly reset the empirical campaign to Aug
+10 train, Aug 11 validation, Aug 12 primary test, and Aug 13 replication test,
+each at 14:00--15:00 UTC. A missed, disconnected, gapped, warning-bearing, or
+otherwise insufficient v2 date is frozen as such and is never replaced. Only
+checksum-verified `COMPLETE` bundles may expose economic frames.
 A verified held-out `INSUFFICIENT_DATA` bundle may be consumed only as control
 evidence for an aggregate insufficiency terminal; its economic frames are never
 opened.
@@ -172,14 +171,13 @@ opened.
 The analysis specification is separately frozen in
 [`docs/M8_L2_ANALYSIS_CONTRACT.md`](docs/M8_L2_ANALYSIS_CONTRACT.md). Its strict
 loader, session input verifier, observed-interval feature/label construction,
-Aug 8/9 development-authority producer, no-refit Aug 10/11 evaluation, market-only
+Aug 10/11 development-authority producer, no-refit Aug 12/13 evaluation, market-only
 execution evaluator, descriptive diagnostics, and artifact-driven report
 renderers are integrated behind tested CLI/Make producers and recursive
-verifiers. The software path is complete, but the Aug 8 window was already
-missed when this remaining-campaign source-freeze snapshot was prepared. No
-declared live session bundle existed when these tracked bytes were frozen, and
-the final four-date study can now only terminate honestly as insufficient; no L2
-metric or execution result is claimed here. During the remaining campaign, live
+verifiers. The software path is complete; no v2 session data existed when the
+10--13 calendar and authority bytes were fixed, so v2 may reach either a valid
+complete result or an honest insufficiency terminal. No L2 metric or execution
+result is claimed before those terminals exist. During the campaign, live
 status belongs only to the immutable campaign/session authorities; this tracked
 README must not be revised between sessions.
 Use the ignored run targets
@@ -210,12 +208,12 @@ Map those values without abbreviation to the role-specific Make variables:
 
 where `<ROLE>` is `TRAIN`, `VALIDATION`, `PRIMARY`, or `REPLICATION`. Make accepts
 these as command-line assignments or exported environment variables. First
-verify every session. After the Aug 9 validation terminal, create and verify the
+verify every session. After the Aug 11 validation terminal, create and verify the
 development authority before any held-out analysis. If both development
 sessions are `COMPLETE`, the authority is `LOCKED` and contains the eight fitted
 child states. If either is a valid `INSUFFICIENT_DATA` terminal, the authority is
 `NOT_CREATED`; it contains typed control evidence and deliberately opens no
-economic frame. In either case it is immutable, and the Aug 10/11 captures must
+economic frame. In either case it is immutable, and the Aug 12/13 captures must
 still proceed on their declared dates:
 
 ```bash
@@ -242,7 +240,7 @@ Use the `development_lock_sha256` printed by the command for either `LOCKED` or
 verification; the Make wrapper normalizes that research-terminal code to 0.
 In both cases inspect the JSON status and preserve its `development_lock.json`,
 exact `_NOT_CREATED` marker (`not-created\n`), and printed authority SHA instead
-of retrying or changing dates. After Aug 11, pass
+of retrying or changing dates. After Aug 13, pass
 the same development coordinates plus both held-out authorities to the final
 producer. A `NOT_CREATED` authority forces an aggregate `INSUFFICIENT_DATA`
 result, opens no economic frames from any of the four sessions, and reports the
@@ -293,7 +291,7 @@ with changed dates or rules.
 | `make download-m8` | Acquire the frozen M8 raw authority without opening archive members |
 | `make capture-m8-l2-session M8_L2_SESSION_DATE=YYYY-MM-DD` | Capture the frozen concurrent BTCUSDT/ETHUSDT L2 session for one declared date |
 | `make verify-m8-l2-session M8_L2_BUNDLE_DIR=<path>` | Verify a complete or `INSUFFICIENT_DATA` frozen L2 session bundle |
-| `make lock-m8-l2-development` | Atomically publish the Aug 8/9 development authority: fitted `LOCKED` state when both sessions pass, or control-only `NOT_CREATED` evidence when either is insufficient |
+| `make lock-m8-l2-development` | Atomically publish the Aug 10/11 development authority: fitted `LOCKED` state when both sessions pass, or control-only `NOT_CREATED` evidence when either is insufficient |
 | `make verify-m8-l2-development-lock` | Recursively verify either development-authority status against its path, SHA, configs, sessions, campaign, and clean source identity |
 | `make reproduce-m8-l2` | Produce a new immutable four-session L2 terminal bundle; use the explicit-digest verifier for an existing target |
 | `make verify-m8-l2-run` | Verify a complete or `INSUFFICIENT_DATA` L2 run plus all external authorities |
@@ -423,7 +421,7 @@ coordinatedly rewritten bundle cannot masquerade as evidence for changed code.
 
 ## Main findings and current evidence
 
-Pre-capture source-freeze snapshot as of 2026-08-08:
+Replacement-campaign source-freeze snapshot as of 2026-08-09:
 
 - The latest settled integration gates passed Ruff, formatting, strict mypy, and
   the full pytest suite across the data, reconstruction, timing, modeling,
@@ -458,8 +456,9 @@ Pre-capture source-freeze snapshot as of 2026-08-08:
 - The live-L2 capture protocol and analysis contract are frozen, and strict
   capture, session-verification, input, development-lock, locked-evaluation,
   market-scenario, descriptive-analysis, and report components are covered by
-  offline tests. No real Aug 8--11 L2 session had been promoted at source freeze,
-  so these tracked bytes contain no book-based empirical result.
+  offline tests. The superseded v1 evidence is preserved separately; no v2
+  Aug 10--13 L2 session existed at this source freeze, so these tracked bytes
+  contain no v2 book-based empirical result.
 
 This distinction is the main research conclusion so far: a functioning simulator
 is not evidence that a market effect exists.
@@ -478,8 +477,8 @@ must not be rerun with replacement dates or a relaxed warning policy. The next
 empirical milestone is the already-frozen prospective, simultaneous
 BTCUSDT/ETHUSDT local-L2 study. It requires four declared session terminals, a
 single clean campaign source identity, continuous valid observed intervals, an
-Aug 8/9 development authority durably published before either held-out session,
-and unchanged Aug 10/11 evaluation when that authority is `LOCKED`. A
+Aug 10/11 development authority durably published before either held-out session,
+and unchanged Aug 12/13 evaluation when that authority is `LOCKED`. A
 `NOT_CREATED` authority records why fitting was forbidden, while the declared
 held-out captures still proceed and the final producer opens no economic frame.
 A failed session remains evidence of insufficiency; no trade-only result can

@@ -81,8 +81,8 @@ def _development_frame(study_date: str, role: str, *, rows: int = 120) -> pl.Dat
 def fitted_state() -> FinalFittedState:
     selected = select_multidate_model(
         (
-            _development_frame("2026-08-08", "train"),
-            _development_frame("2026-08-09", "validation"),
+            _development_frame("2026-08-10", "train"),
+            _development_frame("2026-08-11", "validation"),
         ),
         ModelConfig(
             selection_metric="log_loss",
@@ -92,7 +92,7 @@ def fitted_state() -> FinalFittedState:
         ),
         feature_columns=("signal",),
         target="future_mid_up",
-        declared_test_dates=("2026-08-10", "2026-08-11"),
+        declared_test_dates=("2026-08-12", "2026-08-13"),
         seed=20260807,
         calibration_bins=10,
     )
@@ -190,8 +190,8 @@ def _heldout_frames(
     values: list[L2HeldoutEndpointFrame] = []
     for endpoint in endpoints:
         for study_date, role, aligned in (
-            ("2026-08-10", "primary_test", True),
-            ("2026-08-11", "replication_test", replication_aligned),
+            ("2026-08-12", "primary_test", True),
+            ("2026-08-13", "replication_test", replication_aligned),
         ):
             values.append(
                 L2HeldoutEndpointFrame(
@@ -320,7 +320,7 @@ def _moving_block_probe_frame(*, intervals: int, width: int) -> pl.DataFrame:
             index = interval_index * rows_per_interval + ordinal
             records.append(
                 {
-                    "study_date": "2026-08-10",
+                    "study_date": "2026-08-12",
                     "symbol": "BTCUSDT",
                     "continuity_id": interval_id,
                     "observed_interval_id": interval_id,
@@ -413,7 +413,7 @@ def _clock_moving_block_probe_frame(*, intervals: int, width_ms: int) -> pl.Data
             index = interval_index * rows_per_interval + ordinal
             records.append(
                 {
-                    "study_date": "2026-08-10",
+                    "study_date": "2026-08-12",
                     "symbol": "BTCUSDT",
                     "continuity_id": interval_id,
                     "observed_interval_id": interval_id,
@@ -599,7 +599,7 @@ def test_directional_replication_requires_negative_delta_on_both_dates(
 def test_reference_is_formula_checked_config_bound_and_payload_hashed() -> None:
     reference = L2ExecutionReference.create(
         symbol="BTCUSDT",
-        training_date="2026-08-08",
+        training_date="2026-08-10",
         reference_mid_price=100.0,
         train_l1_depth_q05=20.0,
         lot_size=0.1,
@@ -628,7 +628,7 @@ def test_market_only_execution_grid_reconciles_and_never_authorizes_claims(
     evaluation = evaluate_locked_l2_endpoints(states, frames)
     reference = L2ExecutionReference.create(
         symbol="BTCUSDT",
-        training_date="2026-08-08",
+        training_date="2026-08-10",
         reference_mid_price=100.0,
         train_l1_depth_q05=20.0,
         lot_size=0.1,

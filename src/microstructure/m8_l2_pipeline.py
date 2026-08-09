@@ -100,10 +100,10 @@ _INSUFFICIENT_NAME = "INSUFFICIENT_DATA"
 _SUCCESS_BYTES = b"complete\n"
 _INSUFFICIENT_BYTES = b"terminal\n"
 _EXPECTED_COORDINATES = (
-    ("2026-08-08", "train"),
-    ("2026-08-09", "validation"),
-    ("2026-08-10", "primary_test"),
-    ("2026-08-11", "replication_test"),
+    ("2026-08-10", "train"),
+    ("2026-08-11", "validation"),
+    ("2026-08-12", "primary_test"),
+    ("2026-08-13", "replication_test"),
 )
 _GIB = 1024**3
 # Fail-closed producer/verifier workspace partition for a 16 GiB host.  The
@@ -1108,14 +1108,14 @@ def _regime_from_payload(payload: Mapping[str, Any], *, symbol: str) -> L2Regime
         payload.get("schema_version") != "m8-l2-regime-thresholds-v1"
         or payload.get("artifact_kind") != "train_only_l2_regime_thresholds"
         or payload.get("symbol") != symbol
-        or payload.get("study_date") != "2026-08-08"
+        or payload.get("study_date") != "2026-08-10"
         or payload.get("fit_scope") != "train_session_only"
     ):
         raise M8L2StudyPipelineError("train-only regime snapshot has invalid semantics")
     thresholds = _mapping(payload.get("thresholds"), "regime thresholds")
     return L2RegimeFit(
         symbol=symbol,
-        study_date="2026-08-08",
+        study_date="2026-08-10",
         volatility_column=_string(payload.get("volatility_column"), "regime feature"),
         lower_quantile=_finite(payload.get("lower_quantile"), "lower regime quantile"),
         upper_quantile=_finite(payload.get("upper_quantile"), "upper regime quantile"),
@@ -1140,7 +1140,7 @@ def _execution_reference_from_payload(
         payload.get("schema_version") != "m8-l2-execution-reference-v1"
         or payload.get("artifact_kind") != "train_only_execution_reference"
         or payload.get("symbol") != symbol
-        or payload.get("fit_date") != "2026-08-08"
+        or payload.get("fit_date") != "2026-08-10"
         or payload.get("fit_role") != "train"
         or payload.get("reference_price_statistic") != "train_median_mid_price"
         or payload.get("reference_depth_statistic") != "train_q05_min_bid_ask_l1_depth"
@@ -1148,7 +1148,7 @@ def _execution_reference_from_payload(
         raise M8L2StudyPipelineError("train-only execution snapshot has invalid semantics")
     return L2ExecutionReference.create(
         symbol=symbol,
-        training_date="2026-08-08",
+        training_date="2026-08-10",
         reference_mid_price=_finite(
             payload.get("reference_mid_price"), "execution reference midpoint", positive=True
         ),
@@ -1628,8 +1628,8 @@ def _build_causal_frames(
         raise M8L2StudyPipelineError("rebuilt causal frame set is incomplete")
     for symbol in capture.study.symbols:
         for endpoint in analysis.endpoints:
-            train_frame = causal[("2026-08-08", "train", symbol, endpoint.name)]
-            validation_frame = causal[("2026-08-09", "validation", symbol, endpoint.name)]
+            train_frame = causal[("2026-08-10", "train", symbol, endpoint.name)]
+            validation_frame = causal[("2026-08-11", "validation", symbol, endpoint.name)]
             _require_memory_budget(
                 2 * (_frame_bytes(train_frame) + _frame_bytes(validation_frame)),
                 _MAX_CAUSAL_COORDINATE_BYTES,
@@ -3136,8 +3136,8 @@ def _verify_tabular_outputs_streaming(
     if causal_paths:
         for symbol in capture.study.symbols:
             for endpoint in analysis.endpoints:
-                train_key = ("2026-08-08", "train", symbol, endpoint.name)
-                validation_key = ("2026-08-09", "validation", symbol, endpoint.name)
+                train_key = ("2026-08-10", "train", symbol, endpoint.name)
+                validation_key = ("2026-08-11", "validation", symbol, endpoint.name)
                 train_path = _causal_relative(train_key)
                 validation_path = _causal_relative(validation_key)
                 train_frame = _read_claimed_parquet(root, train_path, claims[train_path])

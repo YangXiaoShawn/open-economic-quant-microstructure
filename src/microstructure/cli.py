@@ -1499,11 +1499,11 @@ def _development_session_authorities(
     args: argparse.Namespace,
 ) -> dict[str, L2SessionFileAuthority]:
     return {
-        "2026-08-08": L2SessionFileAuthority(
+        "2026-08-10": L2SessionFileAuthority(
             manifest_sha256=args.train_manifest_sha256,
             checksums_sha256=args.train_checksums_sha256,
         ),
-        "2026-08-09": L2SessionFileAuthority(
+        "2026-08-11": L2SessionFileAuthority(
             manifest_sha256=args.validation_manifest_sha256,
             checksums_sha256=args.validation_checksums_sha256,
         ),
@@ -1548,7 +1548,7 @@ def _load_explicit_development_sessions(
     train = _verify_m8_l2_session_authority(
         args.train_bundle_dir.absolute(),
         expected_config=capture_config,
-        expected_date="2026-08-08",
+        expected_date="2026-08-10",
         expected_role="train",
         manifest_sha256=args.train_manifest_sha256,
         checksums_sha256=args.train_checksums_sha256,
@@ -1556,7 +1556,7 @@ def _load_explicit_development_sessions(
     validation = _verify_m8_l2_session_authority(
         args.validation_bundle_dir.absolute(),
         expected_config=capture_config,
-        expected_date="2026-08-09",
+        expected_date="2026-08-11",
         expected_role="validation",
         manifest_sha256=args.validation_manifest_sha256,
         checksums_sha256=args.validation_checksums_sha256,

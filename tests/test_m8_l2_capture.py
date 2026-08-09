@@ -958,7 +958,7 @@ def test_dual_capture_uses_one_absolute_barrier_and_publishes_verified_complete_
     bundle = asyncio.run(
         capture_m8_l2_session(
             config,
-            "2026-08-08",
+            "2026-08-10",
             tmp_path,
             capture_one,
             protocol_path=PROTOCOL_PATH,
@@ -1015,7 +1015,7 @@ def test_typed_failure_in_one_symbol_does_not_cancel_the_other_symbol(tmp_path: 
     bundle = asyncio.run(
         capture_m8_l2_session(
             config,
-            "2026-08-08",
+            "2026-08-10",
             tmp_path,
             capture_one,
             protocol_path=PROTOCOL_PATH,
@@ -1051,7 +1051,7 @@ def test_only_observed_intervals_count_toward_epoch_and_overlap_gates(tmp_path: 
     bundle = asyncio.run(
         capture_m8_l2_session(
             config,
-            "2026-08-08",
+            "2026-08-10",
             tmp_path,
             capture_one,
             protocol_path=PROTOCOL_PATH,
@@ -1081,7 +1081,7 @@ def test_missed_absolute_window_is_terminal_insufficient_and_never_calls_capture
     bundle = asyncio.run(
         capture_m8_l2_session(
             config,
-            "2026-08-08",
+            "2026-08-10",
             tmp_path,
             capture_one,
             protocol_path=PROTOCOL_PATH,
@@ -1125,7 +1125,7 @@ def test_system_fault_is_nonterminal_and_preserves_raw_evidence(
         asyncio.run(
             capture_m8_l2_session(
                 config,
-                "2026-08-08",
+                "2026-08-10",
                 tmp_path,
                 capture_one,
                 protocol_path=PROTOCOL_PATH,
@@ -1207,7 +1207,7 @@ def test_active_cancellation_terminalizes_as_insufficient_and_preserves_partial_
         task = asyncio.create_task(
             capture_m8_l2_session(
                 config,
-                "2026-08-08",
+                "2026-08-10",
                 tmp_path,
                 capture_one,
                 protocol_path=PROTOCOL_PATH,
@@ -1246,7 +1246,7 @@ def test_verifier_rejects_tamper_extra_files_and_bad_marker_and_reuse_is_verify_
     first = asyncio.run(
         capture_m8_l2_session(
             config,
-            "2026-08-08",
+            "2026-08-10",
             tmp_path,
             capture_one,
             protocol_path=PROTOCOL_PATH,
@@ -1257,7 +1257,7 @@ def test_verifier_rejects_tamper_extra_files_and_bad_marker_and_reuse_is_verify_
     reused = asyncio.run(
         capture_m8_l2_session(
             config,
-            "2026-08-08",
+            "2026-08-10",
             tmp_path,
             capture_one,
             protocol_path=PROTOCOL_PATH,
@@ -1300,7 +1300,7 @@ def test_capture_result_with_undeclared_file_is_program_fault_not_data_failure(
         asyncio.run(
             capture_m8_l2_session(
                 config,
-                "2026-08-08",
+                "2026-08-10",
                 tmp_path,
                 capture_one,
                 protocol_path=PROTOCOL_PATH,
@@ -1339,7 +1339,7 @@ def test_terminal_publication_io_fault_is_demoted_and_raw_is_preserved(
         asyncio.run(
             capture_m8_l2_session(
                 config,
-                "2026-08-08",
+                "2026-08-10",
                 tmp_path,
                 capture_one,
                 protocol_path=PROTOCOL_PATH,
@@ -1388,7 +1388,7 @@ def test_protocol_drift_during_capture_is_system_failure_and_preserves_raw(
         asyncio.run(
             capture_m8_l2_session(
                 config,
-                "2026-08-08",
+                "2026-08-10",
                 tmp_path / "evidence",
                 capture_one,
                 protocol_path=protocol_path,
@@ -1534,7 +1534,7 @@ def test_manifest_is_machine_readable_and_contains_exact_checksum_inventory(tmp_
     bundle = asyncio.run(
         capture_m8_l2_session(
             config,
-            "2026-08-08",
+            "2026-08-10",
             tmp_path,
             capture_one,
             protocol_path=PROTOCOL_PATH,

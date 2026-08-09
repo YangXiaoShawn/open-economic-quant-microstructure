@@ -8,10 +8,10 @@ strict loader rejects a changed, missing, or additional field.
 
 | Authority | SHA-256 |
 | --- | --- |
-| Analysis TOML source bytes | `71edf7eeb9d5e935a18b0d8e354dc29b5b1132ace8eccd577730572d2caa8617` |
-| Analysis TOML canonical semantics | `eeb9ac23ff275f26de57533a317d8165a89e99a14e86404a667cc69f6477bdac` |
-| Bound capture-config source bytes | `491b14727a3e8bad907d1ad64072f6ebc14e407f98a5c31fca7b0a9e6801e758` |
-| Bound capture-protocol source bytes | `fe6d4aea5af3e9c529486b7e108afefeba623bf5ad3cc0743c0426a5e62e1fa7` |
+| Analysis TOML source bytes | `0d786d5f4109bb5bf773a6197df3fa861c9b7eb61c16c957bd49fb56147fd7d8` |
+| Analysis TOML canonical semantics | `17c91f64765f35195ab03a4caac93d8ff9c5f009c16e785fd84ebd9569d6f84b` |
+| Bound capture-config source bytes | `b1bf3b4e2820e24e4555bfeb9cb0957f9a0bcdef62039f7d92360e0a97d0dd39` |
+| Bound capture-protocol source bytes | `4c77a2099a4cabd049d10e0f8264d3b4c66704d8e87cbaf0c817fd085f4bbd83` |
 
 The calendar, capture gates, model candidate grid, fee, and decision/order
 latency event-count grid remain authoritative in the bound capture config and

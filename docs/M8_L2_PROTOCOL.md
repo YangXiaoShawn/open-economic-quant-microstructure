@@ -1,22 +1,24 @@
-# M8 prospective live-L2 protocol
+# M8 prospective live-L2 protocol — replacement campaign v2
 
 ## Scope and frozen calendar
 
-This protocol was fixed before any declared live session occurred. Both symbols
+This replacement protocol was fixed before any v2 live session occurred. Both symbols
 must be captured concurrently from Binance Spot diff-depth at the requested
 100 ms stream interval:
 
 | UTC session | Role |
 | --- | --- |
-| 2026-08-08 14:00–15:00 | Train |
-| 2026-08-09 14:00–15:00 | Validation |
-| 2026-08-10 14:00–15:00 | Primary test |
-| 2026-08-11 14:00–15:00 | Replication test |
+| 2026-08-10 14:00–15:00 | Train |
+| 2026-08-11 14:00–15:00 | Validation |
+| 2026-08-12 14:00–15:00 | Primary test |
+| 2026-08-13 14:00–15:00 | Replication test |
 
-The dates are the four consecutive UTC dates immediately following the protocol
-work, and the common hour was chosen before observing those sessions. Missing,
+The dates are the four consecutive UTC dates beginning after the v2 reset on
+2026-08-09, and the common hour was chosen before observing those sessions. Missing,
 quiet, volatile, disconnected, corrupt, or unfavorable sessions are never
-replaced. They produce an explicit `INSUFFICIENT_DATA` status. The exact config
+replaced. They produce an explicit `INSUFFICIENT_DATA` status. The superseded
+Aug 8–11 campaign and its evidence remain immutable and are not inputs to this
+study. The exact config
 bytes in `configs/m8_l2_capture_study.toml`, this protocol, their hashes, and the
 freeze Git commit must enter every resulting bundle.
 
@@ -67,9 +69,9 @@ book-only protocol does not infer them from cancellation alone.
 
 ## Evaluation and hypotheses
 
-Per symbol, train on Aug 8, select the fixed prior/logistic/L2/tree ladder by Aug
-9 log loss, lock the specification, then evaluate it without refit on Aug 10 and
-Aug 11. Probability calibration and regime thresholds use development data only.
+Per symbol, train on Aug 10, select the fixed prior/logistic/L2/tree ladder by Aug
+11 log loss, lock the specification, then evaluate it without refit on Aug 12 and
+Aug 13. Probability calibration and regime thresholds use development data only.
 All declared horizons and model comparison rows are published; no final period
 is used for selection.
 
@@ -99,4 +101,3 @@ frozen predictions/comparisons, regime/stability diagnostics, scenario execution
 ledgers, generated reports, config/protocol/input/Git provenance, checksums, and
 `_SUCCESS` written last. A missing session or failed gate may produce a failure
 bundle, but never a promoted result bundle.
-
