@@ -20,6 +20,7 @@ data/quality/**
 data/_ingestion_manifests/**
 data/m8/**
 data/m8_l2/**
+data/exploratory_aggtrades_2026-08-05_08/**
 !data/raw/.gitkeep
 !data/normalized/.gitkeep
 !data/derived/.gitkeep
