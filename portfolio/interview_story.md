@@ -1,5 +1,10 @@
 # Interview story: Order Flow to Price Impact
 
+> **Historical calendar note (2026-08-23):** Any Aug 8–11 live-L2 schedule in
+> this narrative is superseded by the v2 Aug 10–13 protocol recorded in the
+> README and `docs/M8_L2_ANALYSIS_CONTRACT.md`. It is retained as research
+> history, not current campaign authority.
+
 ## One-sentence version
 
 I designed a reproducibility-first market-microstructure research system that

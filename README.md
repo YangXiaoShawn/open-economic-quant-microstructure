@@ -497,5 +497,13 @@ numbers. Run-specific documents are generated from verified bundles. Supporting
 communication artifacts are in `portfolio/`: an interview narrative, three
 resume-bullet variants, and a ten-minute presentation outline.
 
+## Public release
+
+- Project page: <https://yangxiaoshawn.github.io/projects/microstructure/>
+- GitHub source: <https://github.com/YangXiaoShawn/open-economic-quant-microstructure>
+- Versioned code and documentation mirror: <https://huggingface.co/datasets/ShawnChamberlain/open-economic-quant-research-data/tree/main/Microstructure>
+- Interactive evidence explorer: <https://huggingface.co/spaces/ShawnChamberlain/open-economic-quant-research-observatory>
+- Publication and data boundaries: [docs/PUBLICATION.md](docs/PUBLICATION.md) and [docs/DATA_POLICY.md](docs/DATA_POLICY.md)
+
 Licensed under the MIT License. This repository is for research and simulation,
 not investment advice or live trading.

@@ -1,0 +1,45 @@
+title: Order Flow to Price Impact
+slug: microstructure
+summary: Reproducibility-first market-microstructure research that separates data quality, leakage-safe prediction, execution assumptions, and simulated outcomes.
+research_question: When do order-flow imbalance, liquidity, and limit-order-book conditions predict short-horizon price movement, and which claims survive predeclared data-quality and execution gates?
+why_it_matters: Short-horizon market research is easy to overstate. The project makes observability, temporal leakage, data gaps, fees, latency, uncertain fills, adverse selection, and inventory risk explicit before any economic claim is promoted.
+research_fields:
+  - Market microstructure
+  - Quantitative finance
+  - Time-series machine learning
+project_type: empirical-research-system
+status: public-live
+authors:
+  - Repository owner and maintainer
+original_source: Microstructure workspace project
+original_sample_period: Public BTCUSDT and ETHUSDT market-data studies use fixed UTC intervals declared in their protocols; deterministic synthetic fixtures exercise the software path.
+updated_sample_period: The published source snapshot includes the frozen trade-only M8 terminal and the replacement live-L2 protocol through the current repository HEAD.
+data_sources:
+  - Binance Spot public aggregate-trade endpoints and official archive metadata
+  - Optional public live diff-depth and REST snapshots for locally captured L2 sessions
+  - Deterministic synthetic fixtures for software verification
+data_license: No exchange raw observations, normalized events, derived tables, fitted models, or generated run bundles are redistributed. Users obtain public market data independently under provider terms; see docs/DATA_POLICY.md.
+code_license: MIT
+reproduction_command: make reproduce-sample
+expected_runtime: The deterministic synthetic vertical slice is suitable for a local laptop. Public-data and live-L2 studies require independent acquisition, explicit immutable authorities, and substantially more storage and compute.
+outputs:
+  - src/
+  - tests/
+  - configs/
+  - reports/
+  - dashboard/
+  - docs/
+github_url: https://github.com/YangXiaoShawn/open-economic-quant-microstructure
+site_url: https://yangxiaoshawn.github.io/projects/microstructure/
+dataset_url: https://huggingface.co/datasets/ShawnChamberlain/open-economic-quant-research-data/tree/main/Microstructure
+space_url: https://huggingface.co/spaces/ShawnChamberlain/open-economic-quant-research-observatory
+last_updated: 2026-08-23
+limitations: The public package contains code and documentation, not exchange observations or generated run bundles. Synthetic results are software evidence only. The full-archive trade study terminated at a predeclared data-quality gate, so it published no prediction, execution, profit, capacity, or significance claim.
+catalog:
+  field: market-microstructure
+  accent: violet
+  tags:
+    - Market Microstructure
+    - Order Flow
+    - Reproducible Research
+  metric: Predeclared evidence gates

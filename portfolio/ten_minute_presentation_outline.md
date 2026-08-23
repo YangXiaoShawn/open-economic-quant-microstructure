@@ -1,5 +1,10 @@
 # Ten-minute presentation outline
 
+> **Historical calendar note (2026-08-23):** Any Aug 8–11 live-L2 schedule in
+> this outline is superseded by the v2 Aug 10–13 protocol recorded in the
+> README and `docs/M8_L2_ANALYSIS_CONTRACT.md`. It is retained as research
+> history, not current campaign authority.
+
 ## 0:00–0:50 — The question and the trap
 
 - Ask when order-flow imbalance and liquidity predict a strictly future move.
