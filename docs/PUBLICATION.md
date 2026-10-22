@@ -18,6 +18,17 @@ The detailed boundary is recorded in [DATA_POLICY.md](DATA_POLICY.md).
 - The frozen trade-only M8 study ended at `INSUFFICIENT_DATA` after a predeclared
   zero-warning gate failed. Selection, held-out evaluation, execution, and P&L
   did not run.
+- `NONCONFIRMATORY_CONTINUOUS_PILOT_EXPLORATION` is a separate, later evidence
+  tier. The approved website/Space summary comes from one continuous four-hour
+  BTCUSDT/ETHUSDT L2 pilot with deterministic market-order simulation, a frozen
+  4 bp taker fee, and 144 overlapping counterfactual scenarios. It is labeled
+  “research reference only.”
+- The exploratory summary is not confirmatory evidence, live or realized
+  execution, a prospectively untouched test, cross-day replication, a
+  profitability or capacity result, or a statistical-significance claim.
+- Its source bundle is pinned to commit
+  `b918673405226467d6e5c2fa1f2fac59cca19d03`; all 476 recorded files verified
+  against the bundle checksums before the bounded JSON was generated.
 - Superseded campaign calendars remain historical records and are not presented
   as current authority.
 
