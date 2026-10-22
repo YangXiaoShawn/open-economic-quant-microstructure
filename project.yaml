@@ -13,12 +13,12 @@ authors:
   - Repository owner and maintainer
 original_source: Microstructure workspace project
 original_sample_period: Public BTCUSDT and ETHUSDT market-data studies use fixed UTC intervals declared in their protocols; deterministic synthetic fixtures exercise the software path.
-updated_sample_period: The published source snapshot includes the frozen trade-only M8 terminal and the replacement live-L2 protocol through the current repository HEAD.
+updated_sample_period: The website and Space summarize one continuous four-hour BTCUSDT/ETHUSDT L2 pilot captured across 2026-08-13/14 UTC; the separate frozen trade-only M8 terminal remains historical evidence.
 data_sources:
   - Binance Spot public aggregate-trade endpoints and official archive metadata
   - Optional public live diff-depth and REST snapshots for locally captured L2 sessions
   - Deterministic synthetic fixtures for software verification
-data_license: No exchange raw observations, normalized events, derived tables, fitted models, or generated run bundles are redistributed. Users obtain public market data independently under provider terms; see docs/DATA_POLICY.md.
+data_license: No exchange raw observations, normalized events, fitted models, ledgers, or generated run bundles are redistributed. One bounded, low-dimensional scenario summary is PUBLIC_DERIVED_ONLY for the website and Space. Users obtain public market data independently under provider terms; see docs/DATA_POLICY.md.
 code_license: MIT
 reproduction_command: make reproduce-sample
 expected_runtime: The deterministic synthetic vertical slice is suitable for a local laptop. Public-data and live-L2 studies require independent acquisition, explicit immutable authorities, and substantially more storage and compute.
@@ -34,7 +34,7 @@ site_url: https://yangxiaoshawn.github.io/projects/microstructure/
 dataset_url: https://huggingface.co/datasets/ShawnChamberlain/open-economic-quant-research-data/tree/main/Microstructure
 space_url: https://huggingface.co/spaces/ShawnChamberlain/open-economic-quant-research-observatory
 last_updated: 2026-08-23
-limitations: The public package contains code and documentation, not exchange observations or generated run bundles. Synthetic results are software evidence only. The full-archive trade study terminated at a predeclared data-quality gate, so it published no prediction, execution, profit, capacity, or significance claim.
+limitations: The public package contains code and documentation, not exchange observations or generated run bundles. Synthetic results are software evidence only. The full-archive trade study terminated at a predeclared data-quality gate, so it published no prediction, execution, profit, capacity, or significance claim. The separate website and Space summary is one four-hour, nonconfirmatory deterministic market-order simulation. Its 144 counterfactual scenarios overlap and cannot be summed; adjacent pseudo-heldout phases are not prospectively untouched or cross-day replication. Drawdown is marked net equity from zero capital normalized by turnover, not account return. No live-trading, profitability, capacity, or significance claim is authorized.
 catalog:
   field: market-microstructure
   accent: violet
@@ -42,4 +42,4 @@ catalog:
     - Market Microstructure
     - Order Flow
     - Reproducible Research
-  metric: Predeclared evidence gates
+  metric: 144 cost-aware execution scenarios

@@ -33,10 +33,20 @@ states, account-like records, and generated run bundles are not redistributed.
 Synthetic fixtures and smoke outputs are labeled `SYNTHETIC_SMOKE` and support
 software verification only.
 
-The public website and Space may encode low-dimensional aggregate values already
-stated in tracked README or status prose—for example row counts, warning counts,
-and a declared terminal state—when they link back to that source and preserve its
-evidence label. They do not publish additional model or execution metrics.
+The public website and Space may encode low-dimensional aggregate values when
+they link back to a named, checksummed source and preserve its evidence label.
+One explicit `PUBLIC_DERIVED_ONLY` exception is approved for
+`assets/data/microstructure_backtest_reference.json` and the identical Space
+copy. It contains 144 counterfactual scenario summaries from the
+`NONCONFIRMATORY_CONTINUOUS_PILOT_EXPLORATION` run: dimensions, gross P&L, fees,
+net P&L, turnover-normalized edge and drawdown, simple order/fill counts, and
+checksummed provenance. It excludes events, positions, ledgers, models, local
+paths, and the run bundle itself.
+
+The approved summary must display “research reference only,” identify the
+single four-hour simulation, state that scenarios overlap and cannot be summed,
+and distinguish turnover-normalized marked drawdown from account return or
+capital-based drawdown.
 
 ## Trading boundary
 
