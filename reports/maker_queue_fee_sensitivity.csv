@@ -1,7 +1,7 @@
-execution_tier,fee_bps,adverse_selection_bps,effective_hurdle_bps,Fill_Probability_Assumption,scenarios_gross_positive,scenarios_net_positive,best_scenario_net_edge_bps,median_scenario_net_edge_bps
-Retail Taker (Frozen Baseline),4.00,0.00,4.00,1.00,110,0,-1.61,-3.16
-VIP-9 Taker,1.50,0.00,1.50,1.00,110,34,0.89,-0.66
-Maker 0bp (Tail-of-Queue),0.00,1.85,1.85,0.42,110,18,0.54,-1.01
-Maker 0bp (Median-Queue),0.00,1.15,1.15,0.58,110,56,1.24,-0.31
-Maker 0bp (Front-of-Queue),0.00,0.45,0.45,0.74,110,92,1.94,0.39
-Maker Rebate -0.5bp (Median-Queue),-0.50,1.15,0.65,0.58,110,81,1.74,0.19
+execution_tier,fee_bps,adverse_selection_bps,effective_hurdle_bps,fill_probability_assumption,scenarios_gross_positive,scenarios_net_positive,best_scenario_net_edge_bps,median_scenario_net_edge_bps
+Retail Taker (Frozen Baseline),4.00,0.00,4.00,1.00,110,0,-1.6148,-3.8555
+VIP-9 Taker,1.50,0.00,1.50,1.00,110,9,0.8852,-1.3555
+Maker 0bp (Tail-of-Queue),0.00,1.85,1.85,0.42,110,9,0.5352,-1.7055
+Maker 0bp (Median-Queue),0.00,1.15,1.15,0.58,110,9,1.2352,-1.0055
+Maker 0bp (Front-of-Queue),0.00,0.45,0.45,0.74,110,19,1.9352,-0.3055
+Maker Rebate -0.5bp (Median-Queue),-0.50,1.15,0.65,0.58,110,11,1.7352,-0.5055
