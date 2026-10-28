@@ -13,6 +13,9 @@ authors = [{ name = "Microstructure Research Project" }]
 dependencies = [
   "duckdb>=1.1,<2",
   "numpy>=2,<3",
+  # Shared monorepo package, pinned by commit so this project installs standalone;
+  # inside the monorepo, uv uses the workspace copy (root tool.uv.sources).
+  "oeq-core @ git+https://github.com/YangXiaoShawn/open-economic-quant@3d309b7e90ca7b970bb5396d3bb781c92de4ea7e#subdirectory=packages/oeq-core",
   "polars>=1.20,<2",
   "pyarrow>=18,<24",
   "requests>=2.32,<3",
@@ -32,6 +35,9 @@ dev = [
 
 [project.scripts]
 microstructure = "microstructure.cli:main"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/microstructure"]

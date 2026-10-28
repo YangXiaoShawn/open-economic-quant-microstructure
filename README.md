@@ -472,6 +472,22 @@ not deployable capacity. A short crypto interval cannot generalize across dates,
 venues, or asset classes; overlapping horizons also reduce effective sample size
 and make multiplicity control necessary.
 
+`reports/maker_queue_fee_sensitivity.csv`, also shown on the project page and in
+the monorepo README, re-prices the 144 deterministic market-order scenarios of the
+2026-08-13/14 four-hour L2 pilot by subtracting a different hurdle (fee plus an
+assumed adverse-selection cost) from each scenario's published gross edge. It is
+arithmetic on those gross edges, not a maker simulation: no passive order was
+simulated, and the table's `fill_probability_assumption` column (0.42-0.74) is not
+applied to any figure. Its best net edge is the maximum gross edge over 144
+overlapping scenarios minus the hurdle, with no multiplicity adjustment. That
+maximum, 2.3852 bp, is shared by the nine ETHUSDT primary-phase 5-second scenarios,
+which differ only in latency and each contain 10 fills (0.48 USDT gross P&L on
+1,996 USDT turnover). The 19 scenarios that clear the 0.45 bp front-of-queue hurdle
+are all ETHUSDT primary-phase: those nine, nine 1-second scenarios with 62 fills,
+and one 20-event scenario with 108 fills. The +1.9352 bp best maker figure is
+therefore a selected single-session observation on ten fills, not an estimate of
+achievable maker edge.
+
 The trade-only study is closed at its predeclared `INSUFFICIENT_DATA` gate and
 must not be rerun with replacement dates or a relaxed warning policy. The next
 empirical milestone is the already-frozen prospective, simultaneous
