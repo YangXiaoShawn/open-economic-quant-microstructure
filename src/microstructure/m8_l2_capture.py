@@ -60,6 +60,8 @@ _INSUFFICIENT_BYTES = b"terminal\n"
 _NANOSECONDS_PER_SECOND = 1_000_000_000
 _MAX_JSON_AUTHORITY_BYTES = 8 * 1024 * 1024
 _MAX_CAMPAIGN_AUTHORITY_BYTES = 16 * 1024
+# Bounded retries when a concurrent creator's temp-link cleanup touches the authority inode.
+_CAMPAIGN_READ_ATTEMPTS = 5
 _RUNTIME_DISTRIBUTIONS = (
     "duckdb",
     "numpy",
@@ -1002,6 +1004,10 @@ def _decode_canonical_json(raw: bytes, *, label: str) -> object:
     return value
 
 
+class _BoundedReadChanged(M8L2CaptureSystemError):
+    """A bounded read observed the file's metadata change mid-read (no bytes are returned)."""
+
+
 def _read_bounded_regular_nofollow(
     path: Path, *, label: str, maximum_bytes: int = _MAX_JSON_AUTHORITY_BYTES
 ) -> bytes:
@@ -1057,7 +1063,7 @@ def _read_bounded_regular_nofollow(
             or not stable_coordinates
             or not path_still_names_descriptor
         ):
-            raise M8L2CaptureSystemError(f"{label} changed during its bounded read: {path}")
+            raise _BoundedReadChanged(f"{label} changed during its bounded read: {path}")
         return raw
     except OSError as error:
         raise M8L2CaptureSystemError(f"cannot read {label}: {path}") from error
@@ -2102,13 +2108,25 @@ def _ensure_campaign_authority(
         raise M8L2CaptureSystemError(
             f"cannot inspect live-L2 campaign authority: {path}"
         ) from error
-    return _verify_campaign_authority(
-        root,
-        root_identity=root_identity,
-        config=config,
-        source=source,
-        runtime=runtime,
-    )
+    # A concurrent creator that lost or won the link race unlinks its temporary
+    # hard link to the same inode, which updates the authority's ctime once. A
+    # reader overlapping that unlink sees an unstable snapshot; retry a bounded
+    # number of times. Each attempt is still a fully stable read, so no bytes
+    # observed mid-change are ever accepted.
+    for attempt in range(_CAMPAIGN_READ_ATTEMPTS):
+        try:
+            return _verify_campaign_authority(
+                root,
+                root_identity=root_identity,
+                config=config,
+                source=source,
+                runtime=runtime,
+            )
+        except _BoundedReadChanged:
+            if attempt == _CAMPAIGN_READ_ATTEMPTS - 1:
+                raise
+            time.sleep(0.01 * (attempt + 1))
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _verify_bundled_campaign_authority(

@@ -780,6 +780,50 @@ def test_concurrent_campaign_creation_converges_on_one_exact_authority(tmp_path:
     assert not list(root.glob(".campaign-authority-*"))
 
 
+def test_campaign_authority_read_retries_after_transient_concurrent_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent creator's temp-link unlink bumps the inode ctime once; readers retry."""
+    config = load_m8_l2_config(CONFIG_PATH)
+    root, root_identity, _ = l2_module._prepare_output_root(tmp_path)
+    runtime = l2_module._runtime_fingerprint()
+    kwargs = dict(root_identity=root_identity, config=config, source=SOURCE, runtime=runtime)
+    first = l2_module._ensure_campaign_authority(root, **kwargs)
+
+    real_read = l2_module._read_bounded_regular_nofollow
+    calls: list[int] = []
+
+    def flaky_read(path: Path, **read_kwargs: object) -> bytes:
+        calls.append(1)
+        if len(calls) == 1:
+            raise l2_module._BoundedReadChanged("simulated concurrent temp-link cleanup")
+        return real_read(path, **read_kwargs)
+
+    monkeypatch.setattr(l2_module, "_read_bounded_regular_nofollow", flaky_read)
+    second = l2_module._ensure_campaign_authority(root, **kwargs)
+    assert len(calls) == 2
+    assert second.sha256 == first.sha256
+    assert second.nonce == first.nonce
+
+
+def test_campaign_authority_read_fails_closed_when_change_persists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_m8_l2_config(CONFIG_PATH)
+    root, root_identity, _ = l2_module._prepare_output_root(tmp_path)
+    runtime = l2_module._runtime_fingerprint()
+    kwargs = dict(root_identity=root_identity, config=config, source=SOURCE, runtime=runtime)
+    l2_module._ensure_campaign_authority(root, **kwargs)
+
+    def always_changing(path: Path, **read_kwargs: object) -> bytes:
+        raise l2_module._BoundedReadChanged("authority keeps changing")
+
+    monkeypatch.setattr(l2_module, "_read_bounded_regular_nofollow", always_changing)
+    monkeypatch.setattr(l2_module.time, "sleep", lambda _seconds: None)
+    with pytest.raises(l2_module.M8L2CaptureSystemError, match="keeps changing"):
+        l2_module._ensure_campaign_authority(root, **kwargs)
+
+
 def test_first_campaign_write_fsyncs_file_before_link_and_directory_after_link(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
